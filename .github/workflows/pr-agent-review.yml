@@ -496,8 +496,11 @@ jobs:
               if comparison is None:
                   return full(f"{previous[:7]} is not an ancestor of {head_sha[:7]}")
               if len(comparison.get("files") or []) >= 300:
-                  # GitHub lists at most 300 files, so the change is reviewed in full.
-                  return full("the change is too large to list")
+                  # GitHub lists at most 300 files, so the change is reviewed in full, and a rename beyond the
+                  # list is unknown.
+                  result = full("the change is too large to list")
+                  result["renames_complete"] = False
+                  return result
               # Files an earlier review left out for its token budget are reviewed again until one covers them.
               pending = set(checkpoint.get("uncovered") or []) & pr_paths
               delta = sorted(p for p in (pr_paths & changed) | pending if reviewable(p) and not ignored_by(p, user_globs))
@@ -641,7 +644,9 @@ jobs:
                       f.setdefault("renamed_from", f["path"])
                       f["path"] = renames[f["path"]]
                   # Raised again word for word, at its current path.
-                  new = raised_by_text.get((f["path"], f.get("content_id"))) or raised_by_id.get(f["id"])
+                  new = raised_by_text.get((f["path"], f.get("content_id")))
+                  if new is None and raised_by_id.get(f["id"], {}).get("path") == f["path"]:
+                      new = raised_by_id[f["id"]]  # Records from before findings kept their full-text hash.
                   if new is not None:
                       raised_by_id.pop(new["id"], None)
                       raised_by_text.pop((new["path"], new["content_id"]), None)
@@ -769,7 +774,8 @@ jobs:
           def supports_flex(model):
               """OpenAI offers Flex for o3, o4-mini and the GPT-5 and later families, but not o3-mini or older models."""
               name = model.removeprefix("openai/")
-              return re.fullmatch(r"(o3|o4-mini)(-\d{4}-\d{2}-\d{2})?|gpt-[5-9].*", name) is not None and "-chat" not in name
+              return (re.fullmatch(r"(o3|o4-mini)(-\d{4}-\d{2}-\d{2})?|gpt-[5-9].*", name) is not None
+                      and "-chat" not in name and not responses_only(model))
 
 
           def openai_body(model, effort, tier, prompt):
@@ -805,9 +811,10 @@ jobs:
               except urllib.error.HTTPError as error:
                   detail = error.read().decode(errors="replace")
                   error.close()
-                  if error.code != 429 or "service_tier" not in body or FLEX_UNAVAILABLE not in detail:
+                  if "service_tier" not in body or not (
+                          (error.code == 429 and FLEX_UNAVAILABLE in detail) or (error.code == 400 and "service_tier" in detail)):
                       raise
-                  body.pop("service_tier")  # Flex has no capacity: the standard tier.
+                  body.pop("service_tier")  # Flex has no capacity or is not offered for this model: standard tier.
                   request = urllib.request.Request(request.full_url, data=json.dumps(body).encode(), method="POST",
                                                    headers=dict(request.header_items()))
                   result = json.loads(send(request, timeout=600)[0])
@@ -857,8 +864,9 @@ jobs:
                       if error.code in (400, 404) and "v1/responses" in detail:
                           # Chat Completions does not serve this model; the Responses API does.
                           return call_responses(model, effort, tier if "service_tier" in body else "", prompt, keys)
-                      if error.code == 429 and "service_tier" in body and FLEX_UNAVAILABLE in detail:
-                          body.pop("service_tier")  # Flex has no capacity: the standard tier.
+                      if "service_tier" in body and (
+                              (error.code == 429 and FLEX_UNAVAILABLE in detail) or (error.code == 400 and "service_tier" in detail)):
+                          body.pop("service_tier")  # Flex has no capacity or is not offered for this model: standard tier.
                       elif error.code == 400 and body["response_format"]["type"] == "json_schema" and (
                               "response_format" in detail or "json_schema" in detail):
                           # A model without Structured Outputs: JSON mode, with the shape spelled out.
@@ -883,9 +891,10 @@ jobs:
               for item in items if isinstance(items, list) else []:
                   if not isinstance(item, dict) or not isinstance(item.get("id"), str) or item["id"] not in verdicts:
                       continue
-                  verdict = item.get("verdict")
-                  if isinstance(verdict, str) and verdict in VERDICTS:
-                      verdicts[item["id"]] = (verdict, str(item.get("reason") or "")[:500])
+                  verdict, reason = item.get("verdict"), item.get("reason")
+                  # A verdict without its reason is no evidence, least of all for "fixed".
+                  if isinstance(verdict, str) and verdict in VERDICTS and isinstance(reason, str) and reason.strip():
+                      verdicts[item["id"]] = (verdict, reason[:500])
               return verdicts
 
 
@@ -955,7 +964,7 @@ jobs:
                       "PR_REVIEWER.PERSISTENT_COMMENT": "true" if plan_result["mode"] == "full" else "false",
                   })
                   code, log = run_streaming(PR_AGENT, env)
-                  if code != 0 and "LITELLM.EXTRA_BODY" in env and FLEX_UNAVAILABLE in log:
+                  if code != 0 and "LITELLM.EXTRA_BODY" in env and (FLEX_UNAVAILABLE in log or "service_tier" in log):
                       # Flex failed before any model output, so the retry is not billed twice.
                       print("Flex has no capacity right now; retrying the review on the standard tier.", flush=True)
                       del env["LITELLM.EXTRA_BODY"]
@@ -1038,6 +1047,14 @@ jobs:
                               return file.get("patch")
                   return pr_patches.get(path)
 
+              if plan_result.get("renames_complete") is False:
+                  # A finding whose file vanished may have been renamed beyond GitHub's 300-file list; a missing
+                  # file is then no evidence of a fix, so it stays open without asking the verifier.
+                  for f in list(to_verify):
+                      if github.file_at(repo, f["path"], head_sha) is None:
+                          f["check"] = {"verdict": "uncertain", "sha": head_sha,
+                                        "reason": "the file is gone and the push was too large to see whether it was renamed"}
+                          to_verify.remove(f)
               usage = []
               if to_verify:
                   ask = ask or (lambda prompt: call_model(verifier_model, verifier_effort, prompt, keys))

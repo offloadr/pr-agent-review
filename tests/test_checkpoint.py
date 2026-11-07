@@ -265,6 +265,32 @@ class VerifierRequestTests(unittest.TestCase):
             self.assertEqual(cp.openai_body(model, "", "flex", "p")["service_tier"], "flex", model)
         self.assertEqual(cp.openai_body("gpt-4o", "", "priority", "p")["service_tier"], "priority")
 
+    def test_pro_models_get_no_flex(self):
+        self.assertFalse(cp.supports_flex("gpt-5-pro"))
+        self.assertFalse(cp.supports_flex("openai/gpt-6.1-sol-pro"))
+        self.assertTrue(cp.supports_flex("gpt-6.1-sol"))
+
+    def test_a_rejected_service_tier_is_retried_on_the_standard_tier(self):
+        import io
+        import os
+        import urllib.error
+        bodies = []
+
+        def fake_send(request, timeout, attempts=3):
+            body = json.loads(request.data)
+            bodies.append(body)
+            if "service_tier" in body:
+                raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(
+                    b"{\"error\": \"Invalid value for 'service_tier': flex is not supported for this model.\"}"))
+            return json.dumps({"choices": [{"message": {"content": '{"verdicts": []}'}}]}).encode(), {}
+        saved, cp.send = cp.send, fake_send
+        os.environ["SERVICE_TIER"] = "flex"
+        try:
+            cp.call_model("gpt-6.1-sol", "medium", "prompt", {"openai": "k"})
+        finally:
+            cp.send = saved
+        self.assertEqual(["service_tier" in b for b in bodies], [True, False])
+
     def test_chat_variants_get_neither_reasoning_effort_nor_flex(self):
         body = cp.openai_body("gpt-5-chat-latest", "medium", "flex", "p")
         self.assertNotIn("reasoning_effort", body)
@@ -316,7 +342,7 @@ class ResponsesFlexTests(unittest.TestCase):
             return json.dumps(answer).encode(), {}
         saved, cp.send = cp.send, fake_send
         try:
-            answer, _ = cp.call_responses("gpt-6.1-sol-pro", "high", "flex", "prompt", {"openai": "k"})
+            answer, _ = cp.call_responses("gpt-6.1-sol", "high", "flex", "prompt", {"openai": "k"})
         finally:
             cp.send = saved
         self.assertEqual(answer, {"verdicts": []})
@@ -393,6 +419,11 @@ class VerdictTests(unittest.TestCase):
         for answer in ({"verdicts": [{"id": ["1"], "verdict": "fixed"}]}, {"verdicts": "fixed"},
                        {"verdicts": [{"id": "1", "verdict": ["fixed"]}]}, None, ["fixed"]):
             self.assertEqual(cp.parse_verdicts(answer, ["1"])["1"][0], "uncertain", answer)
+
+    def test_verdict_without_a_reason_is_uncertain(self):
+        for item in ({"id": "1", "verdict": "fixed"}, {"id": "1", "verdict": "fixed", "reason": ""},
+                     {"id": "1", "verdict": "fixed", "reason": 7}):
+            self.assertEqual(cp.parse_verdicts({"verdicts": [item]}, ["1"])["1"][0], "uncertain", item)
 
     def test_missing_unknown_and_malformed_verdicts_are_uncertain(self):
         verdicts = cp.parse_verdicts({"verdicts": [{"id": "1", "verdict": "fixed", "reason": "r"},
@@ -790,6 +821,35 @@ class ReviewTests(unittest.TestCase):
         run_review(github, B, review(), verdicts={finding["id"]: "fixed"}, prompts=prompts)
         self.assertEqual(len(prompts), 1)
         self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
+
+    def test_new_file_at_a_renamed_findings_old_path_gets_its_own_finding(self):
+        github = self.first_run()
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.files = [f for f in github.files if f["filename"] != "x.py"] + [{"filename": "moved.py", "patch": "@@"}]
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "moved.py", "previous_filename": "x.py", "status": "renamed"}]}
+        run_review(github, B, review(), verdicts={race: "fixed"})
+        # A new x.py arrives with the same wording of the same issue.
+        github.heads = [C]
+        github.files.append({"filename": "x.py", "patch": "@@"})
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, C, review(issue("x.py", "Race", "Two saves interleave.")))
+        races = {f["path"]: f["state"] for f in github.state()["findings"] if f["header"] == "Race"}
+        self.assertEqual(races, {"moved.py": "FIXED", "x.py": "ACTIVE"})
+
+    def test_vanished_file_after_a_capped_comparison_is_not_verified_as_fixed(self):
+        github = FakeGitHub(A, ["x.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        github.heads = [B]
+        github.files = [{"filename": f"f{i}.py"} for i in range(300)]
+        github.contents["x.py"] = None  # Renamed somewhere beyond the 300 files GitHub listed.
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": f"f{i}.py"} for i in range(300)]}
+        prompts = []
+        _, calls, _ = run_review(github, B, review(), prompts=prompts)
+        self.assertEqual((calls[0]["mode"], prompts), ("full", []))
+        race = github.state()["findings"][0]
+        self.assertEqual((race["state"], race["check"]["verdict"]), ("ACTIVE", "uncertain"))
 
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
