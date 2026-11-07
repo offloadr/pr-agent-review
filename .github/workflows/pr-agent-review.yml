@@ -412,8 +412,52 @@ jobs:
               return "\n".join(lines)
 
 
+          # Pruned findings' ids and dismissed threads are kept within this budget, oldest dropped first.
+          HISTORY_CHARS = 20_000
+
+
+          def history_key(path, fingerprint):
+              return hashlib.sha256(f"{path}|{fingerprint}".encode()).hexdigest()[:12]
+
+
+          def history_entries(finding):
+              """Compact entries for a pruned dismissal's threads: a hash of each thread identity, plus the
+              finding's current path when it moved there through a rename."""
+              entries = []
+              for i in identities(finding):
+                  entry = {"key": history_key(i["path"], i["fingerprint"])}
+                  if finding["path"] != i["path"]:
+                      entry["path"] = finding["path"]
+                  entries.append(entry)
+              return entries
+
+
+          def history_entry_for(thread, entries):
+              """The history entry a thread belongs to, or None."""
+              fingerprint = thread_fingerprint(thread)
+              if fingerprint is None:
+                  return None
+              key = history_key(thread["path"], fingerprint)
+              for entry in entries:
+                  # Entries written before keys were hashed hold the identity itself.
+                  if entry.get("key") == key or (entry.get("fingerprint") == fingerprint and entry.get("path") == thread["path"]
+                                                 and "key" not in entry):
+                      return entry
+              return None
+
+
+          def bound_history(state):
+              """Keep the pruned-finding history within its budget, dropping the oldest entries first."""
+              lists = ("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned")
+              while len(json.dumps([state.get(name) or [] for name in lists])) > HISTORY_CHARS:
+                  longest = max(lists, key=lambda name: len(json.dumps(state.get(name) or [])))
+                  state[longest] = (state.get(longest) or [])[1:]
+                  state["history_trimmed"] = True
+
+
           def fit_comment(state):
               """Render the checkpoint within GitHub's comment limit, dropping the oldest fixed findings first."""
+              bound_history(state)
               body = render_comment(state)
               while len(body) > COMMENT_LIMIT:
                   fixed = [i for i, f in enumerate(state["findings"]) if f["state"] == "FIXED"]
@@ -435,12 +479,13 @@ jobs:
                       # match a new finding in a recreated file there.
                       state.setdefault("dismissed_ids", []).append(current_key(dismissed))
                       # Its threads stay known (about 60 characters each), so unresolving one withdraws the dismissal.
-                      state.setdefault("dismissed_threads", []).extend(identities(dismissed))
+                      state.setdefault("dismissed_threads", []).extend(history_entries(dismissed))
                   elif any(len(f["content"]) > 300 for f in state["findings"]):
                       for f in state["findings"]:
                           f["content"] = f["content"][:300]
                   else:
                       raise RunFailed("Too many open findings to store in one checkpoint comment.")
+                  bound_history(state)
                   body = render_comment(state)
               return body
 
@@ -810,7 +855,9 @@ jobs:
               renamed = sorted({f["renamed_from"] for f in findings if f.get("renamed_from") and f["renamed_from"] != path})
               note = f" (renamed from {', '.join(renamed)}; the findings were reported against the old name)" if renamed else ""
               return (f"File: {path}{note}\n\nFindings:\n\n{items}\n\n"
-                      f"Diff of this file since the findings were last checked:\n```diff\n{(diff or '(no diff available)')[:DIFF_CONTEXT_CHARS]}\n```\n\n"
+                      f"Diff of this file since the findings were last checked:\n```diff\n"
+                      f"{('(no change to this file since then)' if diff == '' else diff or '(no diff available)')[:DIFF_CONTEXT_CHARS]}"
+                      f"\n```\n\n"
                       f"Current file:\n```\n{file_context(content, findings)}\n```\n\n"
                       + (f"Other changes in this push, which can also fix a finding (for example in a helper it calls):\n"
                          f"```diff\n{other_changes[:DIFF_CONTEXT_CHARS // 2]}\n```\n\n" if other_changes else "")
@@ -1114,13 +1161,13 @@ jobs:
               # push that fixes it gets it verified.
               record_dismissals(previous, threads, head_sha)
               for t in threads:
-                  if t["resolved"] or not thread_posts(t, {"threads": dismissed_threads}) or \
-                          any(thread_posts(t, f) for f in previous):
+                  entry = None if t["resolved"] else history_entry_for(t, dismissed_threads)
+                  if entry is None or any(thread_posts(t, f) for f in previous):
                       continue
-                  restored = finding_from_thread(t, (checkpoint or {}).get("head_sha") or head_sha)
+                  restored = finding_from_thread(t, (checkpoint or {}).get("head_sha") or head_sha, entry.get("path"))
                   if restored is not None:
                       previous.append(restored)
-                      dismissed_threads = [i for i in dismissed_threads if not thread_posts(t, {"threads": [i]})]
+                      dismissed_threads = [e for e in dismissed_threads if e is not entry]
                       dismissed_ids.discard(current_key(restored))
               security = (checkpoint or {}).get("security") or {}
               uncovered = sorted(set((checkpoint or {}).get("uncovered") or []) & pr_paths)
@@ -1152,9 +1199,11 @@ jobs:
               def read_diff(path, since):
                   if since:
                       comparison = compare(since, head_sha)
-                      for file in (comparison or {}).get("files") or []:
-                          if path in (file["filename"], file.get("previous_filename")):
-                              return file.get("patch")
+                      if comparison is not None:
+                          for file in comparison.get("files") or []:
+                              if path in (file["filename"], file.get("previous_filename")):
+                                  return file.get("patch")
+                          return ""  # Unchanged since the finding was checked: no fix evidence in this file.
                   return pr_patches.get(path)
 
               if plan_result.get("renames_complete") is False:
@@ -1273,7 +1322,7 @@ jobs:
                                                            for t in matching)
 
 
-          def finding_from_thread(thread, checked_sha):
+          def finding_from_thread(thread, checked_sha, current_path=None):
               """Rebuild a pruned dismissed finding from its inline thread when the dismissal is withdrawn."""
               fingerprint = thread_fingerprint(thread)
               body = DEDUP_MARKER_RE.sub("", thread.get("body") or "")
@@ -1282,9 +1331,9 @@ jobs:
               header, content = (match.group(1), match.group(2).strip()) if match else ("", body)
               if not fingerprint or not content:
                   return None
-              path = thread["path"]
+              path = current_path or thread["path"]  # Where the finding lives now, if it followed a rename.
               return {"id": finding_id(path, header, content), "path": path, "header": header,
-                      "threads": [{"path": path, "fingerprint": fingerprint}], "content_id": content_id(header, content),
+                      "threads": [{"path": thread["path"], "fingerprint": fingerprint}], "content_id": content_id(header, content),
                       "content": content[:CONTENT_CHARS], "line": None, "state": "ACTIVE", "first_seen": checked_sha,
                       "checked_sha": checked_sha, "check": {"verdict": "uncertain", "sha": checked_sha,
                                                             "reason": "its dismissal was withdrawn after it was pruned"}}
@@ -1317,9 +1366,10 @@ jobs:
                   lines.append(f"- [{location}]({url}) {f['header']}: {f['content'].split(chr(10))[0][:200]}")
               # A dismissed finding pruned from the checkpoint is open again once one of its threads is unresolved.
               retained = [f for f in state["findings"] if f["state"] in ("ACTIVE", "DISMISSED")]
-              withdrawn = {"threads": state.get("dismissed_threads") or []}
+              history = state.get("dismissed_threads") or []
               for t in threads:
-                  if not t["resolved"] and thread_posts(t, withdrawn) and not any(thread_posts(t, f) for f in retained):
+                  if not t["resolved"] and history_entry_for(t, history) is not None and \
+                          not any(thread_posts(t, f) for f in retained):
                       lines.append(f"- [{t['path']}]({t['url']}) A dismissed finding's thread was unresolved again.")
               return lines
 
@@ -1332,11 +1382,12 @@ jobs:
               # reintroduced the finding; resolving it here would dismiss that.
               saved_at = moment(state.get("saved_at"))
               # Nor a thread a dismissed finding also posts: unresolving it withdrew that dismissal.
-              protected = active + [f for f in state["findings"] if f["state"] == "DISMISSED"] + \
-                  [{"threads": state.get("dismissed_threads") or []}]
+              protected = active + [f for f in state["findings"] if f["state"] == "DISMISSED"]
+              history = state.get("dismissed_threads") or []
               return [t["id"] for t in threads
                       if not t["resolved"] and moment(t.get("created_at")) <= saved_at
-                      and any(thread_posts(t, f) for f in fixed) and not any(thread_posts(t, f) for f in protected)]
+                      and any(thread_posts(t, f) for f in fixed) and not any(thread_posts(t, f) for f in protected)
+                      and history_entry_for(t, history) is None]
 
 
           def gate_main(github, repo, pr, head_sha, out=print, summary_path=None, sleep=time.sleep):

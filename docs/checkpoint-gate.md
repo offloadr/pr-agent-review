@@ -97,6 +97,9 @@ Re-running only this job re-evaluates dismissals without paying for a review.
   runs until one covers them. The footer lists at most 50 files; beyond that the checkpoint records
   that more were left out, and the next push gets a full review to name them. Only pull requests
   larger than PR-Agent's call budget get there, and for those every push is a full review again.
+- The history of pruned findings (fixed and dismissed ids, hashed thread identities of dismissed
+  ones) is kept within about 20,000 characters, oldest dropped first. On a very long-lived pull
+  request, unresolving the thread of a long-pruned dismissal may then go unnoticed.
 - A delta review sees no earlier findings, so it may raise a still-present issue again in different
   words. That becomes a second finding; both close when verified fixed.
 - PR-Agent's security verdict is not tied to files, so while a concern is open every run is a

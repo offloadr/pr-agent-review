@@ -1378,6 +1378,49 @@ class GateTests(unittest.TestCase):
         self.assertGreater(state["pruned_dismissed"], 0)
         self.assertEqual(self.gate(github, head=previous)[0], 0)
 
+    def test_full_review_does_not_show_an_unchanged_files_old_patch_as_fix_evidence(self):
+        github = FakeGitHub(A, ["x.py", "y.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave."), security="Injection: y.py."))
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "y.py", "patch": "+escape"}]}
+        prompts = []
+        _, calls, _ = run_review(github, B, review(), prompts=prompts)
+        self.assertEqual(calls[0]["mode"], "full")
+        x_prompt = next(p for p in prompts if p.startswith("File: x.py"))
+        self.assertNotIn("@@ patch of x.py", x_prompt)
+        self.assertIn("(no change to this file since then)", x_prompt)
+
+    def test_withdrawn_pruned_dismissal_of_a_renamed_finding_restores_at_its_new_path(self):
+        dismissed = {"id": "1", "path": "moved.py", "header": "Race", "content": "Two saves interleave.",
+                     "state": "DISMISSED", "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint(
+                         "x.py", "Race", "Two saves interleave.")}]}
+        github = self.reviewed()
+        state = github.state()
+        state["dismissed_threads"] = cp.history_entries(dismissed)
+        github.issue_comments[0]["body"] = cp.render_comment(state)
+        github.files = [{"filename": "moved.py", "patch": "@@"}]
+        github.contents["moved.py"] = "the moved code"
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.")]  # Unresolved: withdrawn.
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "moved.py", "patch": "+lock"}]}
+        prompts = []
+        run_review(github, B, review(), prompts=prompts)
+        restored = github.state()["findings"][0]
+        self.assertEqual(restored["path"], "moved.py")
+        self.assertTrue(prompts[0].startswith("File: moved.py"))
+        self.assertIn("the moved code", prompts[0])
+
+    def test_history_of_many_long_path_dismissals_stays_within_its_budget(self):
+        state = {"head_sha": A, "findings": [], "security": {}, "runs": [], "dismissed_threads": [], "dismissed_ids": []}
+        for i in range(400):
+            path = f"{'very/long/directory/name/' * 10}file{i}.py"
+            moved = {"id": str(i), "path": path + ".moved", "threads": [{"path": path, "fingerprint": f"{i:012x}"}]}
+            state["dismissed_threads"].extend(cp.history_entries(moved))
+            state["dismissed_ids"].append(f"{i:012x}")
+        body = cp.fit_comment(state)
+        self.assertLessEqual(len(body), cp.COMMENT_LIMIT)
+        self.assertTrue(state["history_trimmed"])
+
     def test_pruned_renamed_dismissal_does_not_dismiss_a_new_finding_at_the_old_path(self):
         github = self.reviewed()
         state = github.state()
