@@ -54,7 +54,8 @@ findings are kept with their evidence rather than deleted.
    since it was last checked, goes to the verifier model. Findings are batched per file: one call
    gets the findings, the file at head and its diff since the finding was last checked, and must
    return `fixed`, `still_present` or `uncertain` per finding, with a reason. Only `fixed` closes a
-   finding. A missing, malformed or `uncertain` verdict keeps it active. Active findings in files the push did
+   finding. A missing, malformed or `uncertain` verdict keeps it active, and keeps its range: the
+   next verification still sees every change since the last definite verdict. Active findings in files the push did
    not change go to the verifier too, all in one call with the push's diff and a window of each
    finding's file, because a change elsewhere (a helper that stops returning None) can fix them. A verifier error fails the
    run.
@@ -72,7 +73,7 @@ Reads the checkpoint and fails unless it is for the current head. An active find
 it is verified fixed or every inline thread posting it is resolved (a reviewer dismissing it). A
 finding raised again after it was fixed, even after its record was pruned, is dismissed only by
 resolving a thread opened since it came back, or by a resolved thread whose latest comment, written
-since then by an owner, member or collaborator, says "dismiss". GitHub does not report when a
+since then by an owner, member or collaborator, starts with `/dismiss`. GitHub does not report when a
 thread was resolved, so an old resolution or a plain later reply is no evidence. A finding keeps every thread identity it was
 posted under, so a rename adds the new location instead of replacing the old one.
 The findings job resolves only threads that existed when its checkpoint was saved, so a gate left

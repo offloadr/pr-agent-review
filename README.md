@@ -20,7 +20,7 @@ Every push is reviewed, but only the first review reads the whole pull request:
 
 To dismiss a finding you disagree with, resolve its thread and re-run the failed **findings** job. A
 finding that comes back after it was fixed is dismissed by resolving a thread opened for the new
-occurrence, or by replying with "dismiss" on its old thread (as an owner, member or collaborator)
+occurrence, or by replying `/dismiss` on its old thread (as an owner, member or collaborator)
 and resolving it: the earlier occurrence's resolution does not count.
 That costs no API credits; only a new push triggers another review. The design and its limits are
 in [docs/checkpoint-gate.md](docs/checkpoint-gate.md).

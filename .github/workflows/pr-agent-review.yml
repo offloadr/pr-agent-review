@@ -693,7 +693,17 @@ jobs:
           COVERAGE_HEADING = "⚠️ **Review coverage:**"
 
 
-          def decode_code_span(span):
+          def coverage_path(span, pr_paths):
+              """The file a footer entry names: an exact PR file name first (a name may contain a literal
+              backslash-n), then the name with PR-Agent's line-break escapes undone."""
+              raw = decode_code_span(span, unescape=False)
+              if pr_paths is not None and raw in pr_paths:
+                  return raw
+              decoded = decode_code_span(span)
+              return repository_path(decoded, pr_paths) if pr_paths is not None else decoded
+
+
+          def decode_code_span(span, unescape=True):
               """Undo PR-Agent's _markdown_code_span: a backtick fence, one padding space each side when the
               name starts or ends with a space or backtick, and escaped line breaks."""
               match = re.fullmatch(r"(`+)(.*)\1", span, re.DOTALL)
@@ -702,10 +712,12 @@ jobs:
               inner = match.group(2)
               if len(inner) >= 2 and inner.startswith(" ") and inner.endswith(" "):
                   inner = inner[1:-1]
+              if not unescape:
+                  return inner
               return inner.replace("\\n", "\n").replace("\\r", "\r")
 
 
-          def coverage_gaps(comments, since):
+          def coverage_gaps(comments, since, pr_paths=None):
               """Files PR-Agent's coverage footer, in its summary from this run, says it left out or clipped.
 
               Returns (paths, whether the footer listed only some of them)."""
@@ -719,7 +731,7 @@ jobs:
                       if line.startswith(COVERAGE_HEADING):
                           listing = True
                       elif listing and line.startswith("- "):
-                          paths.add(decode_code_span(line[2:]))
+                          paths.add(coverage_path(line[2:], pr_paths))
                       elif listing and line.startswith("... and ") and line.endswith(" more"):
                           more = True
                       elif listing and line.strip():
@@ -943,12 +955,15 @@ jobs:
               for f in group:
                   verdict, reason = verdicts[f["id"]]
                   f["check"] = {"verdict": verdict, "reason": reason, "sha": head_sha}
-                  f["checked_sha"] = head_sha
+                  if verdict != "uncertain":
+                      # An uncertain verdict keeps the earlier range, so a fix it could not confirm stays in
+                      # the diff the next verification sees.
+                      f["checked_sha"] = head_sha
                   if verdict == "fixed":
                       f["state"] = "FIXED"
 
 
-          def verify(findings, head_sha, read_file, read_diff, ask, push_files=()):
+          def verify(findings, head_sha, read_file, read_diff, ask, changes_since=lambda sha: []):
               """Verify findings in place, batched per file; returns the usage records."""
               usage = []
               by_path = {}
@@ -958,7 +973,7 @@ jobs:
                   since = {f["checked_sha"] for f in group}
                   # One diff per batch: since the findings' common check commit, or the whole PR patch.
                   base = group[0]["checked_sha"] if len(since) == 1 else None
-                  others = "\n".join(f"--- {f['filename']}\n{f.get('patch') or '(no patch)'}" for f in push_files
+                  others = "\n".join(f"--- {f['filename']}\n{f.get('patch') or '(no patch)'}" for f in changes_since(base)
                                       if path not in (f["filename"], f.get("previous_filename")))
                   prompt = verifier_prompt(path, group, read_file(path), read_diff(path, base), others)
                   answer, used = ask(prompt)
@@ -1073,8 +1088,7 @@ jobs:
                   raised = findings_from_review(review, head_sha, pr_paths)
                   findings, to_verify, pruned, elsewhere = merge_findings(previous, raised, plan_result, head_sha, pruned,
                                                                           fixed_ids, started_at)
-                  gaps, more_gaps = coverage_gaps(github.comments(repo, pr), started_at)
-                  gaps = [repository_path(g, pr_paths) for g in gaps]
+                  gaps, more_gaps = coverage_gaps(github.comments(repo, pr), started_at, pr_paths)
                   # The latest review's verdict replaces the earlier one, as with PR-Agent's own summary.
                   security = {"sha": head_sha, "concern": security_concern(review)}
                   reviewed = pr_paths if plan_result["mode"] == "full" else set(plan_result["files"])
@@ -1106,18 +1120,32 @@ jobs:
               usage = []
               ask = ask or (lambda prompt: call_model(verifier_model, verifier_effort, prompt, keys))
               read_file = lambda path: github.file_at(repo, path, head_sha)  # noqa: E731
-              push_files = []
-              if checkpoint is not None and checkpoint["head_sha"] != head_sha and (to_verify or elsewhere):
-                  push_files = (compare(checkpoint["head_sha"], head_sha) or {}).get("files") or []
+              since_checkpoint = (checkpoint or {}).get("head_sha")
+
+              def changes_since(sha):
+                  """Files changed from a commit to this head, falling back to the push when it is unknown."""
+                  for base in (sha, since_checkpoint):
+                      if base and base != head_sha:
+                          comparison = compare(base, head_sha)
+                          if comparison is not None:
+                              return comparison.get("files") or []
+                  return []
+
               if to_verify:
-                  usage = verify(to_verify, head_sha, read_file, read_diff, ask, push_files)
-              push_diff = "\n".join(f"--- {f['filename']}\n{f.get('patch') or '(no patch)'}" for f in push_files)
-              if elsewhere and push_diff:
-                  # One call for every open finding outside the changed files, so cost does not grow per file.
-                  answer, used = ask(elsewhere_prompt(elsewhere, read_file, push_diff))
+                  usage = verify(to_verify, head_sha, read_file, read_diff, ask, changes_since)
+              # One call per range for the open findings outside the changed files (usually one call in all),
+              # so cost does not grow per file.
+              by_range = {}
+              for f in elsewhere:
+                  by_range.setdefault(f["checked_sha"], []).append(f)
+              for since, group in by_range.items():
+                  push_diff = "\n".join(f"--- {f['filename']}\n{f.get('patch') or '(no patch)'}" for f in changes_since(since))
+                  if not push_diff:
+                      continue
+                  answer, used = ask(elsewhere_prompt(group, read_file, push_diff))
                   usage.append(used)
-                  apply_verdicts(elsewhere, parse_verdicts(answer, [f["id"] for f in elsewhere]), head_sha)
-                  to_verify = to_verify + elsewhere
+                  apply_verdicts(group, parse_verdicts(answer, [f["id"] for f in group]), head_sha)
+                  to_verify = to_verify + group
               for f in to_verify:
                   out(f"- {f['check']['verdict']}: {f['path']} {f['header']} ({f['check']['reason'][:120]})")
 
@@ -1169,12 +1197,12 @@ jobs:
 
               GitHub does not say when a thread was resolved, so an old resolution or a later reply proves
               nothing. Either the thread was opened for this occurrence, or a collaborator's latest comment,
-              written since the finding came back, says to dismiss it."""
+              written since the finding came back, starts with the /dismiss command."""
               if (thread.get("created_at") or "") > reopened_at:
                   return True
               return ((thread.get("last_comment_at") or "") > reopened_at
                       and thread.get("last_comment_association") in DISMISSING_ASSOCIATIONS
-                      and re.search(r"\bdismiss", thread.get("last_comment_body") or "", re.IGNORECASE) is not None)
+                      and re.match(r"\s*/dismiss\b", thread.get("last_comment_body") or "", re.IGNORECASE) is not None)
 
 
           def open_findings(state, threads, summary_url):

@@ -781,6 +781,24 @@ class ReviewTests(unittest.TestCase):
         _, calls, _ = run_review(github, B, review())
         self.assertIn("big.py ", calls[0]["files"])
 
+    def test_file_name_with_a_literal_backslash_n_left_out_is_retried(self):
+        name = "src/a\\note.py"  # A real backslash followed by n.
+        github = FakeGitHub(A, ["small.py", name])
+        original_comments = github.comments
+
+        def comments_with_footer(repo, pr):
+            footer = {"user": {"login": "github-actions[bot]"}, "updated_at": "9999-01-01T00:00:00Z",
+                      "body": "<!-- pr-agent:review:full -->\n⚠️ **Review coverage:** The following files were not "
+                              "included in this review because of the token budget:\n- `" + name + "`"}
+            return original_comments(repo, pr) + ([footer] if github.heads == [A] else [])
+        github.comments = comments_with_footer
+        run_review(github, A, review())
+        self.assertEqual(github.state()["uncovered"], [name])
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "small.py"}]}
+        _, calls, _ = run_review(github, B, review())
+        self.assertIn(name, calls[0]["files"])
+
     def test_unlisted_coverage_gap_schedules_a_full_review_that_clears_it(self):
         github = FakeGitHub(A, ["small.py", "big.py"])
         original_comments = github.comments
@@ -897,6 +915,25 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(prompts[0].startswith("File: caller.py"))
         self.assertIn("+    return ''", prompts[0])
         self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
+
+    def test_an_uncertain_verdict_keeps_the_fix_in_the_next_verification(self):
+        github = FakeGitHub(A, ["caller.py", "helper.py"])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "helper.py", "patch": "-    return None\n+    return ''"}]}
+        run_review(github, B, review())  # The verifier gives no verdict: uncertain.
+        finding = github.state()["findings"][0]
+        self.assertEqual((finding["check"]["verdict"], finding["checked_sha"]), ("uncertain", A))
+        github.heads = [C]
+        github.compares[(A, C)] = {"status": "ahead", "files": [
+            {"filename": "caller.py", "patch": "-x  = 1\n+x = 1"},
+            {"filename": "helper.py", "patch": "-    return None\n+    return ''"}]}
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "caller.py", "patch": "-x  = 1\n+x = 1"}]}
+        prompts = []
+        run_review(github, C, review(), prompts=prompts)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("+    return ''", prompts[0])
 
     def test_capped_comparison_keeps_the_missing_file_safeguard_in_any_full_review(self):
         github = FakeGitHub(A, ["x.py"])
@@ -1128,7 +1165,7 @@ class GateTests(unittest.TestCase):
         run_review(github, C, review(issue("x.py", "Race", "Two saves interleave.")))
         # A collaborator replies "dismiss" on the old thread after the finding came back, and resolves it.
         reply = posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True, last_comment_at="2999-01-01T00:00:00Z")
-        reply.update(last_comment_body="Dismiss: intended, see the design doc.", last_comment_association="COLLABORATOR")
+        reply.update(last_comment_body="/dismiss intended, see the design doc.", last_comment_association="COLLABORATOR")
         github.threads = [reply]
         self.assertEqual(self.gate(github, head=C)[0], 0)
 
@@ -1141,7 +1178,8 @@ class GateTests(unittest.TestCase):
         github.heads = [C]
         github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
         run_review(github, C, review(issue("x.py", "Race", "Two saves interleave.")))
-        for body, association in (("This is still broken.", "COLLABORATOR"), ("dismiss", "NONE")):
+        for body, association in (("This is still broken.", "COLLABORATOR"), ("/dismiss", "NONE"),
+                                  ("Do not dismiss: this still fails", "COLLABORATOR")):
             reply = posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True,
                            last_comment_at="2999-01-01T00:00:00Z")
             reply.update(last_comment_body=body, last_comment_association=association)
