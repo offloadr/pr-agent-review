@@ -232,6 +232,10 @@ jobs:
               """The run cannot produce a trustworthy checkpoint; nothing is saved."""
 
 
+          class NoReviewOutput(RunFailed):
+              """PR-Agent finished without producing a review."""
+
+
           def send(request, timeout, attempts=3):
               """Send with retries on rate limits, server errors and network errors; not on client errors."""
               for attempt in range(attempts):
@@ -1118,7 +1122,7 @@ jobs:
                               review = json.loads(line[len("review="):])
               # PR-Agent writes the review mapping itself (its data["review"]) as the output value.
               if not isinstance(review, dict) or not review:
-                  raise RunFailed("PR-Agent produced no review output.")
+                  raise NoReviewOutput("PR-Agent produced no review output.")
               return review
 
 
@@ -1178,14 +1182,26 @@ jobs:
                   findings, to_verify, pruned, elsewhere = merge_findings(previous, [], plan_result, head_sha, pruned, fixed_ids,
                                                                           occurrence_since, dismissed_ids)
               else:
-                  review = run_review(plan_result, pr_paths, user_globs, model, keys)
+                  try:
+                      review = run_review(plan_result, pr_paths, user_globs, model, keys)
+                  except NoReviewOutput:
+                      # A delta of files with no text diff (an extensionless binary, say) gives PR-Agent nothing
+                      # to review; that is nothing to review, not a failed review. Large text files also lack a
+                      # GitHub patch, but PR-Agent fetches those itself, so this applies only when it produced
+                      # nothing at all.
+                      if plan_result["mode"] != "delta" or any(pr_patches.get(p) for p in plan_result["files"]):
+                          raise
+                      out("PR-Agent found nothing to review in the changed files (no text diff).")
+                      review = {"key_issues_to_review": [], "security_concerns": "No", "no_text_diff": True}
                   validate_review(review)
                   raised = findings_from_review(review, head_sha, pr_paths)
                   findings, to_verify, pruned, elsewhere = merge_findings(previous, raised, plan_result, head_sha, pruned,
                                                                           fixed_ids, occurrence_since, dismissed_ids)
                   gaps, more_gaps = coverage_gaps(github.comments(repo, pr), started_at, pr_paths)
-                  # The latest review's verdict replaces the earlier one, as with PR-Agent's own summary.
-                  security = {"sha": head_sha, "concern": security_concern(review)}
+                  # The latest review's verdict replaces the earlier one, as with PR-Agent's own summary. A run
+                  # that reviewed nothing keeps the earlier verdict.
+                  if not review.get("no_text_diff"):
+                      security = {"sha": head_sha, "concern": security_concern(review)}
                   reviewed = pr_paths if plan_result["mode"] == "full" else set(plan_result["files"])
                   uncovered = sorted(((set((checkpoint or {}).get("uncovered") or []) - reviewed) | set(gaps)) & pr_paths)
                   if plan_result["mode"] != "full":
@@ -1256,6 +1272,9 @@ jobs:
                       (latest or {}).get("head_sha") != (checkpoint or {}).get("head_sha"):
                   raise RunFailed("Another run saved a newer checkpoint during this run.")
               record_dismissals(findings, threads, head_sha)
+              # A pruned dismissal's history entry is obsolete once a retained finding owns its thread again.
+              owned = [history_entry_for(t, dismissed_threads) for t in threads if any(thread_posts(t, f) for f in findings)]
+              dismissed_threads = [e for e in dismissed_threads if not any(e is o for o in owned)]
               runs = list((checkpoint or {}).get("runs") or [])
               runs.append({"head_sha": head_sha, "mode": plan_result["mode"], "files": len(plan_result["files"]),
                            "verified": len(to_verify), "verifier_usage": usage, "at": int(time.time())})

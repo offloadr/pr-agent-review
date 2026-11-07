@@ -998,6 +998,24 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("+    return ''", null_prompt)
         self.assertEqual(len(prompts), 2)
 
+    def test_delta_of_only_binary_files_with_no_review_output_advances(self):
+        github = FakeGitHub(A, ["x.py", "assets/image"])
+        run_review(github, A, review())
+        github.files = [{"filename": "x.py", "patch": "@@"}, {"filename": "assets/image"}]  # No text diff.
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "assets/image"}]}
+        code, calls, _ = run_review(github, B, cp.NoReviewOutput("PR-Agent produced no review output."))
+        self.assertEqual((code, calls[0]["files"]), (0, ["assets/image"]))
+        self.assertEqual(github.state()["head_sha"], B)
+
+    def test_no_review_output_for_a_text_change_still_fails(self):
+        github = FakeGitHub(A, ["x.py"])
+        run_review(github, A, review())
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        with self.assertRaises(cp.RunFailed):
+            run_review(github, B, cp.NoReviewOutput("PR-Agent produced no review output."))
+
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
         run_review(github, A, review(security="SQL injection: the query concatenates input."))
@@ -1479,6 +1497,28 @@ class GateTests(unittest.TestCase):
         self.assertEqual(restored["state"], "FIXED")
         self.assertEqual(github.state()["dismissed_threads"], [])
         code, _ = self.gate(github, head=B)
+        self.assertEqual((code, github.resolved), (0, ["T1"]))
+
+    def test_re_reported_pruned_dismissal_takes_over_its_history_and_can_be_fixed(self):
+        github = self.reviewed()
+        state = github.state()
+        record = {"id": "old", "path": "x.py", "content_id": cp.content_id("Race", "Two saves interleave."),
+                  "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", "Two saves interleave.")}]}
+        state["dismissed_threads"] = cp.history_entries(record)
+        state["dismissed_ids"] = [cp.current_key(record)]
+        github.issue_comments[0]["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review(issue("x.py", "Race", "Two saves interleave.")))  # Reported again.
+        self.assertEqual(github.state()["dismissed_threads"], [])
+        race = github.state()["findings"][0]
+        github.threads[0]["resolved"] = False  # Withdrawn; then a fix is pushed.
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+        run_review(github, C, review(), verdicts={race["id"]: "fixed"})
+        self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
+        code, _ = self.gate(github, head=C)
         self.assertEqual((code, github.resolved), (0, ["T1"]))
 
     def test_unresolving_a_pruned_dismissed_findings_thread_fails_the_gate(self):
