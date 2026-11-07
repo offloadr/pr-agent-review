@@ -980,6 +980,21 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertIn("+    return ''", prompts[0])
 
+    def test_unknown_rename_survives_a_same_head_rerun(self):
+        github = FakeGitHub(A, ["x.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        race = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.files = [{"filename": f"f{i}.py"} for i in range(300)]
+        github.contents["x.py"] = None
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": f"f{i}.py"} for i in range(300)]}
+        run_review(github, B, review())
+        prompts = []
+        run_review(github, B, review(), verdicts={race: "fixed"}, prompts=prompts)  # Rerun at the same head.
+        finding = github.state()["findings"][0]
+        self.assertEqual((finding["state"], prompts), ("ACTIVE", []))
+        self.assertTrue(finding["rename_unknown"])
+
     def test_capped_comparison_keeps_the_missing_file_safeguard_in_any_full_review(self):
         github = FakeGitHub(A, ["x.py"])
         run_review(github, A, review(issue("x.py", "Race", "Two saves interleave."), security="Injection: x.py."))
@@ -1695,8 +1710,33 @@ class GateTests(unittest.TestCase):
         github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
         run_review(github, C, review(), verdicts={race["id"]: "fixed"})
         self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
+        self.assertEqual(github.state()["dismissed_ids"], [])  # The old dismissal is forgotten.
         code, _ = self.gate(github, head=C)
         self.assertEqual((code, github.resolved), (0, ["T1"]))
+        # The fixed record is pruned, and the defect comes back with no inline location.
+        state = github.state()
+        record = state["findings"].pop()
+        state["fixed_ids"] = [record["id"], cp.current_key(record)]
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.threads[0]["resolved"] = True
+        github.heads = ["d" * 40]
+        github.compares[(C, "d" * 40)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, "d" * 40, review({"relevant_file": "x.py", "issue_header": "Race",
+                                             "issue_content": "Two saves interleave."}))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+        self.assertEqual(self.gate(github, head="d" * 40)[0], 1)
+
+    def test_trimmed_flag_survives_later_saves(self):
+        github = self.reviewed()
+        state = github.state()
+        state["history_trimmed"] = True
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "y.py"}]}
+        run_review(github, B, review())  # A save that needs no trimming.
+        self.assertTrue(github.state()["history_trimmed"])
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.")]
+        self.assertEqual(self.gate(github, head=B)[0], 1)
 
     def test_trimmed_history_fails_closed_on_an_untracked_unresolved_thread(self):
         github = self.reviewed()

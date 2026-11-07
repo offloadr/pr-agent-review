@@ -750,6 +750,7 @@ jobs:
                       if f["state"] == "FIXED":
                           reopen(f, started_at)
                       add_identities(f, new["threads"])
+                      f.pop("rename_unknown", None)
                       # A dismissed finding raised again stays dismissed: it was accepted, not fixed.
                       f.update(state="DISMISSED" if f["state"] == "DISMISSED" else "ACTIVE", line=new["line"],
                                checked_sha=head_sha,
@@ -1287,14 +1288,18 @@ jobs:
                           # GitHub lists at most 300 files, so a missing file may still have changed.
                   return pr_patches.get(path)
 
-              if plan_result.get("renames_complete") is False:
-                  # A finding whose file vanished may have been renamed beyond GitHub's 300-file list; a missing
-                  # file is then no evidence of a fix, so it stays open without asking the verifier.
-                  for f in list(to_verify):
+              # A finding whose file vanished in a push too large to list every rename may live on under another
+              # name; a missing file is then no evidence of a fix. It stays open without asking the verifier, on
+              # this run and later ones (reruns included), until its file is back or a review raises it again.
+              for f in list(to_verify):
+                  if plan_result.get("renames_complete") is False or f.get("rename_unknown"):
                       if github.file_at(repo, f["path"], head_sha) is None:
+                          f["rename_unknown"] = True
                           f["check"] = {"verdict": "uncertain", "sha": head_sha,
                                         "reason": "the file is gone and the push was too large to see whether it was renamed"}
                           to_verify.remove(f)
+                      else:
+                          f.pop("rename_unknown", None)
               usage = []
               ask = ask or (lambda prompt: call_model(verifier_model, verifier_effort, prompt, keys))
               read_file = lambda path: github.file_at(repo, path, head_sha)  # noqa: E731
@@ -1345,6 +1350,12 @@ jobs:
               # A pruned dismissal's history entry is obsolete once a retained finding owns its thread again.
               owned = [history_entry_for(t, dismissed_threads) for t in threads if any(thread_posts(t, f) for f in findings)]
               dismissed_threads = [e for e in dismissed_threads if not any(e is o for o in owned)]
+              # Nor does a retained finding that is not dismissed (taken over, or its dismissal withdrawn) keep a
+              # remembered dismissal that could later dismiss a reintroduction.
+              for f in findings:
+                  if f["state"] != "DISMISSED":
+                      dismissed_ids.discard(dismissed_key(f))
+                      dismissed_ids.discard(current_key(f))
               runs = list((checkpoint or {}).get("runs") or [])
               runs.append({"head_sha": head_sha, "mode": plan_result["mode"], "files": len(plan_result["files"]),
                            "verified": len(to_verify), "verifier_usage": usage, "at": int(time.time())})
@@ -1353,6 +1364,8 @@ jobs:
                        "fixed_ids": sorted(fixed_ids), "dismissed_ids": sorted(dismissed_ids),
                        "dismissed_threads": dismissed_threads,
                        "uncovered": uncovered, "uncovered_unlisted": more_gaps, "saved_at": now_utc(),
+                       # Once history was trimmed, the gate keeps failing closed on untracked threads.
+                       "history_trimmed": bool((checkpoint or {}).get("history_trimmed")),
                        "ignore_glob": list(user_globs),
                        "findings": findings, "security": security, "runs": runs[-KEPT_RUNS:],
                        "pruned_fixed": (checkpoint or {}).get("pruned_fixed", 0),
