@@ -1378,6 +1378,66 @@ class GateTests(unittest.TestCase):
         self.assertGreater(state["pruned_dismissed"], 0)
         self.assertEqual(self.gate(github, head=previous)[0], 0)
 
+    def test_pruned_renamed_dismissal_does_not_dismiss_a_new_finding_at_the_old_path(self):
+        github = self.reviewed()
+        state = github.state()
+        moved = {"path": "moved.py", "content_id": cp.content_id("Race", "Two saves interleave.")}
+        state["dismissed_ids"] = [cp.current_key(moved)]
+        github.issue_comments[0]["body"] = cp.render_comment(state)
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review({"relevant_file": "x.py", "issue_header": "Race",
+                                      "issue_content": "Two saves interleave."}))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+        self.assertEqual(self.gate(github, head=B)[0], 1)
+
+    def test_gate_does_not_resolve_a_thread_a_dismissed_finding_shares(self):
+        identity = {"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", "Two saves interleave.")}
+        fixed = {"id": "1", "path": "moved.py", "header": "Race", "content": "c", "state": "FIXED", "threads": [identity]}
+        dismissed = {"id": "2", "path": "x.py", "header": "Race", "content": "c", "state": "DISMISSED", "threads": [identity]}
+        state = {"findings": [fixed, dismissed], "saved_at": "9999-01-01T00:00:00Z"}
+        thread = posted("T1", "x.py", "Race", "Two saves interleave.")  # Unresolved: the dismissal was withdrawn.
+        self.assertEqual(cp.fixed_thread_ids(state, [thread]), [])
+        state["findings"] = [fixed]
+        state["dismissed_threads"] = [identity]
+        self.assertEqual(cp.fixed_thread_ids(state, [thread]), [])
+
+    def test_withdrawn_dismissal_is_verified_by_the_push_that_fixes_it(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "y.py"}]}
+        run_review(github, B, review())
+        race = github.state()["findings"][0]
+        self.assertEqual(race["state"], "DISMISSED")
+        github.threads[0]["resolved"] = False  # The dismissal is withdrawn before the fix is pushed.
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+        prompts = []
+        run_review(github, C, review(), verdicts={race["id"]: "fixed"}, prompts=prompts)
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
+
+    def test_pruned_dismissal_withdrawn_and_then_fixed_clears_through_verification(self):
+        github = self.reviewed()
+        state = github.state()
+        identity = {"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", "Two saves interleave.")}
+        state["dismissed_threads"] = [identity]
+        github.issue_comments[0]["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.")]  # Unresolved again.
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+        restored_id = cp.finding_id("x.py", "Race", "Two saves interleave.")
+        prompts = []
+        run_review(github, B, review(), verdicts={restored_id: "fixed"}, prompts=prompts)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("Two saves interleave.", prompts[0])
+        restored = github.state()["findings"][0]
+        self.assertEqual(restored["state"], "FIXED")
+        self.assertEqual(github.state()["dismissed_threads"], [])
+        code, _ = self.gate(github, head=B)
+        self.assertEqual((code, github.resolved), (0, ["T1"]))
+
     def test_unresolving_a_pruned_dismissed_findings_thread_fails_the_gate(self):
         finding = {"id": "1", "path": "x.py", "header": "Race", "content": "c" * 500, "line": 1, "state": "DISMISSED",
                    "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", "c" * 500)}],

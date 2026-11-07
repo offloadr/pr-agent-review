@@ -431,7 +431,9 @@ jobs:
                       index = next(i for i, f in enumerate(state["findings"]) if f["state"] == "DISMISSED")
                       dismissed = state["findings"].pop(index)
                       state["pruned_dismissed"] = state.get("pruned_dismissed", 0) + 1
-                      state.setdefault("dismissed_ids", []).extend([dismissed["id"], current_key(dismissed)])
+                      # By current path and full text only: an id from the path it was first reported at could
+                      # match a new finding in a recreated file there.
+                      state.setdefault("dismissed_ids", []).append(current_key(dismissed))
                       # Its threads stay known (about 60 characters each), so unresolving one withdraws the dismissal.
                       state.setdefault("dismissed_threads", []).extend(identities(dismissed))
                   elif any(len(f["content"]) > 300 for f in state["findings"]):
@@ -702,7 +704,7 @@ jobs:
                   add_identities(new, identities(record))
               # Its pruned record may be gone too, but its id is remembered.
               for new in raised_by_id.values():
-                  if new["id"] in dismissed_ids or current_key(new) in dismissed_ids:
+                  if current_key(new) in dismissed_ids:
                       new.update(state="DISMISSED", dismissed_sha=head_sha)  # Dismissed before its record was pruned.
                   elif (new["id"] in fixed_ids or current_key(new) in fixed_ids) and not new.get("reopened_at"):
                       reopen(new, started_at)
@@ -1102,10 +1104,24 @@ jobs:
               started_at = now_utc()
               # Threads created after the previous checkpoint was saved belong to whatever this run raises.
               occurrence_since = (checkpoint or {}).get("saved_at") or started_at
-              previous = (checkpoint or {}).get("findings") or []
+              threads = github.bot_threads(repo, pr)
+              previous = [dict(f) for f in (checkpoint or {}).get("findings") or []]
               pruned = (checkpoint or {}).get("pruned") or []
               fixed_ids = set((checkpoint or {}).get("fixed_ids") or [])
               dismissed_ids = set((checkpoint or {}).get("dismissed_ids") or [])
+              dismissed_threads = list((checkpoint or {}).get("dismissed_threads") or [])
+              # A withdrawn dismissal (its thread unresolved) is open before this run picks what to verify, so a
+              # push that fixes it gets it verified.
+              record_dismissals(previous, threads, head_sha)
+              for t in threads:
+                  if t["resolved"] or not thread_posts(t, {"threads": dismissed_threads}) or \
+                          any(thread_posts(t, f) for f in previous):
+                      continue
+                  restored = finding_from_thread(t, (checkpoint or {}).get("head_sha") or head_sha)
+                  if restored is not None:
+                      previous.append(restored)
+                      dismissed_threads = [i for i in dismissed_threads if not thread_posts(t, {"threads": [i]})]
+                      dismissed_ids.discard(current_key(restored))
               security = (checkpoint or {}).get("security") or {}
               uncovered = sorted(set((checkpoint or {}).get("uncovered") or []) & pr_paths)
               more_gaps = bool((checkpoint or {}).get("uncovered_unlisted"))
@@ -1190,7 +1206,6 @@ jobs:
               if (latest or {}).get("revision", 0) != (checkpoint or {}).get("revision", 0) or \
                       (latest or {}).get("head_sha") != (checkpoint or {}).get("head_sha"):
                   raise RunFailed("Another run saved a newer checkpoint during this run.")
-              threads = github.bot_threads(repo, pr)
               record_dismissals(findings, threads, head_sha)
               runs = list((checkpoint or {}).get("runs") or [])
               runs.append({"head_sha": head_sha, "mode": plan_result["mode"], "files": len(plan_result["files"]),
@@ -1198,7 +1213,7 @@ jobs:
               state = {"version": 1, "revision": (checkpoint or {}).get("revision", 0) + 1,
                        "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref, "merge_base": merge_base,
                        "fixed_ids": sorted(fixed_ids), "dismissed_ids": sorted(dismissed_ids),
-                       "dismissed_threads": list((checkpoint or {}).get("dismissed_threads") or []),
+                       "dismissed_threads": dismissed_threads,
                        "uncovered": uncovered, "uncovered_unlisted": more_gaps, "saved_at": now_utc(),
                        "ignore_glob": list(user_globs),
                        "findings": findings, "security": security, "runs": runs[-KEPT_RUNS:],
@@ -1258,6 +1273,23 @@ jobs:
                                                            for t in matching)
 
 
+          def finding_from_thread(thread, checked_sha):
+              """Rebuild a pruned dismissed finding from its inline thread when the dismissal is withdrawn."""
+              fingerprint = thread_fingerprint(thread)
+              body = DEDUP_MARKER_RE.sub("", thread.get("body") or "")
+              body = re.sub(r"<!-- pr-agent-[a-z-]+: [^>]* -->", "", body).strip()
+              match = re.match(r"\*\*(.+?)\*\*\n\n(.*)", body, re.DOTALL)
+              header, content = (match.group(1), match.group(2).strip()) if match else ("", body)
+              if not fingerprint or not content:
+                  return None
+              path = thread["path"]
+              return {"id": finding_id(path, header, content), "path": path, "header": header,
+                      "threads": [{"path": path, "fingerprint": fingerprint}], "content_id": content_id(header, content),
+                      "content": content[:CONTENT_CHARS], "line": None, "state": "ACTIVE", "first_seen": checked_sha,
+                      "checked_sha": checked_sha, "check": {"verdict": "uncertain", "sha": checked_sha,
+                                                            "reason": "its dismissal was withdrawn after it was pruned"}}
+
+
           def record_dismissals(findings, threads, head_sha):
               """Store dismissals in the checkpoint so dismissed findings can be pruned like fixed ones. A
               dismissed finding whose thread is unresolved again is open again."""
@@ -1299,9 +1331,12 @@ jobs:
               # A thread created after this checkpoint was saved belongs to a newer review, which may have
               # reintroduced the finding; resolving it here would dismiss that.
               saved_at = moment(state.get("saved_at"))
+              # Nor a thread a dismissed finding also posts: unresolving it withdrew that dismissal.
+              protected = active + [f for f in state["findings"] if f["state"] == "DISMISSED"] + \
+                  [{"threads": state.get("dismissed_threads") or []}]
               return [t["id"] for t in threads
                       if not t["resolved"] and moment(t.get("created_at")) <= saved_at
-                      and any(thread_posts(t, f) for f in fixed) and not any(thread_posts(t, f) for f in active)]
+                      and any(thread_posts(t, f) for f in fixed) and not any(thread_posts(t, f) for f in protected)]
 
 
           def gate_main(github, repo, pr, head_sha, out=print, summary_path=None, sleep=time.sleep):
