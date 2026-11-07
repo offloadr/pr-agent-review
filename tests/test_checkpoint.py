@@ -911,6 +911,30 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(prompts, [])
         self.assertEqual(github.state()["findings"][0]["check"]["verdict"], "uncertain")
 
+    def test_recreated_file_at_a_renamed_findings_old_path_gets_a_distinct_id(self):
+        github = self.first_run()
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.files = [f for f in github.files if f["filename"] != "x.py"] + [{"filename": "moved.py", "patch": "@@"}]
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "moved.py", "previous_filename": "x.py", "status": "renamed"}]}
+        run_review(github, B, review(), verdicts={race: "still_present"})
+        github.heads = [C]
+        github.files.append({"filename": "x.py", "patch": "@@"})
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, C, review(issue("x.py", "Race", "Two saves interleave.")))
+        races = [f for f in github.state()["findings"] if f["header"] == "Race"]
+        self.assertEqual(sorted(f["path"] for f in races), ["moved.py", "x.py"])
+        self.assertEqual(len({f["id"] for f in races}), 2)
+        # A later helper change fixes only the moved copy; the other keeps its own verdict.
+        github.heads = ["d" * 40]
+        github.files.append({"filename": "helper.py", "patch": "@@"})
+        github.compares[(C, "d" * 40)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "+fix"}]}
+        moved_id = next(f["id"] for f in races if f["path"] == "moved.py")
+        run_review(github, "d" * 40, review(), verdicts={moved_id: "fixed"})
+        states = {f["path"]: f["state"] for f in github.state()["findings"] if f["header"] == "Race"}
+        self.assertEqual(states, {"moved.py": "FIXED", "x.py": "ACTIVE"})
+
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
         run_review(github, A, review(security="SQL injection: the query concatenates input."))
@@ -1102,10 +1126,27 @@ class GateTests(unittest.TestCase):
         github.heads = [C]
         github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
         run_review(github, C, review(issue("x.py", "Race", "Two saves interleave.")))
-        # Someone replies on the old thread after the finding came back, then resolves it.
-        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True,
-                                 last_comment_at="2999-01-01T00:00:00Z")]
+        # A collaborator replies "dismiss" on the old thread after the finding came back, and resolves it.
+        reply = posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True, last_comment_at="2999-01-01T00:00:00Z")
+        reply.update(last_comment_body="Dismiss: intended, see the design doc.", last_comment_association="COLLABORATOR")
+        github.threads = [reply]
         self.assertEqual(self.gate(github, head=C)[0], 0)
+
+    def test_a_plain_reply_or_an_outsider_cannot_dismiss_a_reintroduction(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review(), verdicts={race: "fixed"})
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, C, review(issue("x.py", "Race", "Two saves interleave.")))
+        for body, association in (("This is still broken.", "COLLABORATOR"), ("dismiss", "NONE")):
+            reply = posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True,
+                           last_comment_at="2999-01-01T00:00:00Z")
+            reply.update(last_comment_body=body, last_comment_association=association)
+            github.threads = [reply]
+            self.assertEqual(self.gate(github, head=C)[0], 1, (body, association))
 
     def test_finding_raised_again_after_its_record_was_pruned_counts_as_reintroduced(self):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
@@ -1138,9 +1179,9 @@ class GateTests(unittest.TestCase):
         reopened_at = {f["header"]: f for f in github.state()["findings"]}["Race"]["reopened_at"]
         self.assertLessEqual(reopened_at, before)  # Timed from the run's start, before PR-Agent posted.
         # PR-Agent posted a new thread during the run, after it started; it is resolved without a reply.
-        github.threads = [posted("T_old", "x.py", "Race", "Two saves interleave.", resolved=True),
-                          posted("T_new", "x.py", "Race", "Two saves interleave.", resolved=True,
-                                 last_comment_at="9999-01-01T00:00:00Z")]
+        new_thread = posted("T_new", "x.py", "Race", "Two saves interleave.", resolved=True)
+        new_thread["created_at"] = "9999-01-01T00:00:00Z"
+        github.threads = [posted("T_old", "x.py", "Race", "Two saves interleave.", resolved=True), new_thread]
         self.assertEqual(self.gate(github, head=C)[0], 0)
 
     def test_reintroduction_is_recognized_after_its_pruned_record_is_gone(self):

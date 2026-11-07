@@ -70,8 +70,10 @@ covers everything since the last saved checkpoint.
 
 Reads the checkpoint and fails unless it is for the current head. An active finding blocks until
 it is verified fixed or every inline thread posting it is resolved (a reviewer dismissing it). A
-finding raised again after it was fixed, even after its record was pruned, is dismissed only by a
-resolved thread with a comment newer than its return. A finding keeps every thread identity it was
+finding raised again after it was fixed, even after its record was pruned, is dismissed only by
+resolving a thread opened since it came back, or by a resolved thread whose latest comment, written
+since then by an owner, member or collaborator, says "dismiss". GitHub does not report when a
+thread was resolved, so an old resolution or a plain later reply is no evidence. A finding keeps every thread identity it was
 posted under, so a rename adds the new location instead of replacing the old one.
 The findings job resolves only threads that existed when its checkpoint was saved, so a gate left
 over from an older run cannot resolve, and so dismiss, a thread a newer review posted. It is not

@@ -216,7 +216,7 @@ jobs:
                   nodes {
                     id isResolved path
                     comments(first: 1) { nodes { author { login } url body createdAt } }
-                    latest: comments(last: 1) { nodes { createdAt } }
+                    latest: comments(last: 1) { nodes { createdAt body authorAssociation } }
                   }
                 }
               }
@@ -333,7 +333,9 @@ jobs:
                           threads.append({"id": node["id"], "resolved": node["isResolved"], "path": node["path"],
                                           "url": first["url"], "body": first["body"] or "",
                                           "created_at": first.get("createdAt") or "",
-                                          "last_comment_at": latest[0].get("createdAt") or ""})
+                                          "last_comment_at": latest[0].get("createdAt") or "",
+                                          "last_comment_body": latest[0].get("body") or "",
+                                          "last_comment_association": latest[0].get("authorAssociation") or ""})
                       if not page["pageInfo"]["hasNextPage"]:
                           return threads
                       after = page["pageInfo"]["endCursor"]
@@ -677,7 +679,14 @@ jobs:
               for new in raised_by_id.values():
                   if (new["id"] in fixed_ids or current_key(new) in fixed_ids) and not new.get("reopened_at"):
                       reopen(new, started_at)
-              merged.extend(raised_by_id.values())
+              # A new finding can share an id with a retained one (same text at a path a renamed finding came
+              # from); verdicts are keyed by id, so it gets its own.
+              taken = {f["id"] for f in merged}
+              for new in raised_by_id.values():
+                  if new["id"] in taken:
+                      new["id"] = hashlib.sha256(f"{new['id']}\n{head_sha}\n{new['path']}".encode()).hexdigest()[:12]
+                  taken.add(new["id"])
+                  merged.append(new)
               return merged, to_verify, kept, elsewhere
 
 
@@ -1152,6 +1161,22 @@ jobs:
                          for i in identities(finding))
 
 
+          DISMISSING_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+
+
+          def dismisses_reintroduction(thread, reopened_at):
+              """Whether a resolved thread dismisses a finding that came back after it was fixed.
+
+              GitHub does not say when a thread was resolved, so an old resolution or a later reply proves
+              nothing. Either the thread was opened for this occurrence, or a collaborator's latest comment,
+              written since the finding came back, says to dismiss it."""
+              if (thread.get("created_at") or "") > reopened_at:
+                  return True
+              return ((thread.get("last_comment_at") or "") > reopened_at
+                      and thread.get("last_comment_association") in DISMISSING_ASSOCIATIONS
+                      and re.search(r"\bdismiss", thread.get("last_comment_body") or "", re.IGNORECASE) is not None)
+
+
           def open_findings(state, threads, summary_url):
               lines = []
               for f in state["findings"]:
@@ -1159,8 +1184,7 @@ jobs:
                       continue
                   matching = [t for t in threads if thread_posts(t, f)]
                   unresolved = [t for t in matching if not t["resolved"]]
-                  # A reintroduced finding is dismissed only by a thread someone replied to since it came back.
-                  current = not f.get("reopened_at") or any(t.get("last_comment_at", "") > f["reopened_at"] for t in matching)
+                  current = not f.get("reopened_at") or any(dismisses_reintroduction(t, f["reopened_at"]) for t in matching)
                   if matching and not unresolved and current:
                       continue  # Dismissed: every thread posting it was resolved.
                   location = f["path"] + (f":{f['line']}" if f.get("line") else "")
