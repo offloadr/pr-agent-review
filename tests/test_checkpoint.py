@@ -977,6 +977,26 @@ class ReviewTests(unittest.TestCase):
         run_review(github, "d" * 40, review(), verdicts={moved_id: "fixed"})
         states = {f["path"]: f["state"] for f in github.state()["findings"] if f["header"] == "Race"}
         self.assertEqual(states, {"moved.py": "FIXED", "x.py": "ACTIVE"})
+        # The original thread on x.py was resolved for the moved finding; it cannot dismiss the new one.
+        github.threads = [posted("T_orig", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        self.assertEqual(cp.gate_main(github, "o/r", "1", "d" * 40, out=lambda _: None, sleep=lambda _: None), 1)
+
+    def test_findings_with_different_check_commits_keep_their_own_ranges(self):
+        github = FakeGitHub(A, ["caller.py", "helper.py"])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None.")))
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "+    return ''"}]}
+        # The helper fix gets no verdict (uncertain, still checked at A); the review adds a second finding.
+        run_review(github, B, review(issue("caller.py", "Leak", "The file handle is never closed.")))
+        github.heads = [C]
+        github.compares[(A, C)] = {"status": "ahead", "files": [
+            {"filename": "caller.py", "patch": "+tidy"}, {"filename": "helper.py", "patch": "+    return ''"}]}
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "caller.py", "patch": "+tidy"}]}
+        prompts = []
+        run_review(github, C, review(), prompts=prompts)
+        null_prompt = next(p for p in prompts if "helper() can return None" in p)
+        self.assertIn("+    return ''", null_prompt)
+        self.assertEqual(len(prompts), 2)
 
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])

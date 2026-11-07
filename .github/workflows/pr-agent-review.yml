@@ -697,6 +697,9 @@ jobs:
               for new in raised_by_id.values():
                   if new["id"] in taken:
                       new["id"] = hashlib.sha256(f"{new['id']}\n{head_sha}\n{new['path']}".encode()).hexdigest()[:12]
+                      # Its threads' fingerprint is the older finding's, so their resolutions belong to that one.
+                      if not new.get("reopened_at"):
+                          reopen(new, started_at)
                   taken.add(new["id"])
                   merged.append(new)
               return merged, to_verify, kept, elsewhere
@@ -979,13 +982,11 @@ jobs:
           def verify(findings, head_sha, read_file, read_diff, ask, changes_since=lambda sha: []):
               """Verify findings in place, batched per file; returns the usage records."""
               usage = []
-              by_path = {}
+              # One batch per file and check commit, so every finding sees all changes since its own check.
+              batches = {}
               for f in findings:
-                  by_path.setdefault(f["path"], []).append(f)
-              for path, group in sorted(by_path.items()):
-                  since = {f["checked_sha"] for f in group}
-                  # One diff per batch: since the findings' common check commit, or the whole PR patch.
-                  base = group[0]["checked_sha"] if len(since) == 1 else None
+                  batches.setdefault((f["path"], f["checked_sha"]), []).append(f)
+              for (path, base), group in sorted(batches.items()):
                   others = "\n".join(f"--- {f['filename']}\n{f.get('patch') or '(no patch)'}" for f in changes_since(base)
                                       if path not in (f["filename"], f.get("previous_filename")))
                   prompt = verifier_prompt(path, group, read_file(path), read_diff(path, base), others)
