@@ -442,6 +442,15 @@ class GateTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("1 open PR-Agent finding", output)
 
+    def test_finding_without_a_fingerprint_counts_as_summary_only(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        comment = github.issue_comments[0]
+        state = github.state()
+        del state["findings"][0]["fingerprint"]
+        comment["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        self.assertEqual(self.gate(github)[0], 1)
+
     def test_security_concern_blocks(self):
         code, output = self.gate(self.reviewed(security="Secrets in logs: the token is printed."))
         self.assertEqual(code, 1)

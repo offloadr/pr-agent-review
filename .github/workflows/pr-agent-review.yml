@@ -514,7 +514,7 @@ jobs:
                   new = raised_by_id.pop(f["id"], None)
                   if new is not None:
                       # Raised again word for word: still present, or reintroduced if it had been fixed.
-                      f.update(state="ACTIVE", line=new["line"], checked_sha=head_sha,
+                      f.update(state="ACTIVE", line=new["line"], fingerprint=new["fingerprint"], checked_sha=head_sha,
                                check={"verdict": "still_present", "reason": "raised again by the review", "sha": head_sha})
                   elif f["state"] == "ACTIVE" and (plan_result["mode"] == "full" or f["path"] in changed):
                       to_verify.append(f)
@@ -758,8 +758,9 @@ jobs:
 
           def thread_posts(thread, finding):
               """A thread posts a finding when it carries that finding's PR-Agent dedup fingerprint."""
-              return (thread["path"] == finding["path"]
-                      and f"<!-- pr-agent-dedup: {finding['fingerprint']} -->" in thread["body"])
+              fingerprint = finding.get("fingerprint")
+              return (bool(fingerprint) and thread["path"] == finding["path"]
+                      and f"<!-- pr-agent-dedup: {fingerprint} -->" in thread["body"])
 
 
           def open_findings(state, threads, summary_url):
