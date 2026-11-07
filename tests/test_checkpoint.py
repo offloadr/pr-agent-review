@@ -141,6 +141,14 @@ class StorageTests(unittest.TestCase):
         self.assertNotIn("-->\n<b>", body)
         self.assertEqual(cp.parse_checkpoint(body), state)
 
+    def test_a_comment_quoting_the_marker_is_not_the_checkpoint(self):
+        real = {"id": 1, "user": {"login": "github-actions[bot]"},
+                "body": cp.render_comment({"head_sha": A, "findings": [], "security": {}, "runs": []})}
+        quoting = {"id": 2, "user": {"login": "github-actions[bot]"},
+                   "body": "## PR Reviewer Guide\nThe gate looks for `<!-- pr-agent:checkpoint -->` in comments."}
+        comment, state = cp.find_checkpoint([real, quoting])
+        self.assertEqual((comment["id"], state["head_sha"]), (1, A))
+
     def test_glob_escape_matches_only_the_literal_path(self):
         import fnmatch
         glob = cp.glob_escape("src/[id]/page*.tsx")
@@ -242,6 +250,32 @@ class VerifierFallbackTests(unittest.TestCase):
             cp.send = saved
         self.assertEqual(answer, {"verdicts": []})
         self.assertEqual(["service_tier" in b for b in bodies], [True, False])
+
+
+class VerifierFormatTests(unittest.TestCase):
+    def test_model_without_structured_outputs_falls_back_to_json_mode(self):
+        import io
+        import os
+        import urllib.error
+        bodies = []
+
+        def fake_send(request, timeout, attempts=3):
+            body = json.loads(request.data)
+            bodies.append(body)
+            if body["response_format"]["type"] == "json_schema":
+                raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(
+                    b"{\"error\": \"Invalid parameter: 'response_format' of type 'json_schema' is not supported with this model.\"}"))
+            answer = {"choices": [{"message": {"content": json.dumps({"verdicts": [{"id": "1", "verdict": "fixed", "reason": "r"}]})}}]}
+            return json.dumps(answer).encode(), {}
+        saved, cp.send = cp.send, fake_send
+        os.environ["SERVICE_TIER"] = ""
+        try:
+            answer, _ = cp.call_model("gpt-4-turbo", "medium", "prompt", {"openai": "k"})
+        finally:
+            cp.send = saved
+        self.assertEqual(answer["verdicts"][0]["verdict"], "fixed")
+        self.assertEqual([b["response_format"]["type"] for b in bodies], ["json_schema", "json_object"])
+        self.assertIn("JSON object", bodies[1]["messages"][-1]["content"])
 
 
 class VerdictTests(unittest.TestCase):
@@ -412,7 +446,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(github.state()["ignore_glob"], [])
 
     def test_incomplete_or_malformed_review_output_saves_nothing(self):
-        for bad in ({"key_issues_to_review": []},
+        for bad in ({"key_issues_to_review": []}, {"security_concerns": "No"},
                     {"key_issues_to_review": [{"relevant_file": "x.py"}], "security_concerns": "No"},
                     {"key_issues_to_review": ["text"], "security_concerns": "No"},
                     {"key_issues_to_review": {}, "security_concerns": "No"}):
@@ -606,6 +640,35 @@ class GateTests(unittest.TestCase):
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "z.py"}]}
         run_review(github, B, review())
         self.assertEqual([p["fingerprint"] for p in github.state()["pruned"]], ["aaaaaaaaaaaa"])
+
+    def test_reintroduced_finding_is_not_dismissed_by_its_old_resolved_thread(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review(), verdicts={race: "fixed"})
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, C, review(issue("x.py", "Race", "Two saves interleave.")))
+        code, output = self.gate(github, head=C)
+        self.assertEqual(code, 1)
+        self.assertIn("Race: Two saves interleave.", output)
+
+    def test_pruned_renamed_finding_still_resolves_its_original_thread(self):
+        finding = {"id": "1", "path": "moved.py", "thread_path": "x.py", "header": "Race", "content": "c" * 500,
+                   "line": 1, "state": "FIXED", "fingerprint": cp.inline_fingerprint("x.py", "Race", "c" * 500),
+                   "checked_sha": B, "check": {"verdict": "fixed", "reason": "r", "sha": B}}
+        state = {"head_sha": B, "findings": [finding], "security": {}, "runs": []}
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, 800
+        try:
+            cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertEqual(state["findings"], [])
+        self.assertEqual(state["pruned"][0]["path"], "x.py")
+        thread_on_old_path = posted("T1", "x.py", "Race", "c" * 500)
+        self.assertEqual(cp.fixed_thread_ids(state, [thread_on_old_path]), ["T1"])
 
     def test_security_concern_blocks(self):
         code, output = self.gate(self.reviewed(security="Secrets in logs: the token is printed."))

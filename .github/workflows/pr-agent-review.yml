@@ -351,8 +351,12 @@ jobs:
           def find_checkpoint(comments):
               """The workflow's checkpoint comment and its state, or (None, None)."""
               for comment in reversed(comments):
-                  if (comment.get("user") or {}).get("login") == COMMENT_AUTHOR and CHECKPOINT_MARKER in (comment.get("body") or ""):
-                      return comment, parse_checkpoint(comment["body"])
+                  body = comment.get("body") or ""
+                  # Only the workflow's own envelope counts, not a comment that quotes the marker.
+                  if (comment.get("user") or {}).get("login") == COMMENT_AUTHOR and body.startswith(CHECKPOINT_MARKER + "\n"):
+                      state = parse_checkpoint(body)
+                      if state is not None:
+                          return comment, state
               return None, None
 
 
@@ -399,7 +403,8 @@ jobs:
                       state["pruned_fixed"] = state.get("pruned_fixed", 0) + 1
                       if pruned.get("fingerprint"):
                           # Kept so the findings job can still resolve the pruned finding's threads.
-                          state.setdefault("pruned", []).append({"path": pruned["path"], "fingerprint": pruned["fingerprint"]})
+                          state.setdefault("pruned", []).append({"path": pruned.get("thread_path") or pruned["path"],
+                                                                 "fingerprint": pruned["fingerprint"]})
                   elif any(len(f["content"]) > 300 for f in state["findings"]):
                       for f in state["findings"]:
                           f["content"] = f["content"][:300]
@@ -502,7 +507,9 @@ jobs:
               security = review.get("security_concerns")
               if not isinstance(security, str) or not security.strip():
                   raise RunFailed("PR-Agent's review output has no security verdict.")
-              issues = review.get("key_issues_to_review", [])
+              if "key_issues_to_review" not in review:
+                  raise RunFailed("PR-Agent's review output has no findings field.")
+              issues = review["key_issues_to_review"] if review["key_issues_to_review"] is not None else []
               if not isinstance(issues, list):
                   raise RunFailed("PR-Agent's review output has a malformed findings list.")
               for issue in issues:
@@ -546,6 +553,9 @@ jobs:
                   new = raised_by_id.pop(f["id"], None)
                   if new is not None:
                       # Raised again word for word: still present, or reintroduced if it had been fixed.
+                      if f["state"] == "FIXED":
+                          # Reintroduced: its old threads were resolved for the earlier fix, not to dismiss this.
+                          f["reopened"] = True
                       f.update(state="ACTIVE", line=new["line"], fingerprint=new["fingerprint"], checked_sha=head_sha,
                                check={"verdict": "still_present", "reason": "raised again by the review", "sha": head_sha})
                   elif f["state"] == "ACTIVE" and (plan_result["mode"] == "full" or f["path"] in changed
@@ -649,15 +659,29 @@ jobs:
               request = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=json.dumps(body).encode(),
                                                method="POST", headers={"Authorization": f"Bearer {keys['openai']}",
                                                                        "Content-Type": "application/json"})
-              try:
-                  result = json.loads(send(request, timeout=900 if tier == "flex" else 600)[0])
-              except urllib.error.HTTPError as error:
-                  if error.code != 429 or "service_tier" not in body or FLEX_UNAVAILABLE not in error.read().decode(errors="replace"):
-                      raise
-                  body.pop("service_tier")
-                  request = urllib.request.Request(request.full_url, data=json.dumps(body).encode(), method="POST",
-                                                   headers=dict(request.header_items()))
-                  result = json.loads(send(request, timeout=600)[0])
+              headers = dict(request.header_items())
+              for _ in range(3):
+                  try:
+                      result = json.loads(send(request, timeout=900 if "service_tier" in body else 600)[0])
+                      break
+                  except urllib.error.HTTPError as error:
+                      detail = error.read().decode(errors="replace")
+                      error.close()
+                      if error.code == 429 and "service_tier" in body and FLEX_UNAVAILABLE in detail:
+                          body.pop("service_tier")  # Flex has no capacity: the standard tier.
+                      elif error.code == 400 and body["response_format"]["type"] == "json_schema" and (
+                              "response_format" in detail or "json_schema" in detail):
+                          # A model without Structured Outputs: JSON mode, with the shape spelled out.
+                          body["response_format"] = {"type": "json_object"}
+                          body["messages"][-1]["content"] += (
+                              '\n\nRespond with a JSON object: {"verdicts": [{"id": "...", "verdict": '
+                              '"fixed" | "still_present" | "uncertain", "reason": "..."}]}.')
+                      else:
+                          raise
+                      request = urllib.request.Request(request.full_url, data=json.dumps(body).encode(), method="POST",
+                                                       headers=headers)
+              else:
+                  raise RunFailed("The verifier request kept failing.")
               content = ((result.get("choices") or [{}])[0].get("message") or {}).get("content") or "{}"
               return json.loads(content), result.get("usage") or {}
 
@@ -854,7 +878,7 @@ jobs:
                       continue
                   matching = [t for t in threads if thread_posts(t, f)]
                   unresolved = [t for t in matching if not t["resolved"]]
-                  if matching and not unresolved:
+                  if matching and not unresolved and not f.get("reopened"):
                       continue  # Dismissed: every thread posting it was resolved.
                   location = f["path"] + (f":{f['line']}" if f.get("line") else "")
                   url = unresolved[0]["url"] if unresolved else summary_url
