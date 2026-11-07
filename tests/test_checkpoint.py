@@ -53,10 +53,11 @@ class FakeGitHub:
         self.threads = []
         self.resolved = []
         self.saved = 0
+        self.base_ref = "main"
 
     def pull(self, repo, pr):
         head = self.heads.pop(0) if len(self.heads) > 1 else self.heads[0]
-        return {"head": {"sha": head}, "base": {"sha": "base"}}
+        return {"head": {"sha": head}, "base": {"sha": "base", "ref": self.base_ref}}
 
     def pull_files(self, repo, pr):
         return self.files
@@ -71,6 +72,8 @@ class FakeGitHub:
         return [dict(c) for c in self.issue_comments]
 
     def save_comment(self, repo, pr, comment_id, body):
+        if len(body) > 65_536:
+            raise AssertionError(f"GitHub would reject a {len(body)}-character comment")
         self.saved += 1
         if comment_id is None:
             comment = {"id": len(self.issue_comments) + 1, "user": {"login": "github-actions[bot]"},
@@ -135,27 +138,27 @@ class PlanTests(unittest.TestCase):
         return lambda base, head: {"status": status, "files": [{"filename": f} for f in files]}
 
     def test_first_run_is_a_full_review(self):
-        self.assertEqual(cp.plan(None, A, {"x.py"}, None, [])["mode"], "full")
+        self.assertEqual(cp.plan(None, A, "main", {"x.py"}, None, [])["mode"], "full")
 
     def test_checkpoint_at_head_needs_nothing(self):
-        self.assertEqual(cp.plan({"head_sha": A}, A, {"x.py"}, None, [])["mode"], "none")
+        self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main"}, A, "main", {"x.py"}, None, [])["mode"], "none")
 
     def test_rebased_branch_gets_a_full_review(self):
-        self.assertEqual(cp.plan({"head_sha": A}, B, {"x.py"}, self.compare("diverged", ["x.py"]), [])["mode"], "full")
-        self.assertEqual(cp.plan({"head_sha": A}, B, {"x.py"}, lambda b, h: None, [])["mode"], "full")
+        self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main"}, B, "main", {"x.py"}, self.compare("diverged", ["x.py"]), [])["mode"], "full")
+        self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main"}, B, "main", {"x.py"}, lambda b, h: None, [])["mode"], "full")
 
     def test_delta_covers_changed_pr_files_minus_ignored(self):
-        result = cp.plan({"head_sha": A}, B, {"x.py", "y.py", "package-lock.json"},
+        result = cp.plan({"head_sha": A, "base_ref": "main"}, B, "main", {"x.py", "y.py", "package-lock.json"},
                          self.compare("ahead", ["x.py", "package-lock.json", "not-in-pr.py"]), ["**/package-lock.json"])
         self.assertEqual((result["mode"], result["files"]), ("delta", ["x.py"]))
 
     def test_push_touching_no_reviewable_file_reviews_nothing(self):
-        result = cp.plan({"head_sha": A}, B, {"x.py"}, self.compare("ahead", ["elsewhere.py"]), [])
+        result = cp.plan({"head_sha": A, "base_ref": "main"}, B, "main", {"x.py"}, self.compare("ahead", ["elsewhere.py"]), [])
         self.assertEqual(result["mode"], "none")
 
     def test_too_many_files_to_leave_out_gets_a_full_review(self):
         paths = {f"f{i}.py" for i in range(cp.MAX_IGNORED_FILES + 2)}
-        self.assertEqual(cp.plan({"head_sha": A}, B, paths, self.compare("ahead", ["f0.py"]), [])["mode"], "full")
+        self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main"}, B, "main", paths, self.compare("ahead", ["f0.py"]), [])["mode"], "full")
 
 
 class VerdictTests(unittest.TestCase):
@@ -247,7 +250,7 @@ class ReviewTests(unittest.TestCase):
         github = self.first_run()
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "z.py"}]}
-        newer = cp.render_comment({"head_sha": C, "findings": [], "security": {}, "runs": []})
+        newer = cp.render_comment({"head_sha": C, "base_ref": "main", "findings": [], "security": {}, "runs": []})
         calls = {"n": 0}
         original = github.comments
 
@@ -267,6 +270,44 @@ class ReviewTests(unittest.TestCase):
         saved = github.saved
         code, calls, _ = run_review(github, A, review())
         self.assertEqual((code, calls, github.saved), (0, [], saved))
+
+    def test_reverting_a_file_out_of_the_pr_still_verifies_its_findings(self):
+        github = self.first_run()
+        github.heads = [B]
+        github.files = [f for f in github.files if f["filename"] != "x.py"]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "@@ revert"}]}
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        code, calls, _ = run_review(github, B, review(), verdicts={race: "fixed"})
+        state = github.state()
+        self.assertEqual((code, calls, state["head_sha"]), (0, [], B))
+        self.assertEqual({f["header"]: f["state"] for f in state["findings"]}["Race"], "FIXED")
+
+    def test_retargeted_base_at_the_same_head_gets_a_full_review(self):
+        github = self.first_run()
+        github.base_ref = "release"
+        code, calls, _ = run_review(github, A, review())
+        self.assertEqual((code, calls[0]["mode"]), (0, "full"))
+        self.assertEqual(github.state()["base_ref"], "release")
+
+    def test_checkpoint_stays_under_the_comment_limit_by_dropping_old_fixed_findings(self):
+        # Twelve fix-and-review rounds of ten 1.5 KB findings each: far more history than fits.
+        paths = [f"f{i}.py" for i in range(10)]
+        github = FakeGitHub("0" * 40, paths)
+        previous = None
+        for round_number in range(12):
+            head = f"{round_number:040d}"
+            github.heads = [head]
+            if previous:
+                github.compares[(previous, head)] = {"status": "ahead", "files": [{"filename": p} for p in paths]}
+            fixed = {f["id"]: "fixed" for f in (github.state() or {}).get("findings", []) if f["state"] == "ACTIVE"}
+            issues = [issue(p, "Bug", f"round {round_number} " + "x" * 1500) for p in paths]
+            code, _, _ = run_review(github, head, review(*issues), verdicts=fixed)
+            self.assertEqual(code, 0)
+            previous = head
+        state = github.state()
+        self.assertEqual(state["head_sha"], previous)
+        self.assertGreater(state["pruned_fixed"], 0)
+        self.assertEqual(sum(f["state"] == "ACTIVE" for f in state["findings"]), 10)
 
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
@@ -289,7 +330,7 @@ class PrAgentProcessTests(unittest.TestCase):
             if {write_review!r}:
                 with open(os.environ["GITHUB_OUTPUT"], "a") as out:
                     out.write("other=1\\n")
-                    out.write("review=" + json.dumps({{"review": {{"key_issues_to_review": [], "seen": seen}}}}) + "\\n")
+                    out.write("review=" + json.dumps({{"key_issues_to_review": [], "seen": seen}}) + "\\n")
             raise SystemExit({exit_code})
         """))
         probe.close()
@@ -363,6 +404,15 @@ class GateTests(unittest.TestCase):
                           thread("T_leak", "y.py", "**Leak**\n\nNever closed.")]
         code, _ = self.gate(github, head=B)
         self.assertEqual((code, github.resolved), (1, ["T_race"]))
+
+    def test_resolved_thread_of_one_finding_does_not_dismiss_a_similar_one(self):
+        shared = "Saves interleave when two requests " + "y" * 150
+        github = self.reviewed(issue("x.py", "Race", shared + " on create."), issue("x.py", "Race", shared + " on delete."))
+        github.threads = [thread("T_old", "x.py", f"**Race**\n\n{shared} on create.", resolved=True)]
+        code, output = self.gate(github)
+        self.assertEqual(code, 1)
+        self.assertIn("on delete", output)
+        self.assertNotIn("on create", output)
 
     def test_security_concern_blocks(self):
         code, output = self.gate(self.reviewed(security="Secrets in logs: the token is printed."))

@@ -180,6 +180,10 @@ jobs:
           FILE_CONTEXT_CHARS = 150_000
           DIFF_CONTEXT_CHARS = 100_000
           KEPT_RUNS = 20
+          # GitHub rejects issue comments over 65,536 characters; stay well under it.
+          COMMENT_LIMIT = 60_000
+          CONTENT_CHARS = 2_000
+          SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
 
           THREADS_QUERY = """
           query($owner: String!, $name: String!, $pr: Int!, $after: String) {
@@ -368,6 +372,23 @@ jobs:
               return "\n".join(lines)
 
 
+          def fit_comment(state):
+              """Render the checkpoint within GitHub's comment limit, dropping the oldest fixed findings first."""
+              body = render_comment(state)
+              while len(body) > COMMENT_LIMIT:
+                  fixed = [i for i, f in enumerate(state["findings"]) if f["state"] == "FIXED"]
+                  if fixed:
+                      del state["findings"][fixed[0]]
+                      state["pruned_fixed"] = state.get("pruned_fixed", 0) + 1
+                  elif any(len(f["content"]) > 300 for f in state["findings"]):
+                      for f in state["findings"]:
+                          f["content"] = f["content"][:300]
+                  else:
+                      raise RunFailed("Too many open findings to store in one checkpoint comment.")
+                  body = render_comment(state)
+              return body
+
+
           # ---- Planning ----------------------------------------------------------------------------------
 
           def glob_escape(path):
@@ -379,10 +400,14 @@ jobs:
               return any(fnmatch.fnmatch(path, g) or (g.startswith("**/") and fnmatch.fnmatch(path, g[3:])) for g in globs)
 
 
-          def plan(checkpoint, head_sha, pr_paths, compare, user_globs):
+          def plan(checkpoint, head_sha, base_ref, pr_paths, compare, user_globs):
               """Decide what this run reviews: {"mode": "none" | "full" | "delta", "files": [...], "reason": ...}."""
               if checkpoint is None:
                   return {"mode": "full", "files": sorted(pr_paths), "reason": "no checkpoint yet"}
+              if checkpoint.get("base_ref") != base_ref:
+                  # Retargeting changes the pull request's diff without moving its head.
+                  return {"mode": "full", "files": sorted(pr_paths),
+                          "reason": f"the base branch changed from {checkpoint.get('base_ref')} to {base_ref}"}
               previous = checkpoint["head_sha"]
               if previous == head_sha:
                   return {"mode": "none", "files": [], "reason": "checkpoint is already at this commit"}
@@ -429,7 +454,7 @@ jobs:
                       continue
                   line = issue.get("start_line")
                   found.append({"id": finding_id(path, header, content), "path": path, "header": header,
-                                "content": content, "line": line if isinstance(line, int) and line > 0 else None,
+                                "content": content[:CONTENT_CHARS], "line": line if isinstance(line, int) and line > 0 else None,
                                 "state": "ACTIVE", "first_seen": head_sha, "checked_sha": head_sha, "check": None})
               return found
 
@@ -610,15 +635,16 @@ jobs:
                       for line in output:
                           if line.startswith("review="):
                               review = json.loads(line[len("review="):])
-              if not isinstance(review, dict) or not isinstance(review.get("review"), dict):
+              # PR-Agent writes the review mapping itself (its data["review"]) as the output value.
+              if not isinstance(review, dict) or not review:
                   raise RunFailed("PR-Agent produced no review output.")
-              return review["review"]
+              return review
 
 
           def review_main(github, repo, pr, event_head, model, verifier_model, verifier_effort, keys, user_globs,
                           run_review=run_pr_agent, ask=None, out=print):
               pull = github.pull(repo, pr)
-              head_sha, base_sha = pull["head"]["sha"], pull["base"]["sha"]
+              head_sha, base_sha, base_ref = pull["head"]["sha"], pull["base"]["sha"], pull["base"]["ref"]
               if head_sha != event_head:
                   raise RunFailed(f"The pull request moved to {head_sha[:7]}; the run for that push reviews it.")
               comment, checkpoint = find_checkpoint(github.comments(repo, pr))
@@ -632,16 +658,18 @@ jobs:
                       compares[(base, head)] = github.compare(repo, base, head)
                   return compares[(base, head)]
 
-              plan_result = plan(checkpoint, head_sha, pr_paths, compare, user_globs)
+              plan_result = plan(checkpoint, head_sha, base_ref, pr_paths, compare, user_globs)
               out(f"Plan: {plan_result['mode']} ({plan_result['reason']}); {len(plan_result['files'])} file(s).")
-              if plan_result["mode"] == "none" and checkpoint is not None and checkpoint["head_sha"] == head_sha:
+              if plan_result["mode"] == "none" and checkpoint["head_sha"] == head_sha:
                   out("The checkpoint already covers this commit.")
                   return 0
 
               previous = (checkpoint or {}).get("findings") or []
               security = (checkpoint or {}).get("security") or {}
               if plan_result["mode"] == "none":
-                  findings, to_verify = [dict(f) for f in previous], []
+                  # Nothing to review, but a change can still fix a finding, for example by reverting its
+                  # file out of the pull request.
+                  findings, to_verify = merge_findings(previous, [], plan_result, head_sha)
               else:
                   review = run_review(plan_result, pr_paths, user_globs, model, keys)
                   raised = findings_from_review(review, head_sha)
@@ -674,9 +702,10 @@ jobs:
               runs = list((checkpoint or {}).get("runs") or [])
               runs.append({"head_sha": head_sha, "mode": plan_result["mode"], "files": len(plan_result["files"]),
                            "verified": len(to_verify), "verifier_usage": usage, "at": int(time.time())})
-              state = {"version": 1, "head_sha": head_sha, "base_sha": base_sha, "findings": findings,
-                       "security": security, "runs": runs[-KEPT_RUNS:]}
-              github.save_comment(repo, pr, (latest_comment or {}).get("id"), render_comment(state))
+              state = {"version": 1, "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref,
+                       "findings": findings, "security": security, "runs": runs[-KEPT_RUNS:],
+                       "pruned_fixed": (checkpoint or {}).get("pruned_fixed", 0)}
+              github.save_comment(repo, pr, (latest_comment or {}).get("id"), fit_comment(state))
               open_count = sum(f["state"] == "ACTIVE" for f in findings)
               out(f"Saved the checkpoint for {head_sha[:7]}: {open_count} open finding(s).")
               return 0
@@ -685,12 +714,12 @@ jobs:
           # ---- Gate mode ---------------------------------------------------------------------------------
 
           def thread_posts(thread, finding):
-              """Inline threads open with **header**, a blank line and the content."""
+              """Inline threads open with **header**, a blank line and the content, as PR-Agent writes them."""
               if thread["path"] != finding["path"]:
                   return False
-              # PR-Agent rewrites suggestion fences, so only the text before any fence is compared.
-              prefix = finding["content"].split("```")[0].strip()[:120]
-              expected = f"**{finding['header']}**\n\n{prefix}" if finding["header"] else prefix
+              # The whole stored content is compared, so findings that share an opening do not share threads.
+              content = SUGGESTION_FENCE_RE.sub("```text", finding["content"].strip())
+              expected = f"**{finding['header']}**\n\n{content}" if finding["header"] else content
               return thread["body"].startswith(expected)
 
 
@@ -763,6 +792,7 @@ jobs:
 
 
           if __name__ == "__main__":
+              sys.stdout.reconfigure(line_buffering=True)
               api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
               client = GitHub(os.environ["GH_TOKEN"], api_url, os.environ.get("GITHUB_GRAPHQL_URL", f"{api_url}/graphql"))
               repo, pr, head = os.environ["REPO"], os.environ["PR"], os.environ["HEAD_SHA"]
