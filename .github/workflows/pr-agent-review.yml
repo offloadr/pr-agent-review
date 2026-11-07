@@ -432,6 +432,8 @@ jobs:
                       dismissed = state["findings"].pop(index)
                       state["pruned_dismissed"] = state.get("pruned_dismissed", 0) + 1
                       state.setdefault("dismissed_ids", []).extend([dismissed["id"], current_key(dismissed)])
+                      # Its threads stay known (about 60 characters each), so unresolving one withdraws the dismissal.
+                      state.setdefault("dismissed_threads", []).extend(identities(dismissed))
                   elif any(len(f["content"]) > 300 for f in state["findings"]):
                       for f in state["findings"]:
                           f["content"] = f["content"][:300]
@@ -1196,6 +1198,7 @@ jobs:
               state = {"version": 1, "revision": (checkpoint or {}).get("revision", 0) + 1,
                        "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref, "merge_base": merge_base,
                        "fixed_ids": sorted(fixed_ids), "dismissed_ids": sorted(dismissed_ids),
+                       "dismissed_threads": list((checkpoint or {}).get("dismissed_threads") or []),
                        "uncovered": uncovered, "uncovered_unlisted": more_gaps, "saved_at": now_utc(),
                        "ignore_glob": list(user_globs),
                        "findings": findings, "security": security, "runs": runs[-KEPT_RUNS:],
@@ -1280,6 +1283,12 @@ jobs:
                   location = f["path"] + (f":{f['line']}" if f.get("line") else "")
                   url = unresolved[0]["url"] if unresolved else summary_url
                   lines.append(f"- [{location}]({url}) {f['header']}: {f['content'].split(chr(10))[0][:200]}")
+              # A dismissed finding pruned from the checkpoint is open again once one of its threads is unresolved.
+              retained = [f for f in state["findings"] if f["state"] in ("ACTIVE", "DISMISSED")]
+              withdrawn = {"threads": state.get("dismissed_threads") or []}
+              for t in threads:
+                  if not t["resolved"] and thread_posts(t, withdrawn) and not any(thread_posts(t, f) for f in retained):
+                      lines.append(f"- [{t['path']}]({t['url']}) A dismissed finding's thread was unresolved again.")
               return lines
 
 

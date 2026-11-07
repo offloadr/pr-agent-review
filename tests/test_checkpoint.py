@@ -1378,6 +1378,27 @@ class GateTests(unittest.TestCase):
         self.assertGreater(state["pruned_dismissed"], 0)
         self.assertEqual(self.gate(github, head=previous)[0], 0)
 
+    def test_unresolving_a_pruned_dismissed_findings_thread_fails_the_gate(self):
+        finding = {"id": "1", "path": "x.py", "header": "Race", "content": "c" * 500, "line": 1, "state": "DISMISSED",
+                   "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", "c" * 500)}],
+                   "checked_sha": A, "check": None, "content_id": "x"}
+        state = {"head_sha": A, "base_ref": "main", "findings": [finding], "security": {}, "runs": []}
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, 800
+        try:
+            body = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertEqual(state["findings"], [])
+        github = FakeGitHub(A, ["x.py"])
+        github.issue_comments = [{"id": 1, "user": {"login": "github-actions[bot]"}, "body": body,
+                                  "html_url": "https://example/checkpoint"}]
+        github.threads = [posted("T1", "x.py", "Race", "c" * 500, resolved=True)]
+        self.assertEqual(self.gate(github)[0], 0)
+        github.threads[0]["resolved"] = False
+        code, output = self.gate(github)
+        self.assertEqual(code, 1)
+        self.assertIn("unresolved again", output)
+
     def test_dismissed_finding_stays_dismissed_when_raised_again_and_reopens_when_unresolved(self):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
         github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
