@@ -460,10 +460,12 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(state["head_sha"], B)
         by_header = {f["header"]: f for f in state["findings"]}
         self.assertEqual(by_header["Race"]["state"], "FIXED")
-        self.assertEqual(by_header["Leak"]["state"], "ACTIVE")       # y.py did not change: not re-checked
+        self.assertEqual(by_header["Leak"]["state"], "ACTIVE")       # y.py did not change: checked against the push only
         self.assertEqual(by_header["Overflow"]["state"], "ACTIVE")   # new blocking finding, still saved
-        self.assertEqual(len(prompts), 1)
+        self.assertEqual(len(prompts), 2)
         self.assertIn("@@ fix", prompts[0])
+        self.assertIn("files this push did not change", prompts[1])
+        self.assertIn("Leak", prompts[1])
 
     def test_unfixed_finding_stays_open(self):
         github = self.first_run()
@@ -480,7 +482,8 @@ class ReviewTests(unittest.TestCase):
         prompts = []
         run_review(github, B, review(issue("x.py", "Race", "Two saves interleave.", line=40)), prompts=prompts)
         race = {f["header"]: f for f in github.state()["findings"]}["Race"]
-        self.assertEqual((race["state"], race["line"], prompts), ("ACTIVE", 40, []))
+        self.assertEqual((race["state"], race["line"]), ("ACTIVE", 40))
+        self.assertFalse(any("Race" in p for p in prompts))
 
     def test_finding_without_a_line_is_tracked(self):
         github = FakeGitHub(A, ["x.py"])
@@ -625,9 +628,10 @@ class ReviewTests(unittest.TestCase):
             {"filename": "moved.py", "previous_filename": "x.py", "status": "renamed"}]}
         prompts = []
         run_review(github, B, review(), verdicts={race: "still_present"}, prompts=prompts)
-        self.assertEqual(len(prompts), 1)
-        self.assertIn("File: moved.py (renamed from x.py", prompts[0])
-        self.assertIn("the same racy code", prompts[0])
+        moved_prompts = [p for p in prompts if p.startswith("File: moved.py")]
+        self.assertEqual(len(moved_prompts), 1)
+        self.assertIn("File: moved.py (renamed from x.py", moved_prompts[0])
+        self.assertIn("the same racy code", moved_prompts[0])
         moved = {f["header"]: f for f in github.state()["findings"]}["Race"]
         self.assertEqual((moved["path"], moved["renamed_from"], moved["state"]), ("moved.py", "x.py", "ACTIVE"))
         self.assertEqual([i["path"] for i in moved["threads"]], ["x.py"])
@@ -644,7 +648,7 @@ class ReviewTests(unittest.TestCase):
         run_review(github, B, review(issue("moved.py", "Race", "Two saves interleave.")), prompts=prompts)
         races = [f for f in github.state()["findings"] if f["header"] == "Race"]
         self.assertEqual(len(races), 1)
-        self.assertEqual(prompts, [])
+        self.assertFalse(any("Race" in p for p in prompts))
         self.assertEqual(sorted(i["path"] for i in races[0]["threads"]), ["moved.py", "x.py"])
 
     def test_same_head_retarget_runs_finishing_in_reverse_order_do_not_overwrite(self):
@@ -709,7 +713,8 @@ class ReviewTests(unittest.TestCase):
         prompts = []
         run_review(github, C, review(issue("moved.py", "Race", "Two saves interleave.")), prompts=prompts)
         races = [f for f in github.state()["findings"] if f["header"] == "Race"]
-        self.assertEqual((len(races), prompts), (1, []))
+        self.assertEqual(len(races), 1)
+        self.assertFalse(any("Race" in p for p in prompts))
 
     def test_overwritten_save_fails_the_run(self):
         github = FakeGitHub(A, ["x.py"])
@@ -850,6 +855,33 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual((calls[0]["mode"], prompts), ("full", []))
         race = github.state()["findings"][0]
         self.assertEqual((race["state"], race["check"]["verdict"]), ("ACTIVE", "uncertain"))
+
+    def test_finding_fixed_by_a_change_in_another_file_is_rechecked_and_cleared(self):
+        github = FakeGitHub(A, ["caller.py", "helper.py"])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        null = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "helper.py", "patch": "-    return None\n+    return ''"}]}
+        prompts = []
+        run_review(github, B, review(), verdicts={null: "fixed"}, prompts=prompts)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("files this push did not change", prompts[0])
+        self.assertIn("+    return ''", prompts[0])
+        self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
+
+    def test_capped_comparison_keeps_the_missing_file_safeguard_in_any_full_review(self):
+        github = FakeGitHub(A, ["x.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave."), security="Injection: x.py."))
+        github.heads = [B]
+        github.files = [{"filename": f"f{i}.py"} for i in range(300)]
+        github.contents["x.py"] = None
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": f"f{i}.py"} for i in range(300)]}
+        prompts = []
+        _, calls, _ = run_review(github, B, review(), prompts=prompts)
+        self.assertEqual(calls[0]["reason"], "an earlier review reported a security concern")
+        self.assertEqual(prompts, [])
+        self.assertEqual(github.state()["findings"][0]["check"]["verdict"], "uncertain")
 
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])

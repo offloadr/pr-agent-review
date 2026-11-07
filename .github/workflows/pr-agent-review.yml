@@ -455,7 +455,7 @@ jobs:
               previous = checkpoint["head_sha"]
               # The push's range, when the checkpoint's head is an ancestor of this one: what changed and what
               # was renamed. Every plan carries it, so earlier findings follow renames even in a full review.
-              changed, renames, comparison = set(), {}, None
+              changed, renames, comparison, truncated = set(), {}, None, False
               if previous != head_sha:
                   comparison = compare(previous, head_sha)
                   if comparison is not None and comparison.get("status") == "ahead":
@@ -464,12 +464,14 @@ jobs:
                           if file.get("previous_filename"):
                               changed.add(file["previous_filename"])
                               renames[file["previous_filename"]] = file["filename"]
+                      # GitHub lists at most 300 files; a rename beyond the list is unknown.
+                      truncated = len(comparison.get("files") or []) >= 300
                   else:
                       comparison = None
 
               def full(reason):
                   return {"mode": "full", "files": sorted(pr_paths), "changed": sorted(changed), "renames": renames,
-                          "reason": reason}
+                          "renames_complete": not truncated, "reason": reason}
 
               if (checkpoint.get("security") or {}).get("concern"):
                   # The concern is not tied to files, so only a review of everything can clear it.
@@ -495,12 +497,8 @@ jobs:
                   return full("an earlier review left out files its coverage footer did not name")
               if comparison is None:
                   return full(f"{previous[:7]} is not an ancestor of {head_sha[:7]}")
-              if len(comparison.get("files") or []) >= 300:
-                  # GitHub lists at most 300 files, so the change is reviewed in full, and a rename beyond the
-                  # list is unknown.
-                  result = full("the change is too large to list")
-                  result["renames_complete"] = False
-                  return result
+              if truncated:
+                  return full("the change is too large to list")
               # Files an earlier review left out for its token budget are reviewed again until one covers them.
               pending = set(checkpoint.get("uncovered") or []) & pr_paths
               delta = sorted(p for p in (pr_paths & changed) | pending if reviewable(p) and not ignored_by(p, user_globs))
@@ -626,14 +624,15 @@ jobs:
           def merge_findings(previous, raised, plan_result, head_sha, pruned=(), fixed_ids=(), started_at=None):
               """Combine earlier findings with this run's.
 
-              Returns (findings, the earlier ones to verify, the pruned records still kept)."""
+              Returns (findings, the earlier ones to verify against their own file's changes, the pruned records
+              still kept, the active ones in files this push did not change)."""
               started_at = started_at or now_utc()
               raised_by_id = {f["id"]: f for f in raised}
               # The same full text at the same current path is the same finding, whatever path its id came from.
               raised_by_text = {(f["path"], f["content_id"]): f for f in raised}
               changed = set(plan_result.get("changed") or plan_result["files"])
               renames = plan_result.get("renames") or {}
-              merged, to_verify = [], []
+              merged, to_verify, elsewhere = [], [], []
               for old in previous:
                   f = dict(old)
                   f["threads"] = list(identities(f))
@@ -658,6 +657,9 @@ jobs:
                   elif f["state"] == "ACTIVE" and (plan_result["mode"] == "full" or f["path"] in changed
                                                    or f.get("renamed_from") in changed):
                       to_verify.append(f)
+                  elif f["state"] == "ACTIVE" and changed:
+                      # A change elsewhere can fix it too, as when a helper stops returning None.
+                      elsewhere.append(f)
                   merged.append(f)
               # A finding raised again after its fixed record was pruned is a reintroduction too.
               kept = []
@@ -674,7 +676,7 @@ jobs:
                   if (new["id"] in fixed_ids or current_key(new) in fixed_ids) and not new.get("reopened_at"):
                       reopen(new, started_at)
               merged.extend(raised_by_id.values())
-              return merged, to_verify, kept
+              return merged, to_verify, kept, elsewhere
 
 
           COVERAGE_HEADING = "⚠️ **Review coverage:**"
@@ -898,6 +900,41 @@ jobs:
               return verdicts
 
 
+          ELSEWHERE_WINDOW = 80
+
+
+          def elsewhere_prompt(findings, read_file, push_diff):
+              """One prompt for findings in files the push did not change, with the push's diff as context."""
+              items = []
+              for f in findings:
+                  content = read_file(f["path"])
+                  if content is None:
+                      excerpt = "(the file does not exist at the current commit)"
+                  else:
+                      lines = content.split("\n")
+                      center = f.get("line") or 1
+                      low, high = max(1, center - ELSEWHERE_WINDOW), min(len(lines), center + ELSEWHERE_WINDOW)
+                      excerpt = "\n".join(f"{n}: {lines[n - 1]}" for n in range(low, high + 1))
+                  items.append(f"id: {f['id']}\nfile: {f['path']}, reported at line {f.get('line') or 'unknown'}\n"
+                               f"title: {f['header']}\ndescription: {f['content']}\n"
+                               f"current code around it:\n```\n{excerpt[:FILE_CONTEXT_CHARS // max(1, len(findings))]}\n```")
+              return ("These findings are in files this push did not change. Decide for each whether the changes "
+                      "elsewhere in the push, shown in the diff below, removed the failure it describes. Most will "
+                      "be 'still_present'; answer 'fixed' only when a specific change in the diff removes it.\n\n"
+                      "Findings:\n\n" + "\n\n".join(items) +
+                      f"\n\nDiff of this push:\n```diff\n{push_diff[:DIFF_CONTEXT_CHARS]}\n```\n\n"
+                      "Return one verdict per finding id.")
+
+
+          def apply_verdicts(group, verdicts, head_sha):
+              for f in group:
+                  verdict, reason = verdicts[f["id"]]
+                  f["check"] = {"verdict": verdict, "reason": reason, "sha": head_sha}
+                  f["checked_sha"] = head_sha
+                  if verdict == "fixed":
+                      f["state"] = "FIXED"
+
+
           def verify(findings, head_sha, read_file, read_diff, ask):
               """Verify findings in place, batched per file; returns the usage records."""
               usage = []
@@ -911,13 +948,7 @@ jobs:
                   prompt = verifier_prompt(path, group, read_file(path), read_diff(path, base))
                   answer, used = ask(prompt)
                   usage.append(used)
-                  verdicts = parse_verdicts(answer, [f["id"] for f in group])
-                  for f in group:
-                      verdict, reason = verdicts[f["id"]]
-                      f["check"] = {"verdict": verdict, "reason": reason, "sha": head_sha}
-                      f["checked_sha"] = head_sha
-                      if verdict == "fixed":
-                          f["state"] = "FIXED"
+                  apply_verdicts(group, parse_verdicts(answer, [f["id"] for f in group]), head_sha)
               return usage
 
 
@@ -1019,12 +1050,14 @@ jobs:
               if plan_result["mode"] == "none":
                   # Nothing to review, but a change can still fix a finding, for example by reverting its
                   # file out of the pull request.
-                  findings, to_verify, pruned = merge_findings(previous, [], plan_result, head_sha, pruned, fixed_ids, started_at)
+                  findings, to_verify, pruned, elsewhere = merge_findings(previous, [], plan_result, head_sha, pruned, fixed_ids,
+                                                                          started_at)
               else:
                   review = run_review(plan_result, pr_paths, user_globs, model, keys)
                   validate_review(review)
                   raised = findings_from_review(review, head_sha, pr_paths)
-                  findings, to_verify, pruned = merge_findings(previous, raised, plan_result, head_sha, pruned, fixed_ids, started_at)
+                  findings, to_verify, pruned, elsewhere = merge_findings(previous, raised, plan_result, head_sha, pruned,
+                                                                          fixed_ids, started_at)
                   gaps, more_gaps = coverage_gaps(github.comments(repo, pr), started_at)
                   gaps = [repository_path(g, pr_paths) for g in gaps]
                   # The latest review's verdict replaces the earlier one, as with PR-Agent's own summary.
@@ -1056,11 +1089,20 @@ jobs:
                                         "reason": "the file is gone and the push was too large to see whether it was renamed"}
                           to_verify.remove(f)
               usage = []
+              ask = ask or (lambda prompt: call_model(verifier_model, verifier_effort, prompt, keys))
+              read_file = lambda path: github.file_at(repo, path, head_sha)  # noqa: E731
               if to_verify:
-                  ask = ask or (lambda prompt: call_model(verifier_model, verifier_effort, prompt, keys))
-                  usage = verify(to_verify, head_sha, lambda path: github.file_at(repo, path, head_sha), read_diff, ask)
-                  for f in to_verify:
-                      out(f"- {f['check']['verdict']}: {f['path']} {f['header']} ({f['check']['reason'][:120]})")
+                  usage = verify(to_verify, head_sha, read_file, read_diff, ask)
+              push_files = ((compare(checkpoint["head_sha"], head_sha) or {}).get("files") or []) if elsewhere else []
+              push_diff = "\n".join(f"--- {f['filename']}\n{f.get('patch') or '(no patch)'}" for f in push_files)
+              if elsewhere and push_diff:
+                  # One call for every open finding outside the changed files, so cost does not grow per file.
+                  answer, used = ask(elsewhere_prompt(elsewhere, read_file, push_diff))
+                  usage.append(used)
+                  apply_verdicts(elsewhere, parse_verdicts(answer, [f["id"] for f in elsewhere]), head_sha)
+                  to_verify = to_verify + elsewhere
+              for f in to_verify:
+                  out(f"- {f['check']['verdict']}: {f['path']} {f['header']} ({f['check']['reason'][:120]})")
 
               # Save only if nothing moved while this run worked: not the head, not the base, and no other
               # run's checkpoint (each save bumps the revision this run planned from).

@@ -54,7 +54,9 @@ findings are kept with their evidence rather than deleted.
    since it was last checked, goes to the verifier model. Findings are batched per file: one call
    gets the findings, the file at head and its diff since the finding was last checked, and must
    return `fixed`, `still_present` or `uncertain` per finding, with a reason. Only `fixed` closes a
-   finding. A missing, malformed or `uncertain` verdict keeps it active. A verifier error fails the
+   finding. A missing, malformed or `uncertain` verdict keeps it active. Active findings in files the push did
+   not change go to the verifier too, all in one call with the push's diff and a window of each
+   finding's file, because a change elsewhere (a helper that stops returning None) can fix them. A verifier error fails the
    run.
 4. **Save.** Re-read the pull request and the checkpoint. If the head moved or another run saved a
    newer checkpoint, fail without saving. Otherwise write the new checkpoint for the reviewed head.
