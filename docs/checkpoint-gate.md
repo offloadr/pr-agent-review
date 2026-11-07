@@ -59,7 +59,8 @@ findings are kept with their evidence rather than deleted.
 4. **Save.** Re-read the pull request and the checkpoint. If the head moved or another run saved a
    newer checkpoint, fail without saving. Otherwise write the new checkpoint for the reviewed head.
 
-A completed review advances the checkpoint even when findings remain: reviewing a commit is not
+Review jobs for one pull request run one at a time (a job-level concurrency group), and each
+save is read back to confirm it stuck. A completed review advances the checkpoint even when findings remain: reviewing a commit is not
 approving it. A failed, cancelled or interrupted run never advances it, so the next run's delta
 covers everything since the last saved checkpoint.
 
@@ -79,8 +80,10 @@ Re-running only this job re-evaluates dismissals without paying for a review.
 
 ## Known limits
 
-- PR-Agent's `review` output has no coverage data, so a full review that PR-Agent had to prune is
-  not detected by the gate. Delta reviews are small enough that this is unlikely.
+- PR-Agent's `review` output has no coverage data, so the files a review left out or clipped for its
+  token budget are read from the coverage footer of its summary comment and reviewed again on later
+  runs until one covers them. The footer lists at most 50 files; beyond that the checkpoint records
+  only that more were left out, and the findings job warns about it without failing.
 - A delta review sees no earlier findings, so it may raise a still-present issue again in different
   words. That becomes a second finding; both close when verified fixed.
 - PR-Agent's security verdict is not tied to files, so while a concern is open every run is a

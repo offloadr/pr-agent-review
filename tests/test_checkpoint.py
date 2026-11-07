@@ -135,6 +135,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('"edited"', line)
 
 
+class CoverageTests(unittest.TestCase):
+    def summary(self, body, updated_at="2026-11-07T12:00:00Z"):
+        return {"user": {"login": "github-actions[bot]"}, "updated_at": updated_at,
+                "body": "## PR Reviewer Guide\n<!-- pr-agent:review:full -->\n" + body}
+
+    def test_coverage_footer_lists_files_left_out(self):
+        body = ("<hr>\n\n⚠️ **Review coverage:** The following files were not included in this review because of "
+                "the token budget:\n- `src/big.cs`\n- `src/other.cs`\n... and 3 more\n\n<hr>\nhelp")
+        self.assertEqual(cp.coverage_gaps([self.summary(body)], "2026-11-07T11:00:00Z"),
+                         (["src/big.cs", "src/other.cs"], True))
+
+    def test_summaries_from_earlier_runs_are_ignored(self):
+        body = "⚠️ **Review coverage:** The following files were not included:\n- `old.cs`"
+        self.assertEqual(cp.coverage_gaps([self.summary(body, "2026-11-01T00:00:00Z")], "2026-11-07T11:00:00Z"),
+                         ([], False))
+
+
+class WorkflowConcurrencyTests(unittest.TestCase):
+    def test_review_jobs_for_a_pull_request_are_serialized(self):
+        text = WORKFLOW.read_text()
+        self.assertIn("group: pr-agent-checkpoint-${{ github.repository }}-${{ github.event.pull_request.number }}", text)
+        review_job = text[text.index("  review:"):text.index("  findings:")]
+        self.assertIn("cancel-in-progress: false", review_job)
+
+
 class StorageTests(unittest.TestCase):
     def test_state_round_trips_even_with_comment_terminators_in_text(self):
         state = {"head_sha": A, "findings": [{"content": "closes the comment --> <b>"}], "runs": [], "security": {}}
@@ -542,6 +567,52 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertIn(old, prompts[0])
 
+    def test_renamed_finding_reported_again_on_a_later_push_stays_one_finding(self):
+        github = self.first_run()
+        github.heads = [B]
+        github.files = [f for f in github.files if f["filename"] != "x.py"] + [{"filename": "moved.py", "patch": "@@"}]
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "moved.py", "previous_filename": "x.py", "status": "renamed"}]}
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        run_review(github, B, review(), verdicts={race: "still_present"})
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "moved.py"}]}
+        prompts = []
+        run_review(github, C, review(issue("moved.py", "Race", "Two saves interleave.")), prompts=prompts)
+        races = [f for f in github.state()["findings"] if f["header"] == "Race"]
+        self.assertEqual((len(races), prompts), (1, []))
+
+    def test_overwritten_save_fails_the_run(self):
+        github = FakeGitHub(A, ["x.py"])
+        original = github.save_comment
+
+        def save_then_overwritten(repo, pr, comment_id, body):
+            comment = original(repo, pr, comment_id, body)
+            # Another run's save lands right after this one.
+            comment["body"] = cp.render_comment({"revision": 99, "head_sha": A, "findings": [], "security": {}, "runs": []})
+            return comment
+        github.save_comment = save_then_overwritten
+        with self.assertRaises(cp.RunFailed):
+            run_review(github, A, review())
+
+    def test_files_left_out_are_reviewed_on_the_next_push(self):
+        github = FakeGitHub(A, ["small.py", "big.py"])
+        original_comments = github.comments
+
+        def comments_with_footer(repo, pr):
+            footer = {"user": {"login": "github-actions[bot]"}, "updated_at": "9999-01-01T00:00:00Z",
+                      "body": "<!-- pr-agent:review:full -->\n⚠️ **Review coverage:** The following files were not "
+                              "included in this review because of the token budget:\n- `big.py`"}
+            return original_comments(repo, pr) + ([footer] if github.heads == [A] else [])
+        github.comments = comments_with_footer
+        run_review(github, A, review())
+        self.assertEqual(github.state()["uncovered"], ["big.py"])
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "small.py"}]}
+        _, calls, _ = run_review(github, B, review())
+        self.assertEqual(calls[0]["files"], ["big.py", "small.py"])
+        self.assertEqual(github.state()["uncovered"], [])
+
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
         run_review(github, A, review(security="SQL injection: the query concatenates input."))
@@ -755,6 +826,24 @@ class GateTests(unittest.TestCase):
         self.assertEqual(github.state()["pruned"], [])
         code, _ = self.gate(github, head=B)
         self.assertEqual(code, 1)
+
+    def test_new_thread_for_a_reintroduced_finding_dismisses_it_when_resolved(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review(), verdicts={race: "fixed"})
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        before = cp.now_utc()
+        run_review(github, C, review(issue("x.py", "Race", "Two saves interleave.", line=30)))
+        reopened_at = {f["header"]: f for f in github.state()["findings"]}["Race"]["reopened_at"]
+        self.assertLessEqual(reopened_at, before)  # Timed from the run's start, before PR-Agent posted.
+        # PR-Agent posted a new thread during the run, after it started; it is resolved without a reply.
+        github.threads = [posted("T_old", "x.py", "Race", "Two saves interleave.", resolved=True),
+                          posted("T_new", "x.py", "Race", "Two saves interleave.", resolved=True,
+                                 last_comment_at="9999-01-01T00:00:00Z")]
+        self.assertEqual(self.gate(github, head=C)[0], 0)
 
     def test_reintroduction_is_recognized_after_its_pruned_record_is_gone(self):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))

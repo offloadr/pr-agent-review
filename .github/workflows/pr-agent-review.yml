@@ -68,6 +68,11 @@ jobs:
     container:
       image: pragent/pr-agent@sha256:b1ed6e8de56eb4d6e4169ee0d5c209bb5ed1ef071a01c0c042c64b80192a785c
     timeout-minutes: 60
+    # One review job per pull request at a time, so checkpoint saves cannot interleave. Jobs queue
+    # rather than cancel here; the caller's own concurrency group cancels superseded runs.
+    concurrency:
+      group: pr-agent-checkpoint-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     permissions:
       contents: read
       issues: write
@@ -475,7 +480,9 @@ jobs:
                   if file.get("previous_filename"):
                       changed.add(file["previous_filename"])
                       renames[file["previous_filename"]] = file["filename"]
-              delta = sorted(p for p in pr_paths & changed if reviewable(p) and not ignored_by(p, user_globs))
+              # Files an earlier review left out for its token budget are reviewed again until one covers them.
+              pending = set(checkpoint.get("uncovered") or []) & pr_paths
+              delta = sorted(p for p in (pr_paths & changed) | pending if reviewable(p) and not ignored_by(p, user_globs))
               if not delta:
                   return {"mode": "none", "files": [], "changed": sorted(changed), "renames": renames,
                           "reason": "no reviewable pull request file changed"}
@@ -565,9 +572,11 @@ jobs:
               finding["threads"] = known + [i for i in extra if i not in known]
 
 
-          def reopen(finding):
-              """Reintroduced after a fix: threads resolved before now dismissed the old occurrence, not this one."""
-              finding["reopened_at"] = now_utc()
+          def reopen(finding, at):
+              """Reintroduced after a fix: threads resolved before this run dismissed the old occurrence.
+
+              `at` is when the run started, so a thread PR-Agent posts for the new occurrence counts as new."""
+              finding["reopened_at"] = at
 
 
           def content_id(header, content):
@@ -575,12 +584,14 @@ jobs:
               return hashlib.sha256(f"{header}\n{content}".encode()).hexdigest()[:12]
 
 
-          def merge_findings(previous, raised, plan_result, head_sha, pruned=(), fixed_ids=()):
+          def merge_findings(previous, raised, plan_result, head_sha, pruned=(), fixed_ids=(), started_at=None):
               """Combine earlier findings with this run's.
 
               Returns (findings, the earlier ones to verify, the pruned records still kept)."""
+              started_at = started_at or now_utc()
               raised_by_id = {f["id"]: f for f in raised}
-              raised_by_text = {f["content_id"]: f for f in raised}
+              # The same full text at the same current path is the same finding, whatever path its id came from.
+              raised_by_text = {(f["path"], f["content_id"]): f for f in raised}
               changed = set(plan_result.get("changed") or plan_result["files"])
               renames = plan_result.get("renames") or {}
               merged, to_verify = [], []
@@ -589,23 +600,17 @@ jobs:
                   f["threads"] = list(identities(f))
                   f.pop("fingerprint", None)
                   f.pop("thread_path", None)
-                  renamed_now = f["path"] in renames
-                  if renamed_now:
+                  if f["path"] in renames:
                       # The finding follows its file; its threads stay on the path they were posted on.
                       f.setdefault("renamed_from", f["path"])
                       f["path"] = renames[f["path"]]
-                  # Raised again word for word: by id, or, for a file renamed in this push, by its full text at
-                  # the new path.
-                  new = raised_by_id.get(f["id"])
-                  if new is None and renamed_now and f.get("content_id"):
-                      candidate = raised_by_text.get(f["content_id"])
-                      if candidate is not None and candidate["path"] == f["path"]:
-                          new = candidate
+                  # Raised again word for word, at its current path.
+                  new = raised_by_text.get((f["path"], f.get("content_id"))) or raised_by_id.get(f["id"])
                   if new is not None:
                       raised_by_id.pop(new["id"], None)
-                      raised_by_text.pop(new["content_id"], None)
+                      raised_by_text.pop((new["path"], new["content_id"]), None)
                       if f["state"] == "FIXED":
-                          reopen(f)
+                          reopen(f, started_at)
                       add_identities(f, new["threads"])
                       f.update(state="ACTIVE", line=new["line"], checked_sha=head_sha,
                                check={"verdict": "still_present", "reason": "raised again by the review", "sha": head_sha})
@@ -620,14 +625,39 @@ jobs:
                   if new is None:
                       kept.append(record)
                       continue
-                  reopen(new)
+                  reopen(new, started_at)
                   add_identities(new, identities(record))
               # Its pruned record may be gone too, but its id is remembered.
               for new in raised_by_id.values():
                   if new["id"] in fixed_ids and not new.get("reopened_at"):
-                      reopen(new)
+                      reopen(new, started_at)
               merged.extend(raised_by_id.values())
               return merged, to_verify, kept
+
+
+          COVERAGE_HEADING = "⚠️ **Review coverage:**"
+
+
+          def coverage_gaps(comments, since):
+              """Files PR-Agent's coverage footer, in its summary from this run, says it left out or clipped.
+
+              Returns (paths, whether the footer listed only some of them)."""
+              summaries = [c for c in comments
+                           if (c.get("user") or {}).get("login") == COMMENT_AUTHOR and "pr-agent:review" in (c.get("body") or "")
+                           and (c.get("updated_at") or c.get("created_at") or "") >= since]
+              paths, more = set(), False
+              for summary in summaries:
+                  listing = False
+                  for line in summary["body"].replace("\r\n", "\n").split("\n"):
+                      if line.startswith(COVERAGE_HEADING):
+                          listing = True
+                      elif listing and line.startswith("- "):
+                          paths.add(line[2:].strip().strip("`").strip())
+                      elif listing and line.startswith("... and ") and line.endswith(" more"):
+                          more = True
+                      elif listing and line.strip():
+                          listing = False
+              return sorted(paths), more
 
 
           # ---- Verifier ----------------------------------------------------------------------------------
@@ -874,21 +904,29 @@ jobs:
                   out("The checkpoint already covers this commit.")
                   return 0
 
+              started_at = now_utc()
               previous = (checkpoint or {}).get("findings") or []
               pruned = (checkpoint or {}).get("pruned") or []
               fixed_ids = set((checkpoint or {}).get("fixed_ids") or [])
               security = (checkpoint or {}).get("security") or {}
+              uncovered, more_gaps = sorted(set((checkpoint or {}).get("uncovered") or []) & pr_paths), False
               if plan_result["mode"] == "none":
                   # Nothing to review, but a change can still fix a finding, for example by reverting its
                   # file out of the pull request.
-                  findings, to_verify, pruned = merge_findings(previous, [], plan_result, head_sha, pruned, fixed_ids)
+                  findings, to_verify, pruned = merge_findings(previous, [], plan_result, head_sha, pruned, fixed_ids, started_at)
               else:
                   review = run_review(plan_result, pr_paths, user_globs, model, keys)
                   validate_review(review)
                   raised = findings_from_review(review, head_sha)
-                  findings, to_verify, pruned = merge_findings(previous, raised, plan_result, head_sha, pruned, fixed_ids)
+                  findings, to_verify, pruned = merge_findings(previous, raised, plan_result, head_sha, pruned, fixed_ids, started_at)
+                  gaps, more_gaps = coverage_gaps(github.comments(repo, pr), started_at)
                   # The latest review's verdict replaces the earlier one, as with PR-Agent's own summary.
                   security = {"sha": head_sha, "concern": security_concern(review)}
+                  reviewed = pr_paths if plan_result["mode"] == "full" else set(plan_result["files"])
+                  uncovered = sorted(((set((checkpoint or {}).get("uncovered") or []) - reviewed) | set(gaps)) & pr_paths)
+                  if gaps or more_gaps:
+                      out(f"::warning::The review left out {len(gaps)}{'+' if more_gaps else ''} file(s) for its token budget; "
+                          "later runs review them.")
                   out(f"The review raised {len(raised)} finding(s); {len(to_verify)} earlier finding(s) to re-check.")
 
               def read_diff(path, since):
@@ -922,12 +960,17 @@ jobs:
               state = {"version": 1, "revision": (checkpoint or {}).get("revision", 0) + 1,
                        "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref, "merge_base": merge_base,
                        "fixed_ids": sorted(fixed_ids),
+                       "uncovered": uncovered, "uncovered_unlisted": more_gaps,
                        "ignore_glob": list(user_globs),
                        "findings": findings, "security": security, "runs": runs[-KEPT_RUNS:],
                        "pruned_fixed": (checkpoint or {}).get("pruned_fixed", 0),
                        # A pruned finding's identity is needed only while one of its threads is open.
                        "pruned": [p for p in pruned if any(thread_posts(t, p) and not t["resolved"] for t in threads)]}
               github.save_comment(repo, pr, (latest_comment or {}).get("id"), fit_comment(state))
+              # Review jobs for a pull request are serialized, so this should always hold; if another save
+              # slipped in, failing here keeps the findings job from trusting a checkpoint it did not get.
+              if (find_checkpoint(github.comments(repo, pr))[1] or {}).get("revision") != state["revision"]:
+                  raise RunFailed("Another run's checkpoint replaced this one.")
               open_count = sum(f["state"] == "ACTIVE" for f in findings)
               out(f"Saved the checkpoint for {head_sha[:7]}: {open_count} open finding(s).")
               return 0
@@ -990,6 +1033,9 @@ jobs:
                   out(f"::error::No PR-Agent checkpoint for {head_sha[:7]} (latest: {seen}). Re-run the whole workflow.")
                   return 1
 
+              if state.get("uncovered") or state.get("uncovered_unlisted"):
+                  out(f"::warning::{len(state.get('uncovered') or [])} file(s) have not been fully reviewed yet "
+                      "because of the token budget: " + ", ".join((state.get("uncovered") or [])[:20]))
               threads = github.bot_threads(repo, pr)
               lines = open_findings(state, threads, comment["html_url"])
               open_count = len(lines)
