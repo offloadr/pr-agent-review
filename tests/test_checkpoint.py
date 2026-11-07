@@ -100,6 +100,9 @@ class FakeGitHub:
 
     def resolve_thread(self, thread_id):
         self.resolved.append(thread_id)
+        for t in self.threads:
+            if t["id"] == thread_id:
+                t["resolved"] = True
 
     def state(self):
         return cp.find_checkpoint(self.issue_comments)[1]
@@ -1167,6 +1170,46 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
         self.assertEqual(cp.gate_main(github, "o/r", "1", C, out=lambda _: None, sleep=lambda _: None), 1)
 
+    def helper_fixed(self):
+        github = FakeGitHub(A, ["caller.py", "helper.py"])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        null = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "+    return ''"}]}
+        run_review(github, B, review(), verdicts={null: "fixed"})
+        return github, null
+
+    def test_reverted_fix_is_rechecked_even_after_the_fixed_record_was_pruned(self):
+        github, null = self.helper_fixed()
+        state = github.state()
+        record = state["findings"].pop()  # Pruned for size, as fit_comment would.
+        state["fixed_deps"] = [{"id": record["id"], "path": record["path"], "header": record["header"],
+                                "content": record["content"][:300], "content_id": record["content_id"],
+                                "fix_files": record["fix_files"], "threads": record["threads"]}]
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.files = [{"filename": "caller.py", "patch": "@@"}]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "-    return ''"}]}
+        prompts = []
+        run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts)
+        self.assertIn("fixed earlier", prompts[0])
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
+    def test_fix_dependencies_follow_renames(self):
+        github, null = self.helper_fixed()
+        github.files = [{"filename": "caller.py", "patch": "@@"}, {"filename": "utils.py", "patch": "@@"}]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [
+            {"filename": "utils.py", "previous_filename": "helper.py", "status": "renamed"}]}
+        run_review(github, C, review(), verdicts={null: "fixed"})
+        self.assertEqual(github.state()["findings"][0]["fix_files"], ["caller.py", "utils.py"])
+        github.heads = ["d" * 40]
+        github.compares[(C, "d" * 40)] = {"status": "ahead", "files": [{"filename": "utils.py", "patch": "-    return ''"}]}
+        prompts = []
+        run_review(github, "d" * 40, review(), verdicts={null: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
     def test_unknown_rename_is_kept_out_of_the_cross_file_check_too(self):
         github = FakeGitHub(A, ["x.py", "y.py"])
         run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
@@ -1337,12 +1380,11 @@ class GateTests(unittest.TestCase):
             run_review(github, head, review(*[issue(p, "Bug", c) for p, c in contents]), verdicts=fixed)
             posted_threads += [posted(f"T{round_number}-{p}", p, "Bug", c) for p, c in contents]
             github.threads = posted_threads
+            # The findings job runs after every review and resolves the threads of fixed findings,
+            # including those already pruned from the checkpoint.
+            self.gate(github, head=head)
             previous = head
         self.assertGreater(github.state()["pruned_fixed"], 0)
-        github.threads = posted_threads
-        # Open threads keep every pruned identity, however many there are.
-        self.assertEqual(len(github.state()["pruned"]), github.state()["pruned_fixed"])
-        self.gate(github, head=previous)
         # Every thread but the ten of the last round, which are still open findings, is resolved.
         self.assertEqual(len(github.resolved), 110)
         self.assertFalse(any(t.startswith("T11-") for t in github.resolved))
@@ -1711,6 +1753,19 @@ class GateTests(unittest.TestCase):
         state["findings"] = [fixed]
         state["dismissed_threads"] = [identity]
         self.assertEqual(cp.fixed_thread_ids(state, [thread]), [])
+
+    def test_dismissal_withdrawn_after_the_fixing_push_is_verified_on_a_rerun(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+        run_review(github, B, review())  # Still dismissed, so the fix is not verified.
+        race = github.state()["findings"][0]
+        self.assertEqual(race["state"], "DISMISSED")
+        github.threads[0]["resolved"] = False  # Withdrawn after the save.
+        code, calls, _ = run_review(github, B, review(), verdicts={race["id"]: "fixed"})  # Re-run at the same head.
+        self.assertEqual((code, calls), (0, []))
+        self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
 
     def test_withdrawn_dismissal_is_verified_by_the_push_that_fixes_it(self):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))

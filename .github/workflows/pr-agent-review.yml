@@ -458,7 +458,7 @@ jobs:
 
           def bound_history(state):
               """Keep the pruned-finding history within its budget, dropping the oldest entries first."""
-              lists = ("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned")
+              lists = ("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned", "fixed_deps")
               while len(json.dumps([state.get(name) or [] for name in lists])) > HISTORY_CHARS:
                   longest = max(lists, key=lambda name: len(json.dumps(state.get(name) or [])))
                   state[longest] = (state.get(longest) or [])[1:]
@@ -476,6 +476,12 @@ jobs:
                       state["pruned_fixed"] = state.get("pruned_fixed", 0) + 1
                       # About 15 characters per id, so the history stays small for any realistic pull request.
                       state.setdefault("fixed_ids", []).extend([pruned["id"], current_key(pruned)])
+                      if pruned.get("fix_files"):
+                          # Enough to recheck the fix if a later push changes the files it relied on.
+                          state.setdefault("fixed_deps", []).append({
+                              "id": pruned["id"], "path": pruned["path"], "header": pruned["header"],
+                              "content": pruned["content"][:300], "content_id": pruned.get("content_id"),
+                              "fix_files": pruned["fix_files"], "threads": identities(pruned)})
                       if identities(pruned):
                           # Kept so the findings job can still resolve the pruned finding's threads, and so a
                           # later review raising it again is recognized as a reintroduction.
@@ -736,6 +742,8 @@ jobs:
                   f["threads"] = list(identities(f))
                   f.pop("fingerprint", None)
                   f.pop("thread_path", None)
+                  if f.get("fix_files"):
+                      f["fix_files"] = sorted({renames.get(p, p) for p in f["fix_files"]})
                   if f["path"] in renames:
                       # The finding follows its file; its threads stay on the path they were posted on.
                       f.setdefault("renamed_from", f["path"])
@@ -1219,6 +1227,10 @@ jobs:
               if plan_result["mode"] == "none" and checkpoint["head_sha"] == head_sha:
                   retry_ids = [f["id"] for f in checkpoint.get("findings") or [] if f["state"] == "ACTIVE"
                                and (f.get("check") or {}).get("verdict") == "uncertain" and (f.get("check") or {}).get("sha") == head_sha]
+                  # A dismissal withdrawn after the save skipped the verification its fixing push would have had.
+                  early_threads = github.bot_threads(repo, pr)
+                  retry_ids += [f["id"] for f in checkpoint.get("findings") or [] if f["state"] == "DISMISSED"
+                                and any(thread_posts(t, f) and not t["resolved"] for t in early_threads)]
                   if not retry_ids:
                       out("The checkpoint already covers this commit.")
                       return 0
@@ -1238,6 +1250,21 @@ jobs:
               # In the previous checkpoint's paths, like every earlier record; this push's renames are applied
               # once, by merge_findings for restored findings and below for the history itself.
               dismissed_threads = list((checkpoint or {}).get("dismissed_threads") or [])
+              # A pruned fixed finding whose fix files this push changes comes back as a fixed record, so the
+              # recheck below can ask whether the fix still holds.
+              changed_now = set(plan_result.get("changed") or plan_result.get("files") or [])
+              fixed_deps = []
+              for dep in (checkpoint or {}).get("fixed_deps") or []:
+                  if set(dep.get("fix_files") or []) & changed_now and not any(f["id"] == dep["id"] for f in previous):
+                      previous.append({"id": dep["id"], "path": dep["path"], "header": dep["header"], "content": dep["content"],
+                                       "content_id": dep.get("content_id"), "threads": dep.get("threads") or [],
+                                       "fix_files": dep["fix_files"], "state": "FIXED", "line": None,
+                                       "checked_sha": (checkpoint or {}).get("head_sha") or head_sha,
+                                       "check": {"verdict": "fixed", "reason": "pruned after an earlier fix",
+                                                 "sha": (checkpoint or {}).get("head_sha") or head_sha}})
+                  else:
+                      fixed_deps.append(dict(dep, fix_files=sorted({renames.get(p, p) for p in dep.get("fix_files") or []}),
+                                             path=renames.get(dep["path"], dep["path"])))
               # A withdrawn dismissal (its thread unresolved) is open before this run picks what to verify, so a
               # push that fixes it gets it verified.
               record_dismissals(previous, threads, head_sha)
@@ -1409,7 +1436,7 @@ jobs:
                            "verified": len(to_verify), "verifier_usage": usage, "at": int(time.time())})
               state = {"version": 1, "revision": (checkpoint or {}).get("revision", 0) + 1,
                        "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref, "merge_base": merge_base,
-                       "fixed_ids": sorted(fixed_ids), "dismissed_ids": sorted(dismissed_ids),
+                       "fixed_ids": sorted(fixed_ids), "dismissed_ids": sorted(dismissed_ids), "fixed_deps": fixed_deps,
                        "dismissed_threads": dismissed_threads,
                        "uncovered": uncovered, "uncovered_unlisted": more_gaps, "saved_at": now_utc(),
                        # Once history was trimmed, the gate keeps failing closed on untracked threads.
