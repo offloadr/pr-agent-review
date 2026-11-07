@@ -280,6 +280,11 @@ class VerifierFormatTests(unittest.TestCase):
 
 
 class VerdictTests(unittest.TestCase):
+    def test_schema_invalid_verifier_output_is_uncertain_not_a_crash(self):
+        for answer in ({"verdicts": [{"id": ["1"], "verdict": "fixed"}]}, {"verdicts": "fixed"},
+                       {"verdicts": [{"id": "1", "verdict": ["fixed"]}]}, None, ["fixed"]):
+            self.assertEqual(cp.parse_verdicts(answer, ["1"])["1"][0], "uncertain", answer)
+
     def test_missing_unknown_and_malformed_verdicts_are_uncertain(self):
         verdicts = cp.parse_verdicts({"verdicts": [{"id": "1", "verdict": "fixed", "reason": "r"},
                                                    {"id": "2", "verdict": "probably"}, "junk",
@@ -487,6 +492,55 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(len(races), 1)
         self.assertEqual(prompts, [])
         self.assertEqual(sorted(i["path"] for i in races[0]["threads"]), ["moved.py", "x.py"])
+
+    def test_same_head_retarget_runs_finishing_in_reverse_order_do_not_overwrite(self):
+        github = self.first_run()
+        github.base_ref = "release"
+        newer = cp.render_comment({"revision": 2, "head_sha": A, "base_ref": "release", "merge_base": "m" * 40,
+                                   "findings": [], "security": {}, "runs": []})
+        calls = {"n": 0}
+        original = github.comments
+
+        def comments(repo, pr):
+            # The faster retarget run saves revision 2 while this one is still reviewing.
+            calls["n"] += 1
+            if calls["n"] == 2:
+                github.issue_comments[0]["body"] = newer
+            return original(repo, pr)
+        github.comments = comments
+        with self.assertRaises(cp.RunFailed):
+            run_review(github, A, review())
+        self.assertEqual(github.state()["revision"], 2)
+
+    def test_base_changing_during_the_run_saves_nothing(self):
+        github = self.first_run()
+        saved = github.saved
+        github.base_ref = "release"
+        original = github.pull
+        calls = {"n": 0}
+
+        def pull(repo, pr):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                github.base_ref = "main"  # Retargeted back while the review ran.
+            return original(repo, pr)
+        github.pull = pull
+        with self.assertRaises(cp.RunFailed):
+            run_review(github, A, review())
+        self.assertEqual(github.saved, saved)
+
+    def test_distinct_findings_sharing_a_long_prefix_stay_separate(self):
+        shared = "Saves interleave " + "z" * cp.CONTENT_CHARS
+        github = FakeGitHub(A, ["x.py"])
+        run_review(github, A, review(issue("x.py", "Race", shared + " on create.")))
+        old = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        prompts = []
+        run_review(github, B, review(issue("x.py", "Race", shared + " on delete.")), prompts=prompts)
+        self.assertEqual(len(github.state()["findings"]), 2)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn(old, prompts[0])
 
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
@@ -701,6 +755,27 @@ class GateTests(unittest.TestCase):
         self.assertEqual(github.state()["pruned"], [])
         code, _ = self.gate(github, head=B)
         self.assertEqual(code, 1)
+
+    def test_reintroduction_is_recognized_after_its_pruned_record_is_gone(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        state = github.state()
+        record = state["findings"].pop()
+        # Fixed, pruned, its threads resolved, and the pruned record dropped by a later checkpoint.
+        state["fixed_ids"], state["pruned"] = [record["id"]], []
+        github.issue_comments[0]["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review({"relevant_file": "x.py", "issue_header": "Race",
+                                      "issue_content": "Two saves interleave."}))
+        self.assertEqual(self.gate(github, head=B)[0], 1)
+
+    def test_gate_rejects_a_checkpoint_for_another_base_branch(self):
+        github = self.reviewed()
+        github.base_ref = "release"
+        code, output = self.gate(github)
+        self.assertEqual(code, 1)
+        self.assertIn("No PR-Agent checkpoint", output)
 
     def test_pruned_renamed_finding_still_resolves_its_original_thread(self):
         finding = {"id": "1", "path": "moved.py", "thread_path": "x.py", "header": "Race", "content": "c" * 500,
