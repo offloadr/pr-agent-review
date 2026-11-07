@@ -183,6 +183,7 @@ jobs:
           # GitHub rejects issue comments over 65,536 characters; stay well under it.
           COMMENT_LIMIT = 60_000
           CONTENT_CHARS = 2_000
+          PRUNED_KEPT = 300
           # PR-Agent 0.49.0's own file filters (language_handler.is_valid_file with default settings), so a
           # delta of files it would skip counts as nothing to review rather than a review with no output.
           BAD_EXTENSIONS = frozenset({
@@ -335,11 +336,12 @@ jobs:
 
           def parse_checkpoint(body):
               lines = (body or "").replace("\r\n", "\n").split("\n")
-              try:
-                  start = lines.index(STATE_START)
-                  end = lines.index(STATE_END, start + 1)
-              except ValueError:
+              # The state block is always the comment's last lines, so text above it cannot impersonate it.
+              starts = [i for i, line in enumerate(lines) if line == STATE_START]
+              if not starts or STATE_END not in lines[starts[-1] + 1:]:
                   return None
+              start = starts[-1]
+              end = lines.index(STATE_END, start + 1)
               return json.loads("\n".join(lines[start + 1:end]))
 
 
@@ -371,7 +373,7 @@ jobs:
               if findings:
                   lines += ["", "| State | Finding | Location |", "| --- | --- | --- |"]
                   for f in active + fixed:
-                      where = f"`{f['path']}`" + (f":{f['line']}" if f.get("line") else "")
+                      where = f"`{cell(f['path'])}`" + (f":{f['line']}" if f.get("line") else "")
                       if f["state"] == "ACTIVE":
                           status = "open"
                       else:
@@ -390,8 +392,12 @@ jobs:
               while len(body) > COMMENT_LIMIT:
                   fixed = [i for i, f in enumerate(state["findings"]) if f["state"] == "FIXED"]
                   if fixed:
-                      del state["findings"][fixed[0]]
+                      pruned = state["findings"].pop(fixed[0])
                       state["pruned_fixed"] = state.get("pruned_fixed", 0) + 1
+                      if pruned.get("fingerprint"):
+                          # Kept so the findings job can still resolve the pruned finding's threads.
+                          state.setdefault("pruned", []).append({"path": pruned["path"], "fingerprint": pruned["fingerprint"]})
+                          state["pruned"] = state["pruned"][-PRUNED_KEPT:]
                   elif any(len(f["content"]) > 300 for f in state["findings"]):
                       for f in state["findings"]:
                           f["content"] = f["content"][:300]
@@ -572,6 +578,23 @@ jobs:
               raise RunFailed(f"The workflow has no API key input for model {model}. Use an anthropic/ or OpenAI model.")
 
 
+          def supports_reasoning_effort(model):
+              """OpenAI reasoning models (o-series, GPT-5 and later) accept reasoning_effort; others reject it."""
+              return re.match(r"(o[0-9]|gpt-[5-9])", model.removeprefix("openai/")) is not None
+
+
+          def openai_body(model, effort, tier, prompt):
+              body = {"model": model.removeprefix("openai/"),
+                      "messages": [{"role": "system", "content": VERIFIER_SYSTEM}, {"role": "user", "content": prompt}],
+                      "response_format": {"type": "json_schema",
+                                          "json_schema": {"name": "verdicts", "strict": True, "schema": VERDICT_SCHEMA}}}
+              if effort and supports_reasoning_effort(model):
+                  body["reasoning_effort"] = effort
+              if tier:
+                  body["service_tier"] = tier
+              return body
+
+
           def call_model(model, effort, prompt, keys):
               """Ask the verifier model for verdicts; returns (parsed object, usage)."""
               if provider_of(model) == "anthropic":
@@ -587,15 +610,8 @@ jobs:
                   result = json.loads(send(request, timeout=600)[0])
                   blocks = [b for b in result.get("content") or [] if b.get("type") == "tool_use"]
                   return (blocks[0]["input"] if blocks else {}), result.get("usage") or {}
-              body = {"model": model.removeprefix("openai/"),
-                      "messages": [{"role": "system", "content": VERIFIER_SYSTEM}, {"role": "user", "content": prompt}],
-                      "response_format": {"type": "json_schema",
-                                          "json_schema": {"name": "verdicts", "strict": True, "schema": VERDICT_SCHEMA}}}
-              if effort:
-                  body["reasoning_effort"] = effort
               tier = os.environ.get("SERVICE_TIER", "")
-              if tier:
-                  body["service_tier"] = tier
+              body = openai_body(model, effort, tier, prompt)
               request = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=json.dumps(body).encode(),
                                                method="POST", headers={"Authorization": f"Bearer {keys['openai']}",
                                                                        "Content-Type": "application/json"})
@@ -747,7 +763,8 @@ jobs:
                            "verified": len(to_verify), "verifier_usage": usage, "at": int(time.time())})
               state = {"version": 1, "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref, "merge_base": merge_base,
                        "findings": findings, "security": security, "runs": runs[-KEPT_RUNS:],
-                       "pruned_fixed": (checkpoint or {}).get("pruned_fixed", 0)}
+                       "pruned_fixed": (checkpoint or {}).get("pruned_fixed", 0),
+                       "pruned": list((checkpoint or {}).get("pruned") or [])}
               github.save_comment(repo, pr, (latest_comment or {}).get("id"), fit_comment(state))
               open_count = sum(f["state"] == "ACTIVE" for f in findings)
               out(f"Saved the checkpoint for {head_sha[:7]}: {open_count} open finding(s).")
@@ -780,7 +797,8 @@ jobs:
 
           def fixed_thread_ids(state, threads):
               active = [f for f in state["findings"] if f["state"] == "ACTIVE"]
-              fixed = [f for f in state["findings"] if f["state"] == "FIXED"]
+              # Pruned fixed findings keep only their thread identity, which is all this needs.
+              fixed = [f for f in state["findings"] if f["state"] == "FIXED"] + list(state.get("pruned") or [])
               return [t["id"] for t in threads
                       if not t["resolved"] and any(thread_posts(t, f) for f in fixed)
                       and not any(thread_posts(t, f) for f in active)]
