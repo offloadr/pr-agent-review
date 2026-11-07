@@ -209,6 +209,9 @@ class VerifierRequestTests(unittest.TestCase):
 
     def test_flex_is_not_sent_to_models_without_it(self):
         self.assertNotIn("service_tier", cp.openai_body("gpt-4o", "", "flex", "p"))
+        self.assertNotIn("service_tier", cp.openai_body("o3-mini", "", "flex", "p"))
+        for model in ("o3", "o4-mini-2025-04-16", "gpt-5", "gpt-6.1-sol", "openai/gpt-6.1-sol"):
+            self.assertEqual(cp.openai_body(model, "", "flex", "p")["service_tier"], "flex", model)
         self.assertEqual(cp.openai_body("gpt-4o", "", "priority", "p")["service_tier"], "priority")
 
     def test_service_tier_is_sent_when_set(self):
@@ -383,6 +386,34 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(calls[0]["mode"], "full")
         self.assertEqual(github.state()["ignore_glob"], [])
 
+    def test_incomplete_or_malformed_review_output_saves_nothing(self):
+        for bad in ({"key_issues_to_review": []},
+                    {"key_issues_to_review": [{"relevant_file": "x.py"}], "security_concerns": "No"},
+                    {"key_issues_to_review": ["text"], "security_concerns": "No"},
+                    {"key_issues_to_review": {}, "security_concerns": "No"}):
+            github = FakeGitHub(A, ["x.py"])
+            with self.assertRaises(cp.RunFailed, msg=bad):
+                run_review(github, A, bad)
+            self.assertEqual(github.saved, 0)
+
+    def test_renamed_file_carries_its_findings_and_threads(self):
+        github = self.first_run()
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.files = [f for f in github.files if f["filename"] != "x.py"] + [{"filename": "moved.py", "patch": "@@"}]
+        github.contents["moved.py"] = "the same racy code"
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "moved.py", "previous_filename": "x.py", "status": "renamed"}]}
+        prompts = []
+        run_review(github, B, review(), verdicts={race: "still_present"}, prompts=prompts)
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("File: moved.py (renamed from x.py", prompts[0])
+        self.assertIn("the same racy code", prompts[0])
+        moved = {f["header"]: f for f in github.state()["findings"]}["Race"]
+        self.assertEqual((moved["path"], moved["thread_path"], moved["state"]), ("moved.py", "x.py", "ACTIVE"))
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.")]
+        self.assertTrue(cp.thread_posts(github.threads[0], moved))
+
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
         run_review(github, A, review(security="SQL injection: the query concatenates input."))
@@ -427,9 +458,10 @@ class PrAgentProcessTests(unittest.TestCase):
                          ("false", "false"))
 
     def test_flex_is_not_sent_to_pr_agent_for_models_without_it(self):
-        seen = self.run_with("gpt-4o", {"anthropic": "", "openai": "o-key"},
-                             {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
-        self.assertIsNone(seen["LITELLM.EXTRA_BODY"])
+        for model in ("gpt-4o", "o3-mini"):
+            seen = self.run_with(model, {"anthropic": "", "openai": "o-key"},
+                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
+            self.assertIsNone(seen["LITELLM.EXTRA_BODY"], model)
 
     def test_full_run_keeps_the_persistent_summary(self):
         seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},

@@ -454,18 +454,19 @@ jobs:
               if comparison is None or comparison.get("status") != "ahead" or len(comparison.get("files") or []) >= 300:
                   return {"mode": "full", "files": sorted(pr_paths),
                           "reason": f"{previous[:7]} is not an ancestor of {head_sha[:7]} or the change is too large to list"}
-              changed = set()
+              changed, renames = set(), {}
               for file in comparison.get("files") or []:
                   changed.add(file["filename"])
                   if file.get("previous_filename"):
                       changed.add(file["previous_filename"])
+                      renames[file["previous_filename"]] = file["filename"]
               delta = sorted(p for p in pr_paths & changed if reviewable(p) and not ignored_by(p, user_globs))
               if not delta:
-                  return {"mode": "none", "files": [], "changed": sorted(changed),
+                  return {"mode": "none", "files": [], "changed": sorted(changed), "renames": renames,
                           "reason": "no reviewable pull request file changed"}
               if len(pr_paths) - len(delta) > MAX_IGNORED_FILES:
                   return {"mode": "full", "files": sorted(pr_paths), "reason": "too many files to leave out"}
-              return {"mode": "delta", "files": delta, "changed": sorted(changed),
+              return {"mode": "delta", "files": delta, "changed": sorted(changed), "renames": renames,
                       "reason": f"files changed since {previous[:7]}"}
 
 
@@ -492,16 +493,28 @@ jobs:
               return hashlib.sha256(f"{path}\n{header}\n{content}".encode()).hexdigest()[:12]
 
 
+          def validate_review(review):
+              """Reject review output that is incomplete or malformed, so it cannot save a clean checkpoint."""
+              if not isinstance(review, dict):
+                  raise RunFailed("PR-Agent's review output is not a mapping.")
+              security = review.get("security_concerns")
+              if not isinstance(security, str) or not security.strip():
+                  raise RunFailed("PR-Agent's review output has no security verdict.")
+              issues = review.get("key_issues_to_review", [])
+              if not isinstance(issues, list):
+                  raise RunFailed("PR-Agent's review output has a malformed findings list.")
+              for issue in issues:
+                  if not (isinstance(issue, dict) and isinstance(issue.get("relevant_file"), str) and issue["relevant_file"].strip()
+                          and isinstance(issue.get("issue_content"), str) and issue["issue_content"].strip()):
+                      raise RunFailed(f"PR-Agent's review output has a malformed finding: {json.dumps(issue)[:200]}")
+
+
           def findings_from_review(review, head_sha):
               found = []
-              for issue in (review or {}).get("key_issues_to_review") or []:
-                  if not isinstance(issue, dict):
-                      continue
-                  path = (issue.get("relevant_file") or "").strip().lstrip("/")
+              for issue in review.get("key_issues_to_review") or []:
+                  path = issue["relevant_file"].strip().lstrip("/")
                   header = normalize_header(issue.get("issue_header"))
-                  content = (issue.get("issue_content") or "").strip()
-                  if not path or not content:
-                      continue
+                  content = issue["issue_content"].strip()
                   line = issue.get("start_line")
                   found.append({"id": finding_id(path, header, content), "path": path, "header": header,
                                 # Computed from the full text, so truncating the stored content cannot merge findings.
@@ -521,14 +534,20 @@ jobs:
               raised_by_id = {f["id"]: f for f in raised}
               changed = set(plan_result.get("changed") or plan_result["files"])
               merged, to_verify = [], []
+              renames = plan_result.get("renames") or {}
               for old in previous:
                   f = dict(old)
+                  if f["path"] in renames:
+                      # The finding follows its file; its threads stay on the path they were posted on.
+                      f.setdefault("thread_path", f["path"])
+                      f["path"] = renames[f["path"]]
                   new = raised_by_id.pop(f["id"], None)
                   if new is not None:
                       # Raised again word for word: still present, or reintroduced if it had been fixed.
                       f.update(state="ACTIVE", line=new["line"], fingerprint=new["fingerprint"], checked_sha=head_sha,
                                check={"verdict": "still_present", "reason": "raised again by the review", "sha": head_sha})
-                  elif f["state"] == "ACTIVE" and (plan_result["mode"] == "full" or f["path"] in changed):
+                  elif f["state"] == "ACTIVE" and (plan_result["mode"] == "full" or f["path"] in changed
+                                                   or f.get("thread_path") in changed):
                       to_verify.append(f)
                   merged.append(f)
               merged.extend(raised_by_id.values())
@@ -570,7 +589,9 @@ jobs:
               items = "\n\n".join(
                   f"id: {f['id']}\nreported at line: {f.get('line') or 'unknown'} (commit {f['checked_sha'][:7]})\n"
                   f"title: {f['header']}\ndescription: {f['content']}" for f in findings)
-              return (f"File: {path}\n\nFindings:\n\n{items}\n\n"
+              renamed = sorted({f["thread_path"] for f in findings if f.get("thread_path") and f["thread_path"] != path})
+              note = f" (renamed from {', '.join(renamed)}; the findings were reported against the old name)" if renamed else ""
+              return (f"File: {path}{note}\n\nFindings:\n\n{items}\n\n"
                       f"Diff of this file since the findings were last checked:\n```diff\n{(diff or '(no diff available)')[:DIFF_CONTEXT_CHARS]}\n```\n\n"
                       f"Current file:\n```\n{file_context(content, findings)}\n```\n\n"
                       "Return one verdict per finding id.")
@@ -590,8 +611,8 @@ jobs:
 
 
           def supports_flex(model):
-              """OpenAI offers the Flex tier for its reasoning models (o3 and later, GPT-5 and later)."""
-              return re.match(r"(o[3-9]|gpt-[5-9])", model.removeprefix("openai/")) is not None
+              """OpenAI offers Flex for o3, o4-mini and the GPT-5 and later families, but not o3-mini or older models."""
+              return re.fullmatch(r"(o3|o4-mini)(-\d{4}-\d{2}-\d{2})?|gpt-[5-9].*", model.removeprefix("openai/")) is not None
 
 
           def openai_body(model, effort, tier, prompt):
@@ -743,6 +764,7 @@ jobs:
                   findings, to_verify = merge_findings(previous, [], plan_result, head_sha)
               else:
                   review = run_review(plan_result, pr_paths, user_globs, model, keys)
+                  validate_review(review)
                   raised = findings_from_review(review, head_sha)
                   findings, to_verify = merge_findings(previous, raised, plan_result, head_sha)
                   # The latest review's verdict replaces the earlier one, as with PR-Agent's own summary.
@@ -792,7 +814,7 @@ jobs:
           def thread_posts(thread, finding):
               """A thread posts a finding when it carries that finding's PR-Agent dedup fingerprint."""
               fingerprint = finding.get("fingerprint")
-              return (bool(fingerprint) and thread["path"] == finding["path"]
+              return (bool(fingerprint) and thread["path"] == (finding.get("thread_path") or finding["path"])
                       and f"<!-- pr-agent-dedup: {fingerprint} -->" in thread["body"])
 
 
