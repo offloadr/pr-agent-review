@@ -705,14 +705,15 @@ jobs:
           COVERAGE_HEADING = "⚠️ **Review coverage:**"
 
 
-          def coverage_path(span, pr_paths):
-              """The file a footer entry names: an exact PR file name first (a name may contain a literal
-              backslash-n), then the name with PR-Agent's line-break escapes undone."""
-              raw = decode_code_span(span, unescape=False)
-              if pr_paths is not None and raw in pr_paths:
-                  return raw
-              decoded = decode_code_span(span)
-              return repository_path(decoded, pr_paths) if pr_paths is not None else decoded
+          def coverage_paths(span, pr_paths):
+              """The files a footer entry can name. PR-Agent escapes line breaks as backslash-n, so an entry
+              can mean a name with a literal backslash-n or one with a line break; every reading that is a PR
+              file is scheduled, so the skipped file is retried whichever it was."""
+              raw, decoded = decode_code_span(span, unescape=False), decode_code_span(span)
+              if pr_paths is None:
+                  return {decoded}
+              found = {p for p in (raw, decoded) if p in pr_paths}
+              return found or {repository_path(decoded, pr_paths)}
 
 
           def decode_code_span(span, unescape=True):
@@ -743,7 +744,7 @@ jobs:
                       if line.startswith(COVERAGE_HEADING):
                           listing = True
                       elif listing and line.startswith("- "):
-                          paths.add(coverage_path(line[2:], pr_paths))
+                          paths.update(coverage_paths(line[2:], pr_paths))
                       elif listing and line.startswith("... and ") and line.endswith(" more"):
                           more = True
                       elif listing and line.strip():

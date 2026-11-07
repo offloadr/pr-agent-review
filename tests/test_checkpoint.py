@@ -152,6 +152,12 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(cp.decode_code_span("``a`b.py``"), "a`b.py")
         self.assertEqual(cp.decode_code_span("`` `odd`.py ``"), "`odd`.py")
 
+    def test_entry_matching_two_pr_files_schedules_both(self):
+        literal, newline = "src/a\\note.py", "src/a\note.py"
+        body = ("⚠️ **Review coverage:** The following files were not included:\n- `src/a\\note.py`")
+        paths, _ = cp.coverage_gaps([self.summary(body)], "2026-11-07T11:00:00Z", {literal, newline, "x.py"})
+        self.assertEqual(sorted(paths), sorted([literal, newline]))
+
     def test_summaries_from_earlier_runs_are_ignored(self):
         body = "⚠️ **Review coverage:** The following files were not included:\n- `old.cs`"
         self.assertEqual(cp.coverage_gaps([self.summary(body, "2026-11-01T00:00:00Z")], "2026-11-07T11:00:00Z"),
