@@ -870,6 +870,34 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("+    return ''", prompts[0])
         self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
 
+    def test_vanished_file_after_a_force_push_or_missing_comparison_stays_open(self):
+        for comparison in ({"status": "diverged", "files": []}, None):
+            github = FakeGitHub(A, ["x.py"])
+            run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+            github.heads = [B]
+            github.files = [{"filename": "elsewhere.py"}]
+            github.contents["x.py"] = None
+            github.compares[(A, B)] = comparison
+            prompts = []
+            _, calls, _ = run_review(github, B, review(), prompts=prompts)
+            self.assertEqual((calls[0]["mode"], prompts), ("full", []), comparison)
+            self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE", comparison)
+
+    def test_verifying_a_changed_file_also_sees_the_push_s_other_changes(self):
+        github = FakeGitHub(A, ["caller.py", "helper.py"])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        null = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "caller.py", "patch": "-x  = 1\n+x = 1"},
+            {"filename": "helper.py", "patch": "-    return None\n+    return ''"}]}
+        prompts = []
+        run_review(github, B, review(), verdicts={null: "fixed"}, prompts=prompts)
+        self.assertEqual(len(prompts), 1)
+        self.assertTrue(prompts[0].startswith("File: caller.py"))
+        self.assertIn("+    return ''", prompts[0])
+        self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
+
     def test_capped_comparison_keeps_the_missing_file_safeguard_in_any_full_review(self):
         github = FakeGitHub(A, ["x.py"])
         run_review(github, A, review(issue("x.py", "Race", "Two saves interleave."), security="Injection: x.py."))

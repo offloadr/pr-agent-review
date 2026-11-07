@@ -471,7 +471,9 @@ jobs:
 
               def full(reason):
                   return {"mode": "full", "files": sorted(pr_paths), "changed": sorted(changed), "renames": renames,
-                          "renames_complete": not truncated, "reason": reason}
+                          # Renames are known only when there is nothing to compare or a complete comparison.
+                          "renames_complete": previous == head_sha or (comparison is not None and not truncated),
+                          "reason": reason}
 
               if (checkpoint.get("security") or {}).get("concern"):
                   # The concern is not tied to files, so only a review of everything can clear it.
@@ -747,7 +749,7 @@ jobs:
               return f"(Lines {low}-{high} of {len(lines)}.)\n{window}"[:FILE_CONTEXT_CHARS]
 
 
-          def verifier_prompt(path, findings, content, diff):
+          def verifier_prompt(path, findings, content, diff, other_changes=""):
               items = "\n\n".join(
                   f"id: {f['id']}\nreported at line: {f.get('line') or 'unknown'} (commit {f['checked_sha'][:7]})\n"
                   f"title: {f['header']}\ndescription: {f['content']}" for f in findings)
@@ -756,7 +758,9 @@ jobs:
               return (f"File: {path}{note}\n\nFindings:\n\n{items}\n\n"
                       f"Diff of this file since the findings were last checked:\n```diff\n{(diff or '(no diff available)')[:DIFF_CONTEXT_CHARS]}\n```\n\n"
                       f"Current file:\n```\n{file_context(content, findings)}\n```\n\n"
-                      "Return one verdict per finding id.")
+                      + (f"Other changes in this push, which can also fix a finding (for example in a helper it calls):\n"
+                         f"```diff\n{other_changes[:DIFF_CONTEXT_CHARS // 2]}\n```\n\n" if other_changes else "")
+                      + "Return one verdict per finding id.")
 
 
           def provider_of(model):
@@ -935,7 +939,7 @@ jobs:
                       f["state"] = "FIXED"
 
 
-          def verify(findings, head_sha, read_file, read_diff, ask):
+          def verify(findings, head_sha, read_file, read_diff, ask, push_files=()):
               """Verify findings in place, batched per file; returns the usage records."""
               usage = []
               by_path = {}
@@ -945,7 +949,9 @@ jobs:
                   since = {f["checked_sha"] for f in group}
                   # One diff per batch: since the findings' common check commit, or the whole PR patch.
                   base = group[0]["checked_sha"] if len(since) == 1 else None
-                  prompt = verifier_prompt(path, group, read_file(path), read_diff(path, base))
+                  others = "\n".join(f"--- {f['filename']}\n{f.get('patch') or '(no patch)'}" for f in push_files
+                                      if path not in (f["filename"], f.get("previous_filename")))
+                  prompt = verifier_prompt(path, group, read_file(path), read_diff(path, base), others)
                   answer, used = ask(prompt)
                   usage.append(used)
                   apply_verdicts(group, parse_verdicts(answer, [f["id"] for f in group]), head_sha)
@@ -1091,9 +1097,11 @@ jobs:
               usage = []
               ask = ask or (lambda prompt: call_model(verifier_model, verifier_effort, prompt, keys))
               read_file = lambda path: github.file_at(repo, path, head_sha)  # noqa: E731
+              push_files = []
+              if checkpoint is not None and checkpoint["head_sha"] != head_sha and (to_verify or elsewhere):
+                  push_files = (compare(checkpoint["head_sha"], head_sha) or {}).get("files") or []
               if to_verify:
-                  usage = verify(to_verify, head_sha, read_file, read_diff, ask)
-              push_files = ((compare(checkpoint["head_sha"], head_sha) or {}).get("files") or []) if elsewhere else []
+                  usage = verify(to_verify, head_sha, read_file, read_diff, ask, push_files)
               push_diff = "\n".join(f"--- {f['filename']}\n{f.get('patch') or '(no patch)'}" for f in push_files)
               if elsewhere and push_diff:
                   # One call for every open finding outside the changed files, so cost does not grow per file.
