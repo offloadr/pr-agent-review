@@ -730,7 +730,7 @@ jobs:
               raised_by_text = {(f["path"], f["content_id"]): f for f in raised}
               changed = set(plan_result.get("changed") or plan_result["files"])
               renames = plan_result.get("renames") or {}
-              merged, to_verify, elsewhere = [], [], []
+              merged, to_verify, elsewhere, recheck = [], [], [], []
               for old in previous:
                   f = dict(old)
                   f["threads"] = list(identities(f))
@@ -761,6 +761,10 @@ jobs:
                   elif f["state"] == "ACTIVE" and changed:
                       # A change elsewhere can fix it too, as when a helper stops returning None.
                       elsewhere.append(f)
+                  elif f["state"] == "FIXED" and set(f.get("fix_files") or []) & changed:
+                      # A push touching the files that showed the fix may have undone it, even with nothing for
+                      # PR-Agent to review (a helper reverted to its base version drops out of the diff).
+                      recheck.append(f)
                   merged.append(f)
               # A finding raised again after its fixed record was pruned is a reintroduction too.
               kept = []
@@ -789,7 +793,7 @@ jobs:
                           reopen(new, started_at)
                   taken.add(new["id"])
                   merged.append(new)
-              return merged, to_verify, kept, elsewhere
+              return merged, to_verify, kept, elsewhere, recheck
 
 
           COVERAGE_HEADING = "⚠️ **Review coverage:**"
@@ -1068,7 +1072,29 @@ jobs:
                       "Return one verdict per finding id.")
 
 
-          def apply_verdicts(group, verdicts, head_sha):
+          def recheck_prompt(findings, read_file, push_diff):
+              """One prompt asking whether earlier fixes still hold after a push changed the files they relied on."""
+              items = []
+              for f in findings:
+                  content = read_file(f["path"])
+                  lines = (content or "").split("\n")
+                  center = f.get("line") or 1
+                  low, high = max(1, center - ELSEWHERE_WINDOW), min(len(lines), center + ELSEWHERE_WINDOW)
+                  excerpt = "\n".join(f"{n}: {lines[n - 1]}" for n in range(low, high + 1)) if content is not None \
+                      else "(the file does not exist at the current commit)"
+                  items.append(f"id: {f['id']}\nfile: {f['path']}, reported at line {f.get('line') or 'unknown'}\n"
+                               f"title: {f['header']}\ndescription: {f['content']}\n"
+                               f"fixed earlier by: {(f.get('check') or {}).get('reason', '')}\n"
+                               f"current code around it:\n```\n{excerpt[:FILE_CONTEXT_CHARS // max(1, len(findings))]}\n```")
+              return ("These findings were fixed earlier, and this push changed files their fix relied on. Decide for "
+                      "each whether the failure is back: 'still_present' if the push undid the fix and the failure "
+                      "can happen again, and say how; 'fixed' if the fix still holds; 'uncertain' if you cannot tell."
+                      "\n\nFindings:\n\n" + "\n\n".join(items) +
+                      f"\n\nDiff of this push:\n```diff\n{push_diff[:DIFF_CONTEXT_CHARS]}\n```\n\n"
+                      "Return one verdict per finding id.")
+
+
+          def apply_verdicts(group, verdicts, head_sha, evidence_files=()):
               for f in group:
                   verdict, reason = verdicts[f["id"]]
                   f["check"] = {"verdict": verdict, "reason": reason, "sha": head_sha}
@@ -1078,6 +1104,8 @@ jobs:
                       f["checked_sha"] = head_sha
                   if verdict == "fixed":
                       f["state"] = "FIXED"
+                      # The files whose changes showed the fix: undoing any of them can bring the failure back.
+                      f["fix_files"] = sorted({f["path"], *evidence_files})
 
 
           def verify(findings, head_sha, read_file, read_diff, ask, changes_since=lambda sha: []):
@@ -1093,7 +1121,8 @@ jobs:
                   prompt = verifier_prompt(path, group, read_file(path), read_diff(path, base), others)
                   answer, used = ask(prompt)
                   usage.append(used)
-                  apply_verdicts(group, parse_verdicts(answer, [f["id"] for f in group]), head_sha)
+                  evidence = [c["filename"] for c in changes_since(base)]
+                  apply_verdicts(group, parse_verdicts(answer, [f["id"] for f in group]), head_sha, evidence)
               return usage
 
 
@@ -1206,8 +1235,9 @@ jobs:
               fixed_ids = set((checkpoint or {}).get("fixed_ids") or [])
               dismissed_ids = follow_renames(set((checkpoint or {}).get("dismissed_ids") or []), plan_result.get("renames") or {})
               renames = plan_result.get("renames") or {}
-              dismissed_threads = [dict(e, path=renames[e["path"]]) if "key" in e and e.get("path") in renames else e
-                                   for e in (checkpoint or {}).get("dismissed_threads") or []]
+              # In the previous checkpoint's paths, like every earlier record; this push's renames are applied
+              # once, by merge_findings for restored findings and below for the history itself.
+              dismissed_threads = list((checkpoint or {}).get("dismissed_threads") or [])
               # A withdrawn dismissal (its thread unresolved) is open before this run picks what to verify, so a
               # push that fixes it gets it verified.
               record_dismissals(previous, threads, head_sha)
@@ -1225,13 +1255,15 @@ jobs:
                       dismissed_threads = [e for e in dismissed_threads if e is not entry]
                       dismissed_ids.discard(dismissed_key(restored))
                       dismissed_ids.discard(current_key(restored))
+              dismissed_threads = [dict(e, path=renames[e["path"]]) if "key" in e and e.get("path") in renames else e
+                                   for e in dismissed_threads]
               security = (checkpoint or {}).get("security") or {}
               uncovered = sorted(set((checkpoint or {}).get("uncovered") or []) & pr_paths)
               more_gaps = bool((checkpoint or {}).get("uncovered_unlisted"))
               if plan_result["mode"] == "none":
                   # Nothing to review, but a change can still fix a finding, for example by reverting its
                   # file out of the pull request.
-                  findings, to_verify, pruned, elsewhere = merge_findings(previous, [], plan_result, head_sha, pruned, fixed_ids,
+                  findings, to_verify, pruned, elsewhere, recheck = merge_findings(previous, [], plan_result, head_sha, pruned, fixed_ids,
                                                                           occurrence_since, dismissed_ids)
                   to_verify += [f for f in findings if f["id"] in (plan_result.get("retry_ids") or []) and f["state"] == "ACTIVE"
                                 and f not in to_verify]
@@ -1249,7 +1281,7 @@ jobs:
                       review = {"key_issues_to_review": [], "security_concerns": "No", "no_text_diff": True}
                   validate_review(review)
                   raised = findings_from_review(review, head_sha, pr_paths)
-                  findings, to_verify, pruned, elsewhere = merge_findings(previous, raised, plan_result, head_sha, pruned,
+                  findings, to_verify, pruned, elsewhere, recheck = merge_findings(previous, raised, plan_result, head_sha, pruned,
                                                                           fixed_ids, occurrence_since, dismissed_ids)
                   # GitHub can briefly serve the summary from before PR-Agent updated it, so wait for this run's.
                   for attempt in range(5):
@@ -1291,15 +1323,16 @@ jobs:
               # A finding whose file vanished in a push too large to list every rename may live on under another
               # name; a missing file is then no evidence of a fix. It stays open without asking the verifier, on
               # this run and later ones (reruns included), until its file is back or a review raises it again.
-              for f in list(to_verify):
-                  if plan_result.get("renames_complete") is False or f.get("rename_unknown"):
-                      if github.file_at(repo, f["path"], head_sha) is None:
-                          f["rename_unknown"] = True
-                          f["check"] = {"verdict": "uncertain", "sha": head_sha,
-                                        "reason": "the file is gone and the push was too large to see whether it was renamed"}
-                          to_verify.remove(f)
-                      else:
-                          f.pop("rename_unknown", None)
+              for queue in (to_verify, elsewhere):
+                  for f in list(queue):
+                      if plan_result.get("renames_complete") is False or f.get("rename_unknown"):
+                          if github.file_at(repo, f["path"], head_sha) is None:
+                              f["rename_unknown"] = True
+                              f["check"] = {"verdict": "uncertain", "sha": head_sha,
+                                            "reason": "the file is gone and the push was too large to see whether it was renamed"}
+                              queue.remove(f)
+                          else:
+                              f.pop("rename_unknown", None)
               usage = []
               ask = ask or (lambda prompt: call_model(verifier_model, verifier_effort, prompt, keys))
               read_file = lambda path: github.file_at(repo, path, head_sha)  # noqa: E731
@@ -1327,8 +1360,23 @@ jobs:
                       continue
                   answer, used = ask(elsewhere_prompt(group, read_file, push_diff))
                   usage.append(used)
-                  apply_verdicts(group, parse_verdicts(answer, [f["id"] for f in group]), head_sha)
+                  apply_verdicts(group, parse_verdicts(answer, [f["id"] for f in group]), head_sha,
+                                 [c["filename"] for c in changes_since(since)])
                   to_verify = to_verify + group
+              # Fixed findings whose fix files this push changed: one call asks whether the fix still holds.
+              recheck_diff = "\n".join(f"--- {c['filename']}\n{c.get('patch') or '(no patch)'}"
+                                        for c in changes_since(since_checkpoint)) if recheck else ""
+              if recheck and recheck_diff:
+                  answer, used = ask(recheck_prompt(recheck, read_file, recheck_diff))
+                  usage.append(used)
+                  verdicts = parse_verdicts(answer, [f["id"] for f in recheck])
+                  for f in recheck:
+                      verdict, reason = verdicts[f["id"]]
+                      if verdict == "still_present":
+                          reopen(f, occurrence_since)
+                          f.update(state="ACTIVE", checked_sha=head_sha,
+                                   check={"verdict": verdict, "reason": f"the fix was undone: {reason}", "sha": head_sha})
+                          out(f"- reopened: {f['path']} {f['header']} ({reason[:120]})")
               for f in to_verify:
                   out(f"- {f['check']['verdict']}: {f['path']} {f['header']} ({f['check']['reason'][:120]})")
 

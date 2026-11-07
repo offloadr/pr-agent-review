@@ -1147,6 +1147,42 @@ class ReviewTests(unittest.TestCase):
         run_review(github, A, review())
         self.assertEqual(github.state()["uncovered"], ["big.py"])
 
+    def test_reverting_a_fix_in_another_file_reopens_the_finding(self):
+        github = FakeGitHub(A, ["caller.py", "helper.py"])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        null = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "+    return ''"}]}
+        run_review(github, B, review(), verdicts={null: "fixed"})
+        fixed = github.state()["findings"][0]
+        self.assertEqual((fixed["state"], fixed["fix_files"]), ("FIXED", ["caller.py", "helper.py"]))
+        # The helper change is reverted to its base version, so helper.py leaves the PR diff entirely.
+        github.files = [{"filename": "caller.py", "patch": "@@"}]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "-    return ''"}]}
+        prompts = []
+        _, calls, _ = run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts)
+        self.assertEqual(calls, [])  # Nothing for PR-Agent to review.
+        self.assertIn("fixed earlier", prompts[0])
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+        self.assertEqual(cp.gate_main(github, "o/r", "1", C, out=lambda _: None, sleep=lambda _: None), 1)
+
+    def test_unknown_rename_is_kept_out_of_the_cross_file_check_too(self):
+        github = FakeGitHub(A, ["x.py", "y.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        race = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.files = [{"filename": "y.py"}] + [{"filename": f"f{i}.py"} for i in range(300)]
+        github.contents["x.py"] = None
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": f"f{i}.py"} for i in range(300)]}
+        run_review(github, B, review())
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "y.py", "patch": "+other"}]}
+        prompts = []
+        run_review(github, C, review(), verdicts={race: "fixed"}, prompts=prompts)
+        self.assertFalse(any("Two saves interleave" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
         run_review(github, A, review(security="SQL injection: the query concatenates input."))
@@ -1547,6 +1583,27 @@ class GateTests(unittest.TestCase):
         x_prompt = next(p for p in prompts if p.startswith("File: x.py"))
         self.assertNotIn("@@ patch of x.py", x_prompt)
         self.assertIn("(no change to this file since then)", x_prompt)
+
+    def test_withdrawn_dismissal_during_a_double_rename_restores_at_the_right_file(self):
+        record = {"id": "1", "path": "x.py", "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint(
+            "x.py", "Race", "Two saves interleave.")}]}
+        github = self.reviewed()
+        state = github.state()
+        state["dismissed_threads"] = cp.history_entries(record)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.")]  # Withdrawn.
+        github.files = [{"filename": "y.py", "patch": "@@"}, {"filename": "z.py", "patch": "@@"}]
+        github.contents["y.py"] = "the code formerly in x.py"
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "y.py", "previous_filename": "x.py", "status": "renamed"},
+            {"filename": "z.py", "previous_filename": "y.py", "status": "renamed"}]}
+        prompts = []
+        run_review(github, B, review(), prompts=prompts)
+        restored = github.state()["findings"][0]
+        self.assertEqual(restored["path"], "y.py")
+        y_prompt = next(p for p in prompts if p.startswith("File: y.py"))
+        self.assertIn("the code formerly in x.py", y_prompt)
 
     def test_pruned_dismissal_renamed_later_restores_at_the_new_path(self):
         record = {"id": "1", "path": "x.py", "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint(
