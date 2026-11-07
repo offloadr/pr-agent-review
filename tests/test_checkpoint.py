@@ -41,6 +41,12 @@ def thread(tid, path, body, resolved=False):
     return {"id": tid, "path": path, "body": body, "resolved": resolved, "url": f"https://example/{tid}"}
 
 
+def posted(tid, path, header, content, resolved=False):
+    """An inline thread as PR-Agent posts it, with its dedup marker."""
+    marker = f"<!-- pr-agent-dedup: {cp.inline_fingerprint(path, header, content)} -->"
+    return thread(tid, path, f"{cp.inline_body(header, content)}\n\n{marker}", resolved)
+
+
 class FakeGitHub:
     """A pull request whose head, files and comments the tests control."""
 
@@ -54,6 +60,7 @@ class FakeGitHub:
         self.resolved = []
         self.saved = 0
         self.base_ref = "main"
+        self.merge_base = "m" * 40
 
     def pull(self, repo, pr):
         head = self.heads.pop(0) if len(self.heads) > 1 else self.heads[0]
@@ -63,6 +70,8 @@ class FakeGitHub:
         return self.files
 
     def compare(self, repo, base, head):
+        if base == "base":  # The merge-base lookup against the pull request's base.
+            return {"status": "ahead", "files": [], "merge_base_commit": {"sha": self.merge_base}}
         return self.compares.get((base, head))
 
     def file_at(self, repo, path, ref):
@@ -138,27 +147,42 @@ class PlanTests(unittest.TestCase):
         return lambda base, head: {"status": status, "files": [{"filename": f} for f in files]}
 
     def test_first_run_is_a_full_review(self):
-        self.assertEqual(cp.plan(None, A, "main", {"x.py"}, None, [])["mode"], "full")
+        self.assertEqual(cp.plan(None, A, "main", "M", {"x.py"}, None, [])["mode"], "full")
 
     def test_checkpoint_at_head_needs_nothing(self):
-        self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main"}, A, "main", {"x.py"}, None, [])["mode"], "none")
+        self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main", "merge_base": "M"}, A, "main", "M", {"x.py"}, None, [])["mode"], "none")
 
     def test_rebased_branch_gets_a_full_review(self):
-        self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main"}, B, "main", {"x.py"}, self.compare("diverged", ["x.py"]), [])["mode"], "full")
-        self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main"}, B, "main", {"x.py"}, lambda b, h: None, [])["mode"], "full")
+        self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main", "merge_base": "M"}, B, "main", "M", {"x.py"}, self.compare("diverged", ["x.py"]), [])["mode"], "full")
+        self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main", "merge_base": "M"}, B, "main", "M", {"x.py"}, lambda b, h: None, [])["mode"], "full")
 
     def test_delta_covers_changed_pr_files_minus_ignored(self):
-        result = cp.plan({"head_sha": A, "base_ref": "main"}, B, "main", {"x.py", "y.py", "package-lock.json"},
+        result = cp.plan({"head_sha": A, "base_ref": "main", "merge_base": "M"}, B, "main", "M", {"x.py", "y.py", "package-lock.json"},
                          self.compare("ahead", ["x.py", "package-lock.json", "not-in-pr.py"]), ["**/package-lock.json"])
         self.assertEqual((result["mode"], result["files"]), ("delta", ["x.py"]))
 
     def test_push_touching_no_reviewable_file_reviews_nothing(self):
-        result = cp.plan({"head_sha": A, "base_ref": "main"}, B, "main", {"x.py"}, self.compare("ahead", ["elsewhere.py"]), [])
+        result = cp.plan({"head_sha": A, "base_ref": "main", "merge_base": "M"}, B, "main", "M", {"x.py"}, self.compare("ahead", ["elsewhere.py"]), [])
         self.assertEqual(result["mode"], "none")
+
+    def test_delta_of_files_pr_agent_skips_reviews_nothing(self):
+        result = cp.plan({"head_sha": A, "base_ref": "main", "merge_base": "M"}, B, "main", "M",
+                         {"x.py", "logo.png", "web/package-lock.json", "app.min.js"},
+                         self.compare("ahead", ["logo.png", "web/package-lock.json", "app.min.js"]), [])
+        self.assertEqual(result["mode"], "none")
+
+    def test_merge_base_moving_back_gets_a_full_review_and_forward_keeps_the_delta(self):
+        checkpoint = {"head_sha": A, "base_ref": "main", "merge_base": "M"}
+        moves = {("M", "N"): {"status": "behind", "files": []}, ("M", "F"): {"status": "ahead", "files": []},
+                 (A, B): {"status": "ahead", "files": [{"filename": "x.py"}]}}
+        compare = lambda base, head: moves.get((base, head))
+        self.assertEqual(cp.plan(checkpoint, A, "main", "N", {"x.py"}, compare, [])["mode"], "full")
+        self.assertEqual(cp.plan(checkpoint, B, "main", "N", {"x.py"}, compare, [])["mode"], "full")
+        self.assertEqual(cp.plan(checkpoint, B, "main", "F", {"x.py"}, compare, [])["mode"], "delta")
 
     def test_too_many_files_to_leave_out_gets_a_full_review(self):
         paths = {f"f{i}.py" for i in range(cp.MAX_IGNORED_FILES + 2)}
-        self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main"}, B, "main", paths, self.compare("ahead", ["f0.py"]), [])["mode"], "full")
+        self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main", "merge_base": "M"}, B, "main", "M", paths, self.compare("ahead", ["f0.py"]), [])["mode"], "full")
 
 
 class VerdictTests(unittest.TestCase):
@@ -250,7 +274,8 @@ class ReviewTests(unittest.TestCase):
         github = self.first_run()
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "z.py"}]}
-        newer = cp.render_comment({"head_sha": C, "base_ref": "main", "findings": [], "security": {}, "runs": []})
+        newer = cp.render_comment({"head_sha": C, "base_ref": "main", "merge_base": "m" * 40, "findings": [],
+                                   "security": {}, "runs": []})
         calls = {"n": 0}
         original = github.comments
 
@@ -387,7 +412,7 @@ class GateTests(unittest.TestCase):
 
     def test_open_finding_fails_and_resolved_threads_dismiss_it(self):
         github = self.reviewed(issue("x.py", "Possible bug", "Two saves interleave."))
-        github.threads = [thread("T1", "x.py", "**Possible Issue**\n\nTwo saves interleave.\n\nmore")]
+        github.threads = [posted("T1", "x.py", "Possible Issue", "Two saves interleave.")]
         code, output = self.gate(github)
         self.assertEqual(code, 1)
         self.assertIn("(https://example/T1) Possible Issue: Two saves interleave.", output)
@@ -400,19 +425,22 @@ class GateTests(unittest.TestCase):
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
         race = finding_ids(github.state(), "x.py", "Race")[0]
         run_review(github, B, review(), verdicts={race: "fixed"})
-        github.threads = [thread("T_race", "x.py", "**Race**\n\nTwo saves interleave."),
-                          thread("T_leak", "y.py", "**Leak**\n\nNever closed.")]
+        github.threads = [posted("T_race", "x.py", "Race", "Two saves interleave."),
+                          posted("T_leak", "y.py", "Leak", "Never closed.")]
         code, _ = self.gate(github, head=B)
         self.assertEqual((code, github.resolved), (1, ["T_race"]))
 
     def test_resolved_thread_of_one_finding_does_not_dismiss_a_similar_one(self):
-        shared = "Saves interleave when two requests " + "y" * 150
+        # The shared opening is longer than the stored content, so only the fingerprint tells them apart.
+        shared = "Saves interleave when two requests " + "y" * cp.CONTENT_CHARS
         github = self.reviewed(issue("x.py", "Race", shared + " on create."), issue("x.py", "Race", shared + " on delete."))
-        github.threads = [thread("T_old", "x.py", f"**Race**\n\n{shared} on create.", resolved=True)]
+        stored = github.state()["findings"]
+        self.assertEqual(stored[0]["content"], stored[1]["content"])
+        # Only the first was posted inline, and that thread was resolved; the second is summary-only.
+        github.threads = [posted("T_old", "x.py", "Race", shared + " on create.", resolved=True)]
         code, output = self.gate(github)
         self.assertEqual(code, 1)
-        self.assertIn("on delete", output)
-        self.assertNotIn("on create", output)
+        self.assertIn("1 open PR-Agent finding", output)
 
     def test_security_concern_blocks(self):
         code, output = self.gate(self.reviewed(security="Secrets in logs: the token is printed."))

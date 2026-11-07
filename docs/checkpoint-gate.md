@@ -30,13 +30,21 @@ findings are kept with their evidence rather than deleted.
 ## Each run of the review job
 
 1. **Plan.** Read the pull request (head, base, files) and the checkpoint.
-   - No checkpoint, a checkpoint head that is not an ancestor of the current head (rebase or
-     force-push), or more changed files than the ignore list can hold: **full review**.
+   - No checkpoint, a changed base branch, a merge base that moved back or sideways (base reset
+     or rewritten, which can expose files no review has seen), a checkpoint head that is not an
+     ancestor of the current head (rebase or force-push), or more changed files than the ignore
+     list can hold: **full review**. A merge base that moved forward (base merged in) keeps the
+     earlier review valid.
    - Otherwise: **delta review** of the PR files that changed between the checkpoint head and the
      current head, from GitHub's compare API. Range selection is exact; PR-Agent's own
      `/review -i` is not used because it picks commits by committer date against the previous
      review comment's creation time, which skips a commit made during a review and pushed after.
-   - Checkpoint already at the current head: nothing to review; the job succeeds.
+   - Delta files are filtered the way PR-Agent filters them (binary and lockfile extensions,
+     generated lockfile names, minified and map files, the caller's ignore globs). A push that
+     touches only such files has nothing to review, but earlier findings in the changed files are
+     still verified.
+   - Checkpoint already at the current head, base branch and merge base: nothing to review; the
+     job succeeds.
 2. **Review.** Run PR-Agent's action entrypoint. A delta review ignores every PR file outside the
    delta, so PR-Agent reviews the full pull-request diff of the changed files, with their
    surrounding PR changes as context. Findings are read from PR-Agent's `review` output (the parsed
@@ -58,7 +66,10 @@ covers everything since the last saved checkpoint.
 ## The findings job (the gate)
 
 Reads the checkpoint and fails unless it is for the current head. An active finding blocks until
-it is verified fixed or every inline thread posting it is resolved (a reviewer dismissing it). A
+it is verified fixed or every inline thread posting it is resolved (a reviewer dismissing it).
+Threads are tied to findings by PR-Agent's `pr-agent-dedup` fingerprint, computed from the full
+finding text when it is first read, so truncating stored text cannot make two findings share
+threads. A
 security concern from the latest review blocks until a later review reports none. Threads of fixed
 findings are resolved with the workflow token, unless the thread also matches an active finding.
 Re-running only this job re-evaluates dismissals without paying for a review.

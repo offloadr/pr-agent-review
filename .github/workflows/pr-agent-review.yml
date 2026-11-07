@@ -183,6 +183,18 @@ jobs:
           # GitHub rejects issue comments over 65,536 characters; stay well under it.
           COMMENT_LIMIT = 60_000
           CONTENT_CHARS = 2_000
+          # PR-Agent 0.49.0's own file filters (language_handler.is_valid_file with default settings), so a
+          # delta of files it would skip counts as nothing to review rather than a review with no output.
+          BAD_EXTENSIONS = frozenset({
+              "app", "bin", "bmp", "bz2", "class", "csv", "dat", "db", "dll", "dylib", "egg", "eot", "exe", "gif",
+              "gitignore", "glif", "gradle", "gz", "ico", "jar", "jpeg", "jpg", "lo", "lock", "log", "mp3", "mp4",
+              "nar", "o", "ogg", "otf", "p", "pdf", "png", "pickle", "pkl", "pyc", "pyd", "pyo", "rkt", "so", "ss",
+              "svg", "tar", "tgz", "tsv", "ttf", "war", "webm", "woff", "woff2", "xz", "zip", "zst", "snap", "lockb"})
+          GENERATED_FILES = frozenset({
+              "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "composer.lock", "Gemfile.lock", "poetry.lock",
+              "go.sum", ".terraform.lock.hcl", "uv.lock", "Cargo.lock", "Pipfile.lock", "mix.lock", "pubspec.lock",
+              "bun.lockb"})
+          GENERATED_SUFFIXES = (".min.js", ".min.css", ".js.map", ".ts.map", ".css.map")
           SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
 
           THREADS_QUERY = """
@@ -395,12 +407,19 @@ jobs:
               return re.sub(r"([\[\]*?])", r"[\1]", path)
 
 
+          def reviewable(path):
+              """Whether PR-Agent would review this file at all."""
+              name = path.replace("\\", "/").split("/")[-1]
+              return (name not in GENERATED_FILES and not path.endswith(GENERATED_SUFFIXES)
+                      and path.split(".")[-1].lower() not in BAD_EXTENSIONS)
+
+
           def ignored_by(path, globs):
               """Approximates PR-Agent's ignore.glob, where a leading **/ also matches zero directories."""
               return any(fnmatch.fnmatch(path, g) or (g.startswith("**/") and fnmatch.fnmatch(path, g[3:])) for g in globs)
 
 
-          def plan(checkpoint, head_sha, base_ref, pr_paths, compare, user_globs):
+          def plan(checkpoint, head_sha, base_ref, merge_base, pr_paths, compare, user_globs):
               """Decide what this run reviews: {"mode": "none" | "full" | "delta", "files": [...], "reason": ...}."""
               if checkpoint is None:
                   return {"mode": "full", "files": sorted(pr_paths), "reason": "no checkpoint yet"}
@@ -408,6 +427,14 @@ jobs:
                   # Retargeting changes the pull request's diff without moving its head.
                   return {"mode": "full", "files": sorted(pr_paths),
                           "reason": f"the base branch changed from {checkpoint.get('base_ref')} to {base_ref}"}
+              # The pull request's diff runs from the merge base. Moving it forward (base merged in) keeps the
+              # earlier review valid; moving it back or sideways (base reset or rewritten) can expose files no
+              # review has seen, so that gets a full review.
+              if checkpoint.get("merge_base") != merge_base:
+                  moved = compare(checkpoint["merge_base"], merge_base) if checkpoint.get("merge_base") else None
+                  if moved is None or moved.get("status") != "ahead":
+                      return {"mode": "full", "files": sorted(pr_paths),
+                              "reason": "the merge base with the base branch moved back or sideways"}
               previous = checkpoint["head_sha"]
               if previous == head_sha:
                   return {"mode": "none", "files": [], "reason": "checkpoint is already at this commit"}
@@ -420,7 +447,7 @@ jobs:
                   changed.add(file["filename"])
                   if file.get("previous_filename"):
                       changed.add(file["previous_filename"])
-              delta = sorted(p for p in pr_paths & changed if not ignored_by(p, user_globs))
+              delta = sorted(p for p in pr_paths & changed if reviewable(p) and not ignored_by(p, user_globs))
               if not delta:
                   return {"mode": "none", "files": [], "changed": sorted(changed),
                           "reason": "no reviewable pull request file changed"}
@@ -436,6 +463,17 @@ jobs:
               header = (header or "").strip()
               # PR-Agent renames this header when it posts the inline comment.
               return "Possible Issue" if header.lower() == "possible bug" else header
+
+
+          def inline_body(header, content):
+              """The body PR-Agent posts for an inline finding (pr_reviewer._build_key_issue_comment)."""
+              content = SUGGESTION_FENCE_RE.sub("```text", content.strip())
+              return f"**{header}**\n\n{content}" if header else content
+
+
+          def inline_fingerprint(path, header, content):
+              """PR-Agent's pr-agent-dedup marker for that body (inline_comment_dedup.key_issue_fingerprint)."""
+              return hashlib.sha256(f"{path}|{inline_body(header, content)}".encode()).hexdigest()[:12]
 
 
           def finding_id(path, header, content):
@@ -454,6 +492,8 @@ jobs:
                       continue
                   line = issue.get("start_line")
                   found.append({"id": finding_id(path, header, content), "path": path, "header": header,
+                                # Computed from the full text, so truncating the stored content cannot merge findings.
+                                "fingerprint": inline_fingerprint(path, header, content),
                                 "content": content[:CONTENT_CHARS], "line": line if isinstance(line, int) and line > 0 else None,
                                 "state": "ACTIVE", "first_seen": head_sha, "checked_sha": head_sha, "check": None})
               return found
@@ -658,7 +698,10 @@ jobs:
                       compares[(base, head)] = github.compare(repo, base, head)
                   return compares[(base, head)]
 
-              plan_result = plan(checkpoint, head_sha, base_ref, pr_paths, compare, user_globs)
+              merge_base = ((compare(base_sha, head_sha) or {}).get("merge_base_commit") or {}).get("sha")
+              if not merge_base:
+                  raise RunFailed("GitHub did not report a merge base for the pull request.")
+              plan_result = plan(checkpoint, head_sha, base_ref, merge_base, pr_paths, compare, user_globs)
               out(f"Plan: {plan_result['mode']} ({plan_result['reason']}); {len(plan_result['files'])} file(s).")
               if plan_result["mode"] == "none" and checkpoint["head_sha"] == head_sha:
                   out("The checkpoint already covers this commit.")
@@ -702,7 +745,7 @@ jobs:
               runs = list((checkpoint or {}).get("runs") or [])
               runs.append({"head_sha": head_sha, "mode": plan_result["mode"], "files": len(plan_result["files"]),
                            "verified": len(to_verify), "verifier_usage": usage, "at": int(time.time())})
-              state = {"version": 1, "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref,
+              state = {"version": 1, "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref, "merge_base": merge_base,
                        "findings": findings, "security": security, "runs": runs[-KEPT_RUNS:],
                        "pruned_fixed": (checkpoint or {}).get("pruned_fixed", 0)}
               github.save_comment(repo, pr, (latest_comment or {}).get("id"), fit_comment(state))
@@ -714,13 +757,9 @@ jobs:
           # ---- Gate mode ---------------------------------------------------------------------------------
 
           def thread_posts(thread, finding):
-              """Inline threads open with **header**, a blank line and the content, as PR-Agent writes them."""
-              if thread["path"] != finding["path"]:
-                  return False
-              # The whole stored content is compared, so findings that share an opening do not share threads.
-              content = SUGGESTION_FENCE_RE.sub("```text", finding["content"].strip())
-              expected = f"**{finding['header']}**\n\n{content}" if finding["header"] else content
-              return thread["body"].startswith(expected)
+              """A thread posts a finding when it carries that finding's PR-Agent dedup fingerprint."""
+              return (thread["path"] == finding["path"]
+                      and f"<!-- pr-agent-dedup: {finding['fingerprint']} -->" in thread["body"])
 
 
           def open_findings(state, threads, summary_url):
