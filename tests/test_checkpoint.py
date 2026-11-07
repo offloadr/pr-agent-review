@@ -153,14 +153,15 @@ class CoverageTests(unittest.TestCase):
 
 
 class WorkflowConcurrencyTests(unittest.TestCase):
-    def test_review_and_findings_jobs_for_a_pull_request_are_serialized(self):
+    def test_review_jobs_are_serialized_and_findings_jobs_cannot_evict_them(self):
         text = WORKFLOW.read_text()
         group = "group: pr-agent-checkpoint-${{ github.repository }}-${{ github.event.pull_request.number }}"
         review_job = text[text.index("  review:"):text.index("  findings:")]
         findings_job = text[text.index("  findings:"):]
-        for job in (review_job, findings_job):
-            self.assertIn(group, job)
-            self.assertIn("cancel-in-progress: false", job)
+        self.assertIn(group, review_job)
+        self.assertIn("cancel-in-progress: false", review_job)
+        # GitHub keeps one pending job per group, so a rerun findings job in it could replace a pending review.
+        self.assertNotIn("concurrency:", findings_job)
 
 
 class StorageTests(unittest.TestCase):
@@ -652,6 +653,32 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(state["uncovered"], [])
         self.assertTrue(state["uncovered_unlisted"])
 
+    def test_renames_survive_a_comparison_capped_at_300_files(self):
+        github = FakeGitHub(A, ["x.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.files = [{"filename": "moved.py", "patch": "@@"}] + [{"filename": f"f{i}.py"} for i in range(299)]
+        github.contents["moved.py"] = "the same racy code"
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "moved.py", "previous_filename": "x.py", "status": "renamed"}] + [{"filename": f"f{i}.py"} for i in range(299)]}
+        prompts = []
+        _, calls, _ = run_review(github, B, review(), verdicts={race: "still_present"}, prompts=prompts)
+        self.assertEqual(calls[0]["mode"], "full")
+        self.assertIn("File: moved.py", prompts[0])
+
+    def test_path_with_trailing_space_keeps_its_real_name(self):
+        github = FakeGitHub(A, ["src/file.py "])
+        run_review(github, A, review(issue("src/file.py", "Race", "Two saves interleave.")))
+        finding = github.state()["findings"][0]
+        self.assertEqual(finding["path"], "src/file.py ")
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "src/file.py "}]}
+        prompts = []
+        run_review(github, B, review(), verdicts={finding["id"]: "fixed"}, prompts=prompts)
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
+
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
         run_review(github, A, review(security="SQL injection: the query concatenates input."))
@@ -916,7 +943,8 @@ class GateTests(unittest.TestCase):
         finally:
             cp.COMMENT_LIMIT = saved
         self.assertEqual(state["findings"], [])
-        self.assertEqual(state["pruned"][0], {"id": "1", "threads": [{"path": "x.py", "fingerprint": finding["fingerprint"]}]})
+        self.assertEqual((state["pruned"][0]["id"], state["pruned"][0]["threads"]),
+                         ("1", [{"path": "x.py", "fingerprint": finding["fingerprint"]}]))
         thread_on_old_path = posted("T1", "x.py", "Race", "c" * 500)
         self.assertEqual(cp.fixed_thread_ids(state, [thread_on_old_path]), ["T1"])
 
@@ -943,6 +971,34 @@ class GateTests(unittest.TestCase):
         code, output = self.gate(github, head=B)
         self.assertEqual(github.resolved, [])
         self.assertIn("leaving thread resolution to its findings job", output)
+
+    def test_reintroduction_at_a_renamed_path_is_recognized_after_pruning(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        state = github.state()
+        record = dict(state["findings"].pop(), path="moved.py")  # Followed a rename, then fixed and pruned.
+        state["fixed_ids"], state["pruned"] = [record["id"], cp.current_key(record)], []
+        github.files = [{"filename": "moved.py"}, {"filename": "y.py"}]
+        github.issue_comments[0]["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "moved.py", "Race", "Two saves interleave.", resolved=True)]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "moved.py"}]}
+        run_review(github, B, review({"relevant_file": "moved.py", "issue_header": "Race",
+                                      "issue_content": "Two saves interleave."}))
+        self.assertEqual(self.gate(github, head=B)[0], 1)
+
+    def test_threads_created_after_the_checkpoint_was_saved_are_not_resolved(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review(), verdicts={race: "fixed"})
+        older = posted("T_old", "x.py", "Race", "Two saves interleave.")
+        older["created_at"] = "2000-01-01T00:00:00Z"
+        newer = posted("T_new", "x.py", "Race", "Two saves interleave.")
+        newer["created_at"] = "9999-01-01T00:00:00Z"  # Posted by a newer review for a reintroduction.
+        github.threads = [older, newer]
+        self.gate(github, head=B)
+        self.assertEqual(github.resolved, ["T_old"])
 
     def test_security_concern_blocks(self):
         code, output = self.gate(self.reviewed(security="Secrets in logs: the token is printed."))

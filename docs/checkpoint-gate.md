@@ -71,6 +71,10 @@ it is verified fixed or every inline thread posting it is resolved (a reviewer d
 finding raised again after it was fixed, even after its record was pruned, is dismissed only by a
 resolved thread with a comment newer than its return. A finding keeps every thread identity it was
 posted under, so a rename adds the new location instead of replacing the old one.
+The findings job resolves only threads that existed when its checkpoint was saved, so a gate left
+over from an older run cannot resolve, and so dismiss, a thread a newer review posted. It is not
+in the review job's concurrency group, because GitHub keeps only one pending job per group and a
+rerun findings job could replace a pending review.
 Threads are tied to findings by PR-Agent's `pr-agent-dedup` fingerprint, computed from the full
 finding text when it is first read, so truncating stored text cannot make two findings share
 threads. A
