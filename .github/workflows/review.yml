@@ -1,0 +1,34 @@
+name: Review
+
+# Reviews this repository's own pull requests with OpenAI gpt-6.1-sol, billed to the API
+# organization that holds OPENAI_KEY. The workflow is called by local path, so each pull
+# request is reviewed by the version of the workflow it changes. Fork pull requests get no
+# secrets and are skipped.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+concurrency:
+  group: pr-agent-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pr-agent:
+    uses: ./.github/workflows/pr-agent-review.yml
+    # The findings job resolves PR-Agent's threads for fixed findings, which GitHub only
+    # allows with contents: write. Neither job checks out or runs pull request code.
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    secrets:
+      OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+    with:
+      model: gpt-6.1-sol
+      instructions: |
+        This repository holds a reusable GitHub Actions workflow that reviews pull requests with PR-Agent in a pinned container, and a standard-library Python gate that fails the check while findings are open and resolves the threads of fixed ones.
+        Focus on expression injection and over-broad token permissions in workflows, API keys reaching steps or processes that do not need them, shell and Python errors, gate logic that disagrees with the PR-Agent summary and state format it parses, and pagination, retry or error handling in the GitHub API calls.
