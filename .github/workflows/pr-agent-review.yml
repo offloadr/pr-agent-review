@@ -95,8 +95,9 @@ jobs:
           # Fail visibly rather than quietly reviewing with a weaker model.
           CONFIG.FALLBACK_MODELS: "[]"
           CONFIG.REASONING_EFFORT: ${{ inputs.reasoning-effort }}
-          # Claude 5 models only think through the adaptive API; other models ignore this.
-          CONFIG.ENABLE_CLAUDE_ADAPTIVE_THINKING: "true"
+          # Claude 5 models only think through the adaptive API. It is off for other models,
+          # where PR-Agent would log a warning on every call.
+          CONFIG.ENABLE_CLAUDE_ADAPTIVE_THINKING: ${{ (startsWith(inputs.model, 'anthropic/') || startsWith(inputs.model, 'claude-')) && 'true' || 'false' }}
           # Sized for complete reviews rather than low cost. Inputs stay under OpenAI's 272K
           # long-context price tier; the output limit includes reasoning tokens.
           CONFIG.MAX_MODEL_TOKENS: "200000"
