@@ -128,6 +128,12 @@ def finding_ids(state, path, header):
     return [f["id"] for f in state["findings"] if f["path"] == path and f["header"] == header]
 
 
+class WorkflowTests(unittest.TestCase):
+    def test_pr_agent_accepts_edited_events(self):
+        line = next(l for l in WORKFLOW.read_text().split("\n") if "GITHUB_ACTION_CONFIG.PR_ACTIONS:" in l)
+        self.assertIn('"edited"', line)
+
+
 class StorageTests(unittest.TestCase):
     def test_state_round_trips_even_with_comment_terminators_in_text(self):
         state = {"head_sha": A, "findings": [{"content": "closes the comment --> <b>"}], "runs": [], "security": {}}
@@ -157,7 +163,8 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main", "merge_base": "M"}, B, "main", "M", {"x.py"}, lambda b, h: None, [])["mode"], "full")
 
     def test_delta_covers_changed_pr_files_minus_ignored(self):
-        result = cp.plan({"head_sha": A, "base_ref": "main", "merge_base": "M"}, B, "main", "M", {"x.py", "y.py", "package-lock.json"},
+        result = cp.plan({"head_sha": A, "base_ref": "main", "merge_base": "M", "ignore_glob": ["**/package-lock.json"]},
+                         B, "main", "M", {"x.py", "y.py", "package-lock.json"},
                          self.compare("ahead", ["x.py", "package-lock.json", "not-in-pr.py"]), ["**/package-lock.json"])
         self.assertEqual((result["mode"], result["files"]), ("delta", ["x.py"]))
 
@@ -199,6 +206,10 @@ class VerifierRequestTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", cp.openai_body("gpt-4o", "medium", "", "p"))
         self.assertEqual(cp.openai_body("gpt-6.1-sol", "medium", "", "p")["reasoning_effort"], "medium")
         self.assertEqual(cp.openai_body("openai/o4-mini", "low", "", "p")["reasoning_effort"], "low")
+
+    def test_flex_is_not_sent_to_models_without_it(self):
+        self.assertNotIn("service_tier", cp.openai_body("gpt-4o", "", "flex", "p"))
+        self.assertEqual(cp.openai_body("gpt-4o", "", "priority", "p")["service_tier"], "priority")
 
     def test_service_tier_is_sent_when_set(self):
         self.assertEqual(cp.openai_body("gpt-6.1-sol", "", "flex", "p")["service_tier"], "flex")
@@ -354,6 +365,24 @@ class ReviewTests(unittest.TestCase):
         self.assertGreater(state["pruned_fixed"], 0)
         self.assertEqual(sum(f["state"] == "ACTIVE" for f in state["findings"]), 10)
 
+    def test_security_concern_forces_a_full_review_so_an_unrelated_delta_cannot_clear_it(self):
+        github = FakeGitHub(A, ["x.py", "y.py"])
+        run_review(github, A, review(security="Injection: x.py builds a shell command from input."))
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "y.py"}]}
+        _, calls, _ = run_review(github, B, review(security="Injection: x.py builds a shell command from input."))
+        self.assertEqual(calls[0]["mode"], "full")
+        self.assertTrue(github.state()["security"]["concern"])
+
+    def test_changing_the_ignore_globs_gets_a_full_review(self):
+        github = FakeGitHub(A, ["x.py", "gen/client.py"])
+        _, calls, _ = run_review(github, A, review(), globs=["gen/**"])
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        _, calls, _ = run_review(github, B, review(), globs=[])
+        self.assertEqual(calls[0]["mode"], "full")
+        self.assertEqual(github.state()["ignore_glob"], [])
+
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
         run_review(github, A, review(security="SQL injection: the query concatenates input."))
@@ -396,6 +425,11 @@ class PrAgentProcessTests(unittest.TestCase):
         self.assertEqual(json.loads(seen["IGNORE.GLOB"]), ["**/package-lock.json", "y[[]1[]].py"])
         self.assertEqual((seen["PR_REVIEWER.PERSISTENT_FINDING_STATE"], seen["PR_REVIEWER.PERSISTENT_COMMENT"]),
                          ("false", "false"))
+
+    def test_flex_is_not_sent_to_pr_agent_for_models_without_it(self):
+        seen = self.run_with("gpt-4o", {"anthropic": "", "openai": "o-key"},
+                             {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
+        self.assertIsNone(seen["LITELLM.EXTRA_BODY"])
 
     def test_full_run_keeps_the_persistent_summary(self):
         seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
@@ -484,13 +518,29 @@ class GateTests(unittest.TestCase):
             contents = [(p, f"round {round_number} " + "x" * 1500) for p in paths]
             run_review(github, head, review(*[issue(p, "Bug", c) for p, c in contents]), verdicts=fixed)
             posted_threads += [posted(f"T{round_number}-{p}", p, "Bug", c) for p, c in contents]
+            github.threads = posted_threads
             previous = head
         self.assertGreater(github.state()["pruned_fixed"], 0)
         github.threads = posted_threads
+        # Open threads keep every pruned identity, however many there are.
+        self.assertEqual(len(github.state()["pruned"]), github.state()["pruned_fixed"])
         self.gate(github, head=previous)
         # Every thread but the ten of the last round, which are still open findings, is resolved.
         self.assertEqual(len(github.resolved), 110)
         self.assertFalse(any(t.startswith("T11-") for t in github.resolved))
+
+    def test_pruned_identity_is_dropped_once_its_threads_are_resolved(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        comment = github.issue_comments[0]
+        state = github.state()
+        state["pruned"] = [{"path": "x.py", "fingerprint": "aaaaaaaaaaaa"}, {"path": "y.py", "fingerprint": "bbbbbbbbbbbb"}]
+        comment["body"] = cp.render_comment(state)
+        github.threads = [thread("T1", "x.py", "<!-- pr-agent-dedup: aaaaaaaaaaaa -->"),
+                          thread("T2", "y.py", "<!-- pr-agent-dedup: bbbbbbbbbbbb -->", resolved=True)]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "z.py"}]}
+        run_review(github, B, review())
+        self.assertEqual([p["fingerprint"] for p in github.state()["pruned"]], ["aaaaaaaaaaaa"])
 
     def test_security_concern_blocks(self):
         code, output = self.gate(self.reviewed(security="Secrets in logs: the token is printed."))

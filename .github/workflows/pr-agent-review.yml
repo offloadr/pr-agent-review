@@ -108,7 +108,9 @@ jobs:
           OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
 
           # Every event runs PR-Agent's review path; the script decides what it covers.
-          GITHUB_ACTION_CONFIG.PR_ACTIONS: '["opened", "reopened", "ready_for_review", "synchronize"]'
+          # "edited" lets a caller that triggers on retargets get the planned full review; the script
+          # skips PR-Agent entirely when nothing needs reviewing, so other edits cost nothing.
+          GITHUB_ACTION_CONFIG.PR_ACTIONS: '["opened", "reopened", "ready_for_review", "synchronize", "edited"]'
           GITHUB_ACTION_CONFIG.AUTO_REVIEW: "true"
           # Describe would rewrite the pull request description.
           GITHUB_ACTION_CONFIG.AUTO_DESCRIBE: "false"
@@ -183,7 +185,6 @@ jobs:
           # GitHub rejects issue comments over 65,536 characters; stay well under it.
           COMMENT_LIMIT = 60_000
           CONTENT_CHARS = 2_000
-          PRUNED_KEPT = 300
           # PR-Agent 0.49.0's own file filters (language_handler.is_valid_file with default settings), so a
           # delta of files it would skip counts as nothing to review rather than a review with no output.
           BAD_EXTENSIONS = frozenset({
@@ -397,7 +398,6 @@ jobs:
                       if pruned.get("fingerprint"):
                           # Kept so the findings job can still resolve the pruned finding's threads.
                           state.setdefault("pruned", []).append({"path": pruned["path"], "fingerprint": pruned["fingerprint"]})
-                          state["pruned"] = state["pruned"][-PRUNED_KEPT:]
                   elif any(len(f["content"]) > 300 for f in state["findings"]):
                       for f in state["findings"]:
                           f["content"] = f["content"][:300]
@@ -429,6 +429,12 @@ jobs:
               """Decide what this run reviews: {"mode": "none" | "full" | "delta", "files": [...], "reason": ...}."""
               if checkpoint is None:
                   return {"mode": "full", "files": sorted(pr_paths), "reason": "no checkpoint yet"}
+              if (checkpoint.get("security") or {}).get("concern"):
+                  # The concern is not tied to files, so only a review of everything can clear it.
+                  return {"mode": "full", "files": sorted(pr_paths), "reason": "an earlier review reported a security concern"}
+              if checkpoint.get("ignore_glob", []) != list(user_globs):
+                  # A narrower ignore list brings in files no review has seen.
+                  return {"mode": "full", "files": sorted(pr_paths), "reason": "the ignore globs changed"}
               if checkpoint.get("base_ref") != base_ref:
                   # Retargeting changes the pull request's diff without moving its head.
                   return {"mode": "full", "files": sorted(pr_paths),
@@ -583,6 +589,11 @@ jobs:
               return re.match(r"(o[0-9]|gpt-[5-9])", model.removeprefix("openai/")) is not None
 
 
+          def supports_flex(model):
+              """OpenAI offers the Flex tier for its reasoning models (o3 and later, GPT-5 and later)."""
+              return re.match(r"(o[3-9]|gpt-[5-9])", model.removeprefix("openai/")) is not None
+
+
           def openai_body(model, effort, tier, prompt):
               body = {"model": model.removeprefix("openai/"),
                       "messages": [{"role": "system", "content": VERIFIER_SYSTEM}, {"role": "user", "content": prompt}],
@@ -590,7 +601,7 @@ jobs:
                                           "json_schema": {"name": "verdicts", "strict": True, "schema": VERDICT_SCHEMA}}}
               if effort and supports_reasoning_effort(model):
                   body["reasoning_effort"] = effort
-              if tier:
+              if tier and (tier != "flex" or supports_flex(model)):
                   body["service_tier"] = tier
               return body
 
@@ -671,9 +682,10 @@ jobs:
                       env["ANTHROPIC.KEY"] = keys["anthropic"]
                   else:
                       env["OPENAI_KEY"] = keys["openai"]
-                      if os.environ.get("SERVICE_TIER"):
+                      tier = os.environ.get("SERVICE_TIER", "")
+                      if tier and (tier != "flex" or supports_flex(model)):
                           # PR-Agent forwards only allowlisted extra-body keys; service_tier is one.
-                          env["LITELLM.EXTRA_BODY"] = json.dumps({"service_tier": os.environ["SERVICE_TIER"]})
+                          env["LITELLM.EXTRA_BODY"] = json.dumps({"service_tier": tier})
                   env.update({
                       "GITHUB_OUTPUT": output_path,
                       "GITHUB_ACTION_CONFIG.ENABLE_OUTPUT": "true",
@@ -758,13 +770,17 @@ jobs:
               latest_comment, latest = find_checkpoint(github.comments(repo, pr))
               if (latest or {}).get("head_sha") != (checkpoint or {}).get("head_sha"):
                   raise RunFailed("Another run saved a newer checkpoint during this run.")
+              pruned = (checkpoint or {}).get("pruned") or []
+              threads = github.bot_threads(repo, pr) if pruned else []
               runs = list((checkpoint or {}).get("runs") or [])
               runs.append({"head_sha": head_sha, "mode": plan_result["mode"], "files": len(plan_result["files"]),
                            "verified": len(to_verify), "verifier_usage": usage, "at": int(time.time())})
               state = {"version": 1, "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref, "merge_base": merge_base,
+                       "ignore_glob": list(user_globs),
                        "findings": findings, "security": security, "runs": runs[-KEPT_RUNS:],
                        "pruned_fixed": (checkpoint or {}).get("pruned_fixed", 0),
-                       "pruned": list((checkpoint or {}).get("pruned") or [])}
+                       # A pruned finding's identity is needed only while one of its threads is open.
+                       "pruned": [p for p in pruned if any(thread_posts(t, p) and not t["resolved"] for t in threads)]}
               github.save_comment(repo, pr, (latest_comment or {}).get("id"), fit_comment(state))
               open_count = sum(f["state"] == "ACTIVE" for f in findings)
               out(f"Saved the checkpoint for {head_sha[:7]}: {open_count} open finding(s).")

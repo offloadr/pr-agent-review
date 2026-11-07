@@ -58,6 +58,9 @@ jobs:
       ignore-glob: '["package-lock.json", "src/Generated/**"]'
 ```
 
+Adding `edited` to the trigger types reviews a retargeted pull request right away; without it, a
+retarget is reviewed in full on the next push. Other edits run no review.
+
 Do not add an `issue_comment` trigger. PR-Agent does not check who wrote a slash command, so on
 a public repository any commenter could spend your API credits.
 

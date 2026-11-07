@@ -30,7 +30,7 @@ findings are kept with their evidence rather than deleted.
 ## Each run of the review job
 
 1. **Plan.** Read the pull request (head, base, files) and the checkpoint.
-   - No checkpoint, a changed base branch, a merge base that moved back or sideways (base reset
+   - No checkpoint, an open security concern, changed ignore globs, a changed base branch, a merge base that moved back or sideways (base reset
      or rewritten, which can expose files no review has seen), a checkpoint head that is not an
      ancestor of the current head (rebase or force-push), or more changed files than the ignore
      list can hold: **full review**. A merge base that moved forward (base merged in) keeps the
@@ -80,9 +80,8 @@ Re-running only this job re-evaluates dismissals without paying for a review.
   not detected by the gate. Delta reviews are small enough that this is unlikely.
 - A delta review sees no earlier findings, so it may raise a still-present issue again in different
   words. That becomes a second finding; both close when verified fixed.
-- PR-Agent's security verdict is not tied to files, so the latest review's verdict replaces the
-  earlier one, as with PR-Agent's own summary. A delta review of unrelated files that reports no
-  concern clears an earlier one; the run history in the checkpoint keeps the earlier text.
+- PR-Agent's security verdict is not tied to files, so while a concern is open every run is a
+  full review: only a review of the whole pull request that reports no concern clears it.
 - The verifier reads pull-request content, so a crafted change could talk it into a `fixed`
   verdict. That gives a same-repository author nothing new: they can already dismiss a finding by
   resolving its thread.
