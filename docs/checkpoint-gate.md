@@ -1,0 +1,88 @@
+# Checkpoint gate
+
+Large pull requests reviewed on every push cost a full review each time: lumibelle#37 (100
+files, +7K lines) took 15 full reviews at about $0.55 each in one day. The checkpoint gate keeps
+a review on every push and a gate that applies to the current commit, but stops re-reading the
+whole pull request after each fix.
+
+## Invariant
+
+Every push is reviewed, every earlier finding is accounted for, and the gate's verdict applies to
+the current head commit.
+
+## State
+
+The workflow, not PR-Agent, owns the finding state. It lives in one comment that the workflow
+token writes, in a hidden block:
+
+```
+<!-- pr-agent-checkpoint:v1
+{"head_sha": ..., "base_sha": ..., "findings": [...], "security": {...}, "runs": [...]}
+-->
+```
+
+PR-Agent's own persistent finding state is turned off, so there is one source of truth.
+
+Each finding has an id, path, line, header, content, `state` (`ACTIVE` or `FIXED`), the commit
+it was first seen on, and the latest verification: verdict, reason, commit and model. Fixed
+findings are kept with their evidence rather than deleted.
+
+## Each run of the review job
+
+1. **Plan.** Read the pull request (head, base, files) and the checkpoint.
+   - No checkpoint, a checkpoint head that is not an ancestor of the current head (rebase or
+     force-push), or more changed files than the ignore list can hold: **full review**.
+   - Otherwise: **delta review** of the PR files that changed between the checkpoint head and the
+     current head, from GitHub's compare API. Range selection is exact; PR-Agent's own
+     `/review -i` is not used because it picks commits by committer date against the previous
+     review comment's creation time, which skips a commit made during a review and pushed after.
+   - Checkpoint already at the current head: nothing to review; the job succeeds.
+2. **Review.** Run PR-Agent's action entrypoint. A delta review ignores every PR file outside the
+   delta, so PR-Agent reviews the full pull-request diff of the changed files, with their
+   surrounding PR changes as context. Findings are read from PR-Agent's `review` output (the parsed
+   review, written to a private `GITHUB_OUTPUT` file), not from comments, so findings without an
+   inline location are kept too. Inline threads are presentation only.
+3. **Verify.** Every active finding that the review did not raise again, in a file that changed
+   since it was last checked, goes to the verifier model. Findings are batched per file: one call
+   gets the findings, the file at head and its diff since the finding was last checked, and must
+   return `fixed`, `still_present` or `uncertain` per finding, with a reason. Only `fixed` closes a
+   finding. A missing, malformed or `uncertain` verdict keeps it active. A verifier error fails the
+   run.
+4. **Save.** Re-read the pull request and the checkpoint. If the head moved or another run saved a
+   newer checkpoint, fail without saving. Otherwise write the new checkpoint for the reviewed head.
+
+A completed review advances the checkpoint even when findings remain: reviewing a commit is not
+approving it. A failed, cancelled or interrupted run never advances it, so the next run's delta
+covers everything since the last saved checkpoint.
+
+## The findings job (the gate)
+
+Reads the checkpoint and fails unless it is for the current head. An active finding blocks until
+it is verified fixed or every inline thread posting it is resolved (a reviewer dismissing it). A
+security concern from the latest review blocks until a later review reports none. Threads of fixed
+findings are resolved with the workflow token, unless the thread also matches an active finding.
+Re-running only this job re-evaluates dismissals without paying for a review.
+
+## Known limits
+
+- PR-Agent's `review` output has no coverage data, so a full review that PR-Agent had to prune is
+  not detected by the gate. Delta reviews are small enough that this is unlikely.
+- A delta review sees no earlier findings, so it may raise a still-present issue again in different
+  words. That becomes a second finding; both close when verified fixed.
+- PR-Agent's security verdict is not tied to files, so the latest review's verdict replaces the
+  earlier one, as with PR-Agent's own summary. A delta review of unrelated files that reports no
+  concern clears an earlier one; the run history in the checkpoint keeps the earlier text.
+- The verifier reads pull-request content, so a crafted change could talk it into a `fixed`
+  verdict. That gives a same-repository author nothing new: they can already dismiss a finding by
+  resolving its thread.
+
+## Pilot acceptance
+
+- A delta review that raises a new blocking finding still advances the checkpoint, and the gate
+  is red.
+- A finding with no inline location is tracked and verified.
+- A run cancelled after PR-Agent posted output does not advance the checkpoint; the next run's
+  delta still covers its commits.
+- A deliberately unfixed finding is not closed by the verifier.
+- Per-push cost (delta review plus verification) is measured separately and compared with a full
+  review of the same pull request.
