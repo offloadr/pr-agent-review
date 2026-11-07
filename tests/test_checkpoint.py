@@ -153,11 +153,14 @@ class CoverageTests(unittest.TestCase):
 
 
 class WorkflowConcurrencyTests(unittest.TestCase):
-    def test_review_jobs_for_a_pull_request_are_serialized(self):
+    def test_review_and_findings_jobs_for_a_pull_request_are_serialized(self):
         text = WORKFLOW.read_text()
-        self.assertIn("group: pr-agent-checkpoint-${{ github.repository }}-${{ github.event.pull_request.number }}", text)
+        group = "group: pr-agent-checkpoint-${{ github.repository }}-${{ github.event.pull_request.number }}"
         review_job = text[text.index("  review:"):text.index("  findings:")]
-        self.assertIn("cancel-in-progress: false", review_job)
+        findings_job = text[text.index("  findings:"):]
+        for job in (review_job, findings_job):
+            self.assertIn(group, job)
+            self.assertIn("cancel-in-progress: false", job)
 
 
 class StorageTests(unittest.TestCase):
@@ -613,6 +616,42 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(calls[0]["files"], ["big.py", "small.py"])
         self.assertEqual(github.state()["uncovered"], [])
 
+    def test_rename_survives_the_full_review_fallback_for_large_prs(self):
+        others = [f"other{i}.py" for i in range(cp.MAX_IGNORED_FILES + 5)]
+        github = FakeGitHub(A, ["x.py"] + others)
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.files = [f for f in github.files if f["filename"] != "x.py"] + [{"filename": "moved.py", "patch": "@@"}]
+        github.contents["moved.py"] = "the same racy code"
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "moved.py", "previous_filename": "x.py", "status": "renamed"}]}
+        prompts = []
+        _, calls, _ = run_review(github, B, review(), verdicts={race: "still_present"}, prompts=prompts)
+        self.assertEqual(calls[0]["mode"], "full")
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("File: moved.py", prompts[0])
+        self.assertIn("the same racy code", prompts[0])
+
+    def test_unlisted_coverage_gap_is_kept_until_a_full_review_has_none(self):
+        github = FakeGitHub(A, ["small.py", "big.py"])
+        original_comments = github.comments
+
+        def comments_with_footer(repo, pr):
+            footer = {"user": {"login": "github-actions[bot]"}, "updated_at": "9999-01-01T00:00:00Z",
+                      "body": "<!-- pr-agent:review:full -->\n⚠️ **Review coverage:** The following files were not "
+                              "included in this review because of the token budget:\n- `big.py`\n... and 3 more"}
+            return original_comments(repo, pr) + ([footer] if github.heads == [A] else [])
+        github.comments = comments_with_footer
+        run_review(github, A, review())
+        self.assertTrue(github.state()["uncovered_unlisted"])
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "small.py"}]}
+        run_review(github, B, review())
+        state = github.state()
+        self.assertEqual(state["uncovered"], [])
+        self.assertTrue(state["uncovered_unlisted"])
+
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
         run_review(github, A, review(security="SQL injection: the query concatenates input."))
@@ -880,6 +919,30 @@ class GateTests(unittest.TestCase):
         self.assertEqual(state["pruned"][0], {"id": "1", "threads": [{"path": "x.py", "fingerprint": finding["fingerprint"]}]})
         thread_on_old_path = posted("T1", "x.py", "Race", "c" * 500)
         self.assertEqual(cp.fixed_thread_ids(state, [thread_on_old_path]), ["T1"])
+
+    def test_gate_does_not_resolve_threads_when_a_newer_checkpoint_appears(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review(), verdicts={race: "fixed"})
+        github.threads = [posted("T_new", "x.py", "Race", "Two saves interleave.")]
+        newer = github.state()
+        newer["revision"] += 1
+        newer_body = cp.render_comment(newer)
+        original = github.comments
+        calls = {"n": 0}
+
+        def comments(repo, pr):
+            # A newer review saves between this gate's checkpoint read and its thread resolution.
+            calls["n"] += 1
+            if calls["n"] == 2:
+                github.issue_comments[0]["body"] = newer_body
+            return original(repo, pr)
+        github.comments = comments
+        code, output = self.gate(github, head=B)
+        self.assertEqual(github.resolved, [])
+        self.assertIn("leaving thread resolution to its findings job", output)
 
     def test_security_concern_blocks(self):
         code, output = self.gate(self.reviewed(security="Secrets in logs: the token is printed."))
