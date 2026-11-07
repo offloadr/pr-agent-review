@@ -664,6 +664,18 @@ jobs:
           COVERAGE_HEADING = "⚠️ **Review coverage:**"
 
 
+          def decode_code_span(span):
+              """Undo PR-Agent's _markdown_code_span: a backtick fence, one padding space each side when the
+              name starts or ends with a space or backtick, and escaped line breaks."""
+              match = re.fullmatch(r"(`+)(.*)\1", span, re.DOTALL)
+              if not match:
+                  return span
+              inner = match.group(2)
+              if len(inner) >= 2 and inner.startswith(" ") and inner.endswith(" "):
+                  inner = inner[1:-1]
+              return inner.replace("\\n", "\n").replace("\\r", "\r")
+
+
           def coverage_gaps(comments, since):
               """Files PR-Agent's coverage footer, in its summary from this run, says it left out or clipped.
 
@@ -678,7 +690,7 @@ jobs:
                       if line.startswith(COVERAGE_HEADING):
                           listing = True
                       elif listing and line.startswith("- "):
-                          paths.add(line[2:].strip().strip("`").strip())
+                          paths.add(decode_code_span(line[2:]))
                       elif listing and line.startswith("... and ") and line.endswith(" more"):
                           more = True
                       elif listing and line.strip():
@@ -739,12 +751,14 @@ jobs:
 
           def supports_reasoning_effort(model):
               """OpenAI reasoning models (o-series, GPT-5 and later) accept reasoning_effort; others reject it."""
-              return re.match(r"(o[0-9]|gpt-[5-9])", model.removeprefix("openai/")) is not None
+              name = model.removeprefix("openai/")
+              return re.match(r"(o[0-9]|gpt-[5-9])", name) is not None and "-chat" not in name
 
 
           def supports_flex(model):
               """OpenAI offers Flex for o3, o4-mini and the GPT-5 and later families, but not o3-mini or older models."""
-              return re.fullmatch(r"(o3|o4-mini)(-\d{4}-\d{2}-\d{2})?|gpt-[5-9].*", model.removeprefix("openai/")) is not None
+              name = model.removeprefix("openai/")
+              return re.fullmatch(r"(o3|o4-mini)(-\d{4}-\d{2}-\d{2})?|gpt-[5-9].*", name) is not None and "-chat" not in name
 
 
           def openai_body(model, effort, tier, prompt):
@@ -757,6 +771,36 @@ jobs:
               if tier and (tier != "flex" or supports_flex(model)):
                   body["service_tier"] = tier
               return body
+
+
+          def responses_only(model):
+              """OpenAI's -pro reasoning models are served only by the Responses API."""
+              return re.search(r"-pro(-|$)", model.removeprefix("openai/")) is not None
+
+
+          def call_responses(model, effort, tier, prompt, keys):
+              """The verifier call on OpenAI's Responses API, for models Chat Completions does not serve."""
+              body = {"model": model.removeprefix("openai/"), "instructions": VERIFIER_SYSTEM, "input": prompt,
+                      "text": {"format": {"type": "json_schema", "name": "verdicts", "strict": True, "schema": VERDICT_SCHEMA}}}
+              if effort and supports_reasoning_effort(model):
+                  body["reasoning"] = {"effort": effort}
+              if tier and (tier != "flex" or supports_flex(model)):
+                  body["service_tier"] = tier
+              request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(body).encode(),
+                                               method="POST", headers={"Authorization": f"Bearer {keys['openai']}",
+                                                                       "Content-Type": "application/json"})
+              result = json.loads(send(request, timeout=900)[0])
+              text = "".join(part.get("text", "") for item in result.get("output") or [] if item.get("type") == "message"
+                             for part in item.get("content") or [] if part.get("type") == "output_text")
+              return parse_json(text), result.get("usage") or {}
+
+
+          def parse_json(text):
+              """Model output as JSON; anything unparseable is an empty answer, so its verdicts are 'uncertain'."""
+              try:
+                  return json.loads(text or "{}")
+              except ValueError:
+                  return {}
 
 
           def call_model(model, effort, prompt, keys):
@@ -775,6 +819,8 @@ jobs:
                   blocks = [b for b in result.get("content") or [] if b.get("type") == "tool_use"]
                   return (blocks[0]["input"] if blocks else {}), result.get("usage") or {}
               tier = os.environ.get("SERVICE_TIER", "")
+              if responses_only(model):
+                  return call_responses(model, effort, tier, prompt, keys)
               body = openai_body(model, effort, tier, prompt)
               request = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=json.dumps(body).encode(),
                                                method="POST", headers={"Authorization": f"Bearer {keys['openai']}",
@@ -787,6 +833,9 @@ jobs:
                   except urllib.error.HTTPError as error:
                       detail = error.read().decode(errors="replace")
                       error.close()
+                      if error.code in (400, 404) and "v1/responses" in detail:
+                          # Chat Completions does not serve this model; the Responses API does.
+                          return call_responses(model, effort, tier if "service_tier" in body else "", prompt, keys)
                       if error.code == 429 and "service_tier" in body and FLEX_UNAVAILABLE in detail:
                           body.pop("service_tier")  # Flex has no capacity: the standard tier.
                       elif error.code == 400 and body["response_format"]["type"] == "json_schema" and (
@@ -803,7 +852,7 @@ jobs:
               else:
                   raise RunFailed("The verifier request kept failing.")
               content = ((result.get("choices") or [{}])[0].get("message") or {}).get("content") or "{}"
-              return json.loads(content), result.get("usage") or {}
+              return parse_json(content), result.get("usage") or {}
 
 
           def parse_verdicts(answer, ids):
@@ -947,6 +996,7 @@ jobs:
                   raised = findings_from_review(review, head_sha, pr_paths)
                   findings, to_verify, pruned = merge_findings(previous, raised, plan_result, head_sha, pruned, fixed_ids, started_at)
                   gaps, more_gaps = coverage_gaps(github.comments(repo, pr), started_at)
+                  gaps = [repository_path(g, pr_paths) for g in gaps]
                   # The latest review's verdict replaces the earlier one, as with PR-Agent's own summary.
                   security = {"sha": head_sha, "concern": security_concern(review)}
                   reviewed = pr_paths if plan_result["mode"] == "full" else set(plan_result["files"])

@@ -146,6 +146,12 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(cp.coverage_gaps([self.summary(body)], "2026-11-07T11:00:00Z"),
                          (["src/big.cs", "src/other.cs"], True))
 
+    def test_code_spans_decode_exactly(self):
+        self.assertEqual(cp.decode_code_span("`src/a.py`"), "src/a.py")
+        self.assertEqual(cp.decode_code_span("` src/file.py  `"), "src/file.py ")   # name ends with a space
+        self.assertEqual(cp.decode_code_span("``a`b.py``"), "a`b.py")
+        self.assertEqual(cp.decode_code_span("`` `odd`.py ``"), "`odd`.py")
+
     def test_summaries_from_earlier_runs_are_ignored(self):
         body = "⚠️ **Review coverage:** The following files were not included:\n- `old.cs`"
         self.assertEqual(cp.coverage_gaps([self.summary(body, "2026-11-01T00:00:00Z")], "2026-11-07T11:00:00Z"),
@@ -252,6 +258,11 @@ class VerifierRequestTests(unittest.TestCase):
             self.assertEqual(cp.openai_body(model, "", "flex", "p")["service_tier"], "flex", model)
         self.assertEqual(cp.openai_body("gpt-4o", "", "priority", "p")["service_tier"], "priority")
 
+    def test_chat_variants_get_neither_reasoning_effort_nor_flex(self):
+        body = cp.openai_body("gpt-5-chat-latest", "medium", "flex", "p")
+        self.assertNotIn("reasoning_effort", body)
+        self.assertNotIn("service_tier", body)
+
     def test_service_tier_is_sent_when_set(self):
         self.assertEqual(cp.openai_body("gpt-6.1-sol", "", "flex", "p")["service_tier"], "flex")
         self.assertNotIn("service_tier", cp.openai_body("gpt-6.1-sol", "", "", "p"))
@@ -306,6 +317,45 @@ class VerifierFormatTests(unittest.TestCase):
         self.assertEqual(answer["verdicts"][0]["verdict"], "fixed")
         self.assertEqual([b["response_format"]["type"] for b in bodies], ["json_schema", "json_object"])
         self.assertIn("JSON object", bodies[1]["messages"][-1]["content"])
+
+
+class VerifierEndpointTests(unittest.TestCase):
+    def call(self, model, chat_rejects):
+        import io
+        import os
+        import urllib.error
+        urls = []
+
+        def fake_send(request, timeout, attempts=3):
+            urls.append(request.full_url)
+            if request.full_url.endswith("/chat/completions"):
+                if chat_rejects:
+                    raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(
+                        b'{"error": "This model is only supported in v1/responses and not in v1/chat/completions."}'))
+                return json.dumps({"choices": [{"message": {"content": '{"verdicts": []}'}}]}).encode(), {}
+            answer = {"output": [{"type": "reasoning"}, {"type": "message", "content": [
+                {"type": "output_text", "text": '{"verdicts": [{"id": "1", "verdict": "fixed", "reason": "r"}]}'}]}]}
+            return json.dumps(answer).encode(), {}
+        saved, cp.send = cp.send, fake_send
+        os.environ["SERVICE_TIER"] = ""
+        try:
+            answer, _ = cp.call_model(model, "high", "prompt", {"openai": "k"})
+        finally:
+            cp.send = saved
+        return answer, urls
+
+    def test_pro_models_go_to_the_responses_api(self):
+        answer, urls = self.call("o3-pro", chat_rejects=True)
+        self.assertEqual(urls, ["https://api.openai.com/v1/responses"])
+        self.assertEqual(answer["verdicts"][0]["verdict"], "fixed")
+
+    def test_a_model_chat_completions_rejects_falls_back_to_responses(self):
+        answer, urls = self.call("gpt-9-preview", chat_rejects=True)
+        self.assertEqual([u.rsplit("/", 1)[-1] for u in urls], ["completions", "responses"])
+        self.assertEqual(answer["verdicts"][0]["verdict"], "fixed")
+
+    def test_unparseable_model_output_is_an_empty_answer(self):
+        self.assertEqual(cp.parse_json("not json"), {})
 
 
 class VerdictTests(unittest.TestCase):
@@ -633,6 +683,23 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertIn("File: moved.py", prompts[0])
         self.assertIn("the same racy code", prompts[0])
+
+    def test_file_with_a_trailing_space_left_out_is_retried_by_its_exact_name(self):
+        github = FakeGitHub(A, ["small.py", "big.py "])
+        original_comments = github.comments
+
+        def comments_with_footer(repo, pr):
+            footer = {"user": {"login": "github-actions[bot]"}, "updated_at": "9999-01-01T00:00:00Z",
+                      "body": "<!-- pr-agent:review:full -->\n⚠️ **Review coverage:** The following files were not "
+                              "included in this review because of the token budget:\n- ` big.py  `"}
+            return original_comments(repo, pr) + ([footer] if github.heads == [A] else [])
+        github.comments = comments_with_footer
+        run_review(github, A, review())
+        self.assertEqual(github.state()["uncovered"], ["big.py "])
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "small.py"}]}
+        _, calls, _ = run_review(github, B, review())
+        self.assertIn("big.py ", calls[0]["files"])
 
     def test_unlisted_coverage_gap_is_kept_until_a_full_review_has_none(self):
         github = FakeGitHub(A, ["small.py", "big.py"])
