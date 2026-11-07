@@ -481,7 +481,7 @@ jobs:
                       state["pruned_dismissed"] = state.get("pruned_dismissed", 0) + 1
                       # By current path and full text only: an id from the path it was first reported at could
                       # match a new finding in a recreated file there.
-                      state.setdefault("dismissed_ids", []).append(current_key(dismissed))
+                      state.setdefault("dismissed_ids", []).append(dismissed_key(dismissed))
                       # Its threads stay known (about 60 characters each), so unresolving one withdraws the dismissal.
                       state.setdefault("dismissed_threads", []).extend(history_entries(dismissed))
                   elif any(len(f["content"]) > 300 for f in state["findings"]):
@@ -688,6 +688,20 @@ jobs:
               finding["reopened_at"] = at
 
 
+          def dismissed_key(finding):
+              """A pruned dismissal's identity: its current path and full-text hash, kept readable so a rename
+              can move it to the new path."""
+              return f"{finding['path']}\n{finding.get('content_id')}"
+
+
+          def follow_renames(dismissed_ids, renames):
+              moved = set()
+              for key in dismissed_ids:
+                  path, separator, text = key.partition("\n")
+                  moved.add(f"{renames[path]}\n{text}" if separator and path in renames else key)
+              return moved
+
+
           def current_key(finding):
               """A finding's identity at its current path, so a renamed finding is recognized there."""
               return hashlib.sha256(f"{finding['path']}\n{finding.get('content_id')}".encode()).hexdigest()[:12]
@@ -753,7 +767,7 @@ jobs:
                   add_identities(new, identities(record))
               # Its pruned record may be gone too, but its id is remembered.
               for new in raised_by_id.values():
-                  if current_key(new) in dismissed_ids:
+                  if dismissed_key(new) in dismissed_ids or current_key(new) in dismissed_ids:
                       new.update(state="DISMISSED", dismissed_sha=head_sha)  # Dismissed before its record was pruned.
                   elif (new["id"] in fixed_ids or current_key(new) in fixed_ids) and not new.get("reopened_at"):
                       reopen(new, started_at)
@@ -911,24 +925,29 @@ jobs:
               body = {"model": model.removeprefix("openai/"), "instructions": VERIFIER_SYSTEM, "input": prompt,
                       "text": {"format": {"type": "json_schema", "name": "verdicts", "strict": True, "schema": VERDICT_SCHEMA}}}
               if effort and supports_reasoning_effort(model):
-                  body["reasoning"] = {"effort": effort}
+                  # The -pro models accept only high effort.
+                  body["reasoning"] = {"effort": "high" if responses_only(model) else effort}
               if tier and (tier != "flex" or supports_flex(model)):
                   body["service_tier"] = tier
-              request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(body).encode(),
-                                               method="POST", headers={"Authorization": f"Bearer {keys['openai']}",
-                                                                       "Content-Type": "application/json"})
-              try:
-                  result = json.loads(send(request, timeout=900)[0])
-              except urllib.error.HTTPError as error:
-                  detail = error.read().decode(errors="replace")
-                  error.close()
-                  if "service_tier" not in body or not (
-                          (error.code == 429 and FLEX_UNAVAILABLE in detail) or (error.code == 400 and "service_tier" in detail)):
-                      raise
-                  body.pop("service_tier")  # Flex has no capacity or is not offered for this model: standard tier.
-                  request = urllib.request.Request(request.full_url, data=json.dumps(body).encode(), method="POST",
-                                                   headers=dict(request.header_items()))
-                  result = json.loads(send(request, timeout=600)[0])
+              headers = {"Authorization": f"Bearer {keys['openai']}", "Content-Type": "application/json"}
+              for _ in range(3):
+                  request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(body).encode(),
+                                                   method="POST", headers=headers)
+                  try:
+                      result = json.loads(send(request, timeout=900)[0])
+                      break
+                  except urllib.error.HTTPError as error:
+                      detail = error.read().decode(errors="replace")
+                      error.close()
+                      if "service_tier" in body and ((error.code == 429 and FLEX_UNAVAILABLE in detail)
+                                                     or (error.code == 400 and "service_tier" in detail)):
+                          body.pop("service_tier")  # Flex has no capacity or is not offered for this model.
+                      elif "reasoning" in body and error.code == 400 and "reasoning" in detail:
+                          body.pop("reasoning")  # The model rejects this effort; let it use its own default.
+                      else:
+                          raise
+              else:
+                  raise RunFailed("The verifier request kept failing.")
               text = "".join(part.get("text", "") for item in result.get("output") or [] if item.get("type") == "message"
                              for part in item.get("content") or [] if part.get("type") == "output_text")
               return parse_json(text), result.get("usage") or {}
@@ -978,6 +997,8 @@ jobs:
                       if "service_tier" in body and (
                               (error.code == 429 and FLEX_UNAVAILABLE in detail) or (error.code == 400 and "service_tier" in detail)):
                           body.pop("service_tier")  # Flex has no capacity or is not offered for this model: standard tier.
+                      elif error.code == 400 and "reasoning_effort" in body and "reasoning_effort" in detail:
+                          body.pop("reasoning_effort")  # The model rejects this effort; let it use its own default.
                       elif error.code == 400 and body["response_format"]["type"] == "json_schema" and (
                               "response_format" in detail or "json_schema" in detail):
                           # A model without Structured Outputs: JSON mode, with the shape spelled out.
@@ -1107,6 +1128,12 @@ jobs:
                       "PR_REVIEWER.PERSISTENT_COMMENT": "true" if plan_result["mode"] == "full" else "false",
                   })
                   code, log = run_streaming(PR_AGENT, env)
+                  chunks = re.search(r"Number of PR chunk calls: (\d+)", log)
+                  if code != 0 and "LITELLM.EXTRA_BODY" in env and chunks and int(chunks.group(1)) > 1 and \
+                          (FLEX_UNAVAILABLE in log or "service_tier" in log):
+                      # Earlier chunks may already have been billed; a rerun here would pay for them again.
+                      raise RunFailed("Flex ran out of capacity partway through a chunked review. Re-run the job: it "
+                                      "tries Flex again, without paying twice for the chunks that finished.")
                   if code != 0 and "LITELLM.EXTRA_BODY" in env and (FLEX_UNAVAILABLE in log or "service_tier" in log):
                       # Flex failed before any model output, so the retry is not billed twice.
                       print("Flex has no capacity right now; retrying the review on the standard tier.", flush=True)
@@ -1159,7 +1186,7 @@ jobs:
               previous = [dict(f) for f in (checkpoint or {}).get("findings") or []]
               pruned = (checkpoint or {}).get("pruned") or []
               fixed_ids = set((checkpoint or {}).get("fixed_ids") or [])
-              dismissed_ids = set((checkpoint or {}).get("dismissed_ids") or [])
+              dismissed_ids = follow_renames(set((checkpoint or {}).get("dismissed_ids") or []), plan_result.get("renames") or {})
               dismissed_threads = list((checkpoint or {}).get("dismissed_threads") or [])
               # A withdrawn dismissal (its thread unresolved) is open before this run picks what to verify, so a
               # push that fixes it gets it verified.
@@ -1172,6 +1199,7 @@ jobs:
                   if restored is not None:
                       previous.append(restored)
                       dismissed_threads = [e for e in dismissed_threads if e is not entry]
+                      dismissed_ids.discard(dismissed_key(restored))
                       dismissed_ids.discard(current_key(restored))
               security = (checkpoint or {}).get("security") or {}
               uncovered = sorted(set((checkpoint or {}).get("uncovered") or []) & pr_paths)

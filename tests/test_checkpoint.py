@@ -355,6 +355,35 @@ class ResponsesFlexTests(unittest.TestCase):
         self.assertEqual(["service_tier" in b for b in bodies], [True, False])
 
 
+class VerifierEffortTests(unittest.TestCase):
+    def capture(self, model, effort, reject_reasoning=False):
+        import io
+        import urllib.error
+        bodies = []
+
+        def fake_send(request, timeout, attempts=3):
+            body = json.loads(request.data)
+            bodies.append(body)
+            if reject_reasoning and "reasoning" in body:
+                raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(
+                    b"{\"error\": \"Unsupported value: 'reasoning.effort' does not support 'medium' with this model.\"}"))
+            answer = {"output": [{"type": "message", "content": [{"type": "output_text", "text": '{"verdicts": []}'}]}]}
+            return json.dumps(answer).encode(), {}
+        saved, cp.send = cp.send, fake_send
+        try:
+            cp.call_responses(model, effort, "", "prompt", {"openai": "k"})
+        finally:
+            cp.send = saved
+        return bodies
+
+    def test_pro_models_get_high_effort(self):
+        self.assertEqual(self.capture("gpt-5-pro", "medium")[0]["reasoning"], {"effort": "high"})
+
+    def test_rejected_effort_is_dropped_and_retried(self):
+        bodies = self.capture("gpt-6.1-sol", "medium", reject_reasoning=True)
+        self.assertEqual(["reasoning" in b for b in bodies], [True, False])
+
+
 class VerifierFormatTests(unittest.TestCase):
     def test_model_without_structured_outputs_falls_back_to_json_mode(self):
         import io
@@ -1025,7 +1054,8 @@ class ReviewTests(unittest.TestCase):
 class PrAgentProcessTests(unittest.TestCase):
     """Runs run_pr_agent against a stand-in PR-Agent that reports the environment it got."""
 
-    def run_with(self, model, keys, plan_result, pr_paths, exit_code=0, write_review=True, flex_busy=False):
+    def run_with(self, model, keys, plan_result, pr_paths, exit_code=0, write_review=True, flex_busy=False,
+                 chunked=False):
         import os
         import sys
         import tempfile
@@ -1034,6 +1064,8 @@ class PrAgentProcessTests(unittest.TestCase):
             import json, os
             seen = {{k: os.environ.get(k) for k in ("OPENAI_KEY", "ANTHROPIC_KEY", "ANTHROPIC.KEY", "IGNORE.GLOB", "LITELLM.EXTRA_BODY",
                                                      "PR_REVIEWER.PERSISTENT_FINDING_STATE", "PR_REVIEWER.PERSISTENT_COMMENT")}}
+            if {chunked!r}:
+                print("Number of PR chunk calls: 2")
             if {flex_busy!r} and os.environ.get("LITELLM.EXTRA_BODY"):
                 print("RateLimitError: Flex does not have sufficient resources available")
                 raise SystemExit(1)
@@ -1079,6 +1111,12 @@ class PrAgentProcessTests(unittest.TestCase):
         seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
                              {"mode": "full", "files": ["x.py"]}, {"x.py"}, flex_busy=True)["seen"]
         self.assertIsNone(seen["LITELLM.EXTRA_BODY"])
+
+    def test_chunked_review_is_not_rerun_after_flex_runs_out(self):
+        with self.assertRaises(cp.RunFailed) as failure:
+            self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                          {"mode": "full", "files": ["x.py"]}, {"x.py"}, flex_busy=True, chunked=True)
+        self.assertIn("partway through a chunked review", str(failure.exception))
 
     def test_failure_or_missing_output_is_a_failed_run(self):
         with self.assertRaises(cp.RunFailed):
@@ -1438,6 +1476,19 @@ class GateTests(unittest.TestCase):
         body = cp.fit_comment(state)
         self.assertLessEqual(len(body), cp.COMMENT_LIMIT)
         self.assertTrue(state["history_trimmed"])
+
+    def test_pruned_dismissal_follows_a_rename(self):
+        github = self.reviewed()
+        state = github.state()
+        state["dismissed_ids"] = [cp.dismissed_key({"path": "x.py", "content_id": cp.content_id("Race", "Two saves interleave.")})]
+        github.issue_comments[0]["body"] = cp.render_comment(state)
+        github.files = [{"filename": "y.py", "patch": "@@"}]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "y.py", "previous_filename": "x.py", "status": "renamed"}]}
+        run_review(github, B, review(issue("y.py", "Race", "Two saves interleave.")))
+        self.assertEqual(github.state()["findings"][0]["state"], "DISMISSED")
+        self.assertEqual(self.gate(github, head=B)[0], 0)
 
     def test_pruned_renamed_dismissal_does_not_dismiss_a_new_finding_at_the_old_path(self):
         github = self.reviewed()
