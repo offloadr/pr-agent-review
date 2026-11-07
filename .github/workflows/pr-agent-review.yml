@@ -158,6 +158,7 @@ jobs:
             Do not report missing tests as a standalone finding. When you report a concrete defect, describe the focused test that would expose it.
         # Standard library only; tests/test_checkpoint.py loads this script from this file.
         run: &checkpoint_script |
+          import calendar
           import fnmatch
           import hashlib
           import json
@@ -594,6 +595,16 @@ jobs:
               return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+          def moment(text):
+              """An ISO 8601 UTC timestamp as a comparable number (seconds); missing or odd values sort first."""
+              match = re.fullmatch(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(\.\d+)?Z", text or "")
+              if not match:
+                  return float("-inf")
+              year, month, day, hour, minute, second = (int(g) for g in match.groups()[:6])
+              whole = calendar.timegm((year, month, day, hour, minute, second, 0, 0, 0))
+              return whole + float(match.group(7) or 0)
+
+
           def identities(finding):
               """Every (path, fingerprint) a finding's inline threads were posted under."""
               if "threads" in finding:
@@ -609,9 +620,10 @@ jobs:
 
 
           def reopen(finding, at):
-              """Reintroduced after a fix: threads resolved before this run dismissed the old occurrence.
+              """Reintroduced after a fix: threads resolved before then dismissed the old occurrence.
 
-              `at` is when the run started, so a thread PR-Agent posts for the new occurrence counts as new."""
+              `at` is when the checkpoint that recorded the fix was saved, so any thread posted since, even by
+              an earlier attempt of this run that failed, belongs to the new occurrence."""
               finding["reopened_at"] = at
 
 
@@ -723,7 +735,7 @@ jobs:
               Returns (paths, whether the footer listed only some of them)."""
               summaries = [c for c in comments
                            if (c.get("user") or {}).get("login") == COMMENT_AUTHOR and "pr-agent:review" in (c.get("body") or "")
-                           and (c.get("updated_at") or c.get("created_at") or "") >= since]
+                           and moment(c.get("updated_at") or c.get("created_at")) >= moment(since)]
               paths, more = set(), False
               for summary in summaries:
                   listing = False
@@ -1071,6 +1083,8 @@ jobs:
                   return 0
 
               started_at = now_utc()
+              # Threads created after the previous checkpoint was saved belong to whatever this run raises.
+              occurrence_since = (checkpoint or {}).get("saved_at") or started_at
               previous = (checkpoint or {}).get("findings") or []
               pruned = (checkpoint or {}).get("pruned") or []
               fixed_ids = set((checkpoint or {}).get("fixed_ids") or [])
@@ -1081,13 +1095,13 @@ jobs:
                   # Nothing to review, but a change can still fix a finding, for example by reverting its
                   # file out of the pull request.
                   findings, to_verify, pruned, elsewhere = merge_findings(previous, [], plan_result, head_sha, pruned, fixed_ids,
-                                                                          started_at)
+                                                                          occurrence_since)
               else:
                   review = run_review(plan_result, pr_paths, user_globs, model, keys)
                   validate_review(review)
                   raised = findings_from_review(review, head_sha, pr_paths)
                   findings, to_verify, pruned, elsewhere = merge_findings(previous, raised, plan_result, head_sha, pruned,
-                                                                          fixed_ids, started_at)
+                                                                          fixed_ids, occurrence_since)
                   gaps, more_gaps = coverage_gaps(github.comments(repo, pr), started_at, pr_paths)
                   # The latest review's verdict replaces the earlier one, as with PR-Agent's own summary.
                   security = {"sha": head_sha, "concern": security_concern(review)}
@@ -1198,9 +1212,9 @@ jobs:
               GitHub does not say when a thread was resolved, so an old resolution or a later reply proves
               nothing. Either the thread was opened for this occurrence, or a collaborator's latest comment,
               written since the finding came back, starts with the /dismiss command."""
-              if (thread.get("created_at") or "") > reopened_at:
+              if moment(thread.get("created_at")) > moment(reopened_at):
                   return True
-              return ((thread.get("last_comment_at") or "") > reopened_at
+              return (moment(thread.get("last_comment_at")) > moment(reopened_at)
                       and thread.get("last_comment_association") in DISMISSING_ASSOCIATIONS
                       and re.match(r"\s*/dismiss\b", thread.get("last_comment_body") or "", re.IGNORECASE) is not None)
 
@@ -1227,9 +1241,9 @@ jobs:
               fixed = [f for f in state["findings"] if f["state"] == "FIXED"] + list(state.get("pruned") or [])
               # A thread created after this checkpoint was saved belongs to a newer review, which may have
               # reintroduced the finding; resolving it here would dismiss that.
-              saved_at = state.get("saved_at") or ""
+              saved_at = moment(state.get("saved_at"))
               return [t["id"] for t in threads
-                      if not t["resolved"] and (t.get("created_at") or "") <= saved_at
+                      if not t["resolved"] and moment(t.get("created_at")) <= saved_at
                       and any(thread_posts(t, f) for f in fixed) and not any(thread_posts(t, f) for f in active)]
 
 

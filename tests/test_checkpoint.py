@@ -1222,6 +1222,26 @@ class GateTests(unittest.TestCase):
         github.threads = [posted("T_old", "x.py", "Race", "Two saves interleave.", resolved=True), new_thread]
         self.assertEqual(self.gate(github, head=C)[0], 0)
 
+    def test_thread_posted_by_a_failed_attempt_dismisses_the_reintroduction_after_a_retry(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review(), verdicts={race: "fixed"})
+        fixed_saved_at = github.state()["saved_at"]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        # A first attempt at C posts PR-Agent's thread, then fails before saving.
+        with self.assertRaises(cp.RunFailed):
+            run_review(github, C, cp.RunFailed("PR-Agent exited with code 1."))
+        attempt_thread = posted("T_attempt", "x.py", "Race", "Two saves interleave.", resolved=True)
+        attempt_thread["created_at"] = fixed_saved_at[:-1] + ".5Z"  # Just after the fix was saved.
+        # The retry succeeds; PR-Agent deduplicates and posts no new thread.
+        run_review(github, C, review(issue("x.py", "Race", "Two saves interleave.")))
+        self.assertEqual({f["header"]: f for f in github.state()["findings"]}["Race"]["reopened_at"], fixed_saved_at)
+        github.threads = [attempt_thread]
+        self.assertEqual(self.gate(github, head=C)[0], 0)
+
     def test_reintroduction_is_recognized_after_its_pruned_record_is_gone(self):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
         state = github.state()
