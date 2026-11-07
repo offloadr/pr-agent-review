@@ -197,6 +197,8 @@ jobs:
               "go.sum", ".terraform.lock.hcl", "uv.lock", "Cargo.lock", "Pipfile.lock", "mix.lock", "pubspec.lock",
               "bun.lockb"})
           GENERATED_SUFFIXES = (".min.js", ".min.css", ".js.map", ".ts.map", ".css.map")
+          # OpenAI's answer when Flex has no capacity; the request then goes to the standard tier instead.
+          FLEX_UNAVAILABLE = "Flex does not have sufficient resources"
           SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
 
           THREADS_QUERY = """
@@ -647,7 +649,15 @@ jobs:
               request = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=json.dumps(body).encode(),
                                                method="POST", headers={"Authorization": f"Bearer {keys['openai']}",
                                                                        "Content-Type": "application/json"})
-              result = json.loads(send(request, timeout=900 if tier == "flex" else 600)[0])
+              try:
+                  result = json.loads(send(request, timeout=900 if tier == "flex" else 600)[0])
+              except urllib.error.HTTPError as error:
+                  if error.code != 429 or "service_tier" not in body or FLEX_UNAVAILABLE not in error.read().decode(errors="replace"):
+                      raise
+                  body.pop("service_tier")
+                  request = urllib.request.Request(request.full_url, data=json.dumps(body).encode(), method="POST",
+                                                   headers=dict(request.header_items()))
+                  result = json.loads(send(request, timeout=600)[0])
               content = ((result.get("choices") or [{}])[0].get("message") or {}).get("content") or "{}"
               return json.loads(content), result.get("usage") or {}
 
@@ -689,6 +699,19 @@ jobs:
 
           # ---- Review mode -------------------------------------------------------------------------------
 
+          def run_streaming(command, env):
+              """Run a command, echoing its output as it arrives; returns (exit code, the output's tail)."""
+              tail = []
+              with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, errors="replace") as process:
+                  for line in process.stdout:
+                      sys.stdout.write(line)
+                      tail.append(line)
+                      del tail[:-2000]
+              sys.stdout.flush()
+              return process.returncode, "".join(tail)
+
+
           def run_pr_agent(plan_result, pr_paths, user_globs, model, keys):
               """Run PR-Agent's action entrypoint on the planned files; returns its parsed review."""
               ignored = list(user_globs)
@@ -716,7 +739,13 @@ jobs:
                       # A full review keeps one summary comment; each delta review posts its own.
                       "PR_REVIEWER.PERSISTENT_COMMENT": "true" if plan_result["mode"] == "full" else "false",
                   })
-                  code = subprocess.run(PR_AGENT, env=env).returncode
+                  code, log = run_streaming(PR_AGENT, env)
+                  if code != 0 and "LITELLM.EXTRA_BODY" in env and FLEX_UNAVAILABLE in log:
+                      # Flex failed before any model output, so the retry is not billed twice.
+                      print("Flex has no capacity right now; retrying the review on the standard tier.", flush=True)
+                      del env["LITELLM.EXTRA_BODY"]
+                      open(output_path, "w").close()
+                      code, log = run_streaming(PR_AGENT, env)
                   if code != 0:
                       raise RunFailed(f"PR-Agent exited with code {code}.")
                   review = None

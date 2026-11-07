@@ -219,6 +219,31 @@ class VerifierRequestTests(unittest.TestCase):
         self.assertNotIn("service_tier", cp.openai_body("gpt-6.1-sol", "", "", "p"))
 
 
+class VerifierFallbackTests(unittest.TestCase):
+    def test_verifier_retries_on_the_standard_tier_when_flex_is_busy(self):
+        import io
+        import os
+        import urllib.error
+        bodies = []
+
+        def fake_send(request, timeout, attempts=3):
+            body = json.loads(request.data)
+            bodies.append(body)
+            if "service_tier" in body:
+                raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {},
+                                             io.BytesIO(b'{"error": "Flex does not have sufficient resources available"}'))
+            answer = {"choices": [{"message": {"content": json.dumps({"verdicts": []})}}], "usage": {}}
+            return json.dumps(answer).encode(), {}
+        saved, cp.send = cp.send, fake_send
+        os.environ["SERVICE_TIER"] = "flex"
+        try:
+            answer, _ = cp.call_model("gpt-6.1-sol", "medium", "prompt", {"openai": "k"})
+        finally:
+            cp.send = saved
+        self.assertEqual(answer, {"verdicts": []})
+        self.assertEqual(["service_tier" in b for b in bodies], [True, False])
+
+
 class VerdictTests(unittest.TestCase):
     def test_missing_unknown_and_malformed_verdicts_are_uncertain(self):
         verdicts = cp.parse_verdicts({"verdicts": [{"id": "1", "verdict": "fixed", "reason": "r"},
@@ -423,7 +448,7 @@ class ReviewTests(unittest.TestCase):
 class PrAgentProcessTests(unittest.TestCase):
     """Runs run_pr_agent against a stand-in PR-Agent that reports the environment it got."""
 
-    def run_with(self, model, keys, plan_result, pr_paths, exit_code=0, write_review=True):
+    def run_with(self, model, keys, plan_result, pr_paths, exit_code=0, write_review=True, flex_busy=False):
         import os
         import sys
         import tempfile
@@ -432,6 +457,9 @@ class PrAgentProcessTests(unittest.TestCase):
             import json, os
             seen = {{k: os.environ.get(k) for k in ("OPENAI_KEY", "ANTHROPIC_KEY", "ANTHROPIC.KEY", "IGNORE.GLOB", "LITELLM.EXTRA_BODY",
                                                      "PR_REVIEWER.PERSISTENT_FINDING_STATE", "PR_REVIEWER.PERSISTENT_COMMENT")}}
+            if {flex_busy!r} and os.environ.get("LITELLM.EXTRA_BODY"):
+                print("RateLimitError: Flex does not have sufficient resources available")
+                raise SystemExit(1)
             if {write_review!r}:
                 with open(os.environ["GITHUB_OUTPUT"], "a") as out:
                     out.write("other=1\\n")
@@ -469,6 +497,11 @@ class PrAgentProcessTests(unittest.TestCase):
         self.assertEqual((seen["OPENAI_KEY"], seen["ANTHROPIC.KEY"], seen["PR_REVIEWER.PERSISTENT_COMMENT"]),
                          ("o-key", None, "true"))
         self.assertEqual(json.loads(seen["LITELLM.EXTRA_BODY"]), {"service_tier": "flex"})
+
+    def test_flex_without_capacity_retries_on_the_standard_tier(self):
+        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                             {"mode": "full", "files": ["x.py"]}, {"x.py"}, flex_busy=True)["seen"]
+        self.assertIsNone(seen["LITELLM.EXTRA_BODY"])
 
     def test_failure_or_missing_output_is_a_failed_run(self):
         with self.assertRaises(cp.RunFailed):
