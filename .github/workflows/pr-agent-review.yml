@@ -433,6 +433,15 @@ jobs:
               return entries
 
 
+          def untracked_thread(thread, state):
+              """A PR-Agent thread whose finding the checkpoint no longer knows (its history was trimmed)."""
+              if thread_fingerprint(thread) is None:
+                  return False  # Not a PR-Agent finding thread (a Claude review thread, say).
+              known = list(state.get("findings") or []) + list(state.get("pruned") or [])
+              return (not any(thread_posts(thread, f) for f in known)
+                      and history_entry_for(thread, state.get("dismissed_threads") or []) is None)
+
+
           def history_entry_for(thread, entries):
               """The history entry a thread belongs to, or None."""
               fingerprint = thread_fingerprint(thread)
@@ -694,7 +703,7 @@ jobs:
           def follow_renames(dismissed_ids, renames):
               moved = set()
               for key in dismissed_ids:
-                  path, separator, text = key.partition("\n")
+                  path, separator, text = key.rpartition("\n")
                   moved.add(f"{renames[path]}\n{text}" if separator and path in renames else key)
               return moved
 
@@ -808,6 +817,11 @@ jobs:
               if not unescape:
                   return inner
               return inner.replace("\\n", "\n").replace("\\r", "\r")
+
+
+          def has_summary_since(comments, since):
+              return any((c.get("user") or {}).get("login") == COMMENT_AUTHOR and "pr-agent:review" in (c.get("body") or "")
+                         and moment(c.get("updated_at") or c.get("created_at")) >= moment(since) for c in comments)
 
 
           def coverage_gaps(comments, since, pr_paths=None):
@@ -1173,8 +1187,14 @@ jobs:
               plan_result = plan(checkpoint, head_sha, base_ref, merge_base, pr_paths, compare, user_globs)
               out(f"Plan: {plan_result['mode']} ({plan_result['reason']}); {len(plan_result['files'])} file(s).")
               if plan_result["mode"] == "none" and checkpoint["head_sha"] == head_sha:
-                  out("The checkpoint already covers this commit.")
-                  return 0
+                  retry_ids = [f["id"] for f in checkpoint.get("findings") or [] if f["state"] == "ACTIVE"
+                               and (f.get("check") or {}).get("verdict") == "uncertain" and (f.get("check") or {}).get("sha") == head_sha]
+                  if not retry_ids:
+                      out("The checkpoint already covers this commit.")
+                      return 0
+                  # A rerun retries verifications the verifier left uncertain here, without reviewing again.
+                  out(f"Re-checking {len(retry_ids)} finding(s) the verifier left uncertain at this commit.")
+                  plan_result = dict(plan_result, retry_ids=retry_ids)
 
               started_at = now_utc()
               # Threads created after the previous checkpoint was saved belong to whatever this run raises.
@@ -1190,8 +1210,12 @@ jobs:
               # A withdrawn dismissal (its thread unresolved) is open before this run picks what to verify, so a
               # push that fixes it gets it verified.
               record_dismissals(previous, threads, head_sha)
+              trimmed_state = {"findings": previous, "pruned": pruned, "dismissed_threads": dismissed_threads}
               for t in threads:
                   entry = None if t["resolved"] else history_entry_for(t, dismissed_threads)
+                  if entry is None and not t["resolved"] and (checkpoint or {}).get("history_trimmed") and \
+                          untracked_thread(t, trimmed_state):
+                      entry = {}  # Trimmed history: treat an untracked unresolved thread as a withdrawn dismissal.
                   if entry is None or any(thread_posts(t, f) for f in previous):
                       continue
                   restored = finding_from_thread(t, (checkpoint or {}).get("head_sha") or head_sha, entry.get("path"))
@@ -1208,6 +1232,8 @@ jobs:
                   # file out of the pull request.
                   findings, to_verify, pruned, elsewhere = merge_findings(previous, [], plan_result, head_sha, pruned, fixed_ids,
                                                                           occurrence_since, dismissed_ids)
+                  to_verify += [f for f in findings if f["id"] in (plan_result.get("retry_ids") or []) and f["state"] == "ACTIVE"
+                                and f not in to_verify]
               else:
                   try:
                       review = run_review(plan_result, pr_paths, user_globs, model, keys)
@@ -1224,7 +1250,17 @@ jobs:
                   raised = findings_from_review(review, head_sha, pr_paths)
                   findings, to_verify, pruned, elsewhere = merge_findings(previous, raised, plan_result, head_sha, pruned,
                                                                           fixed_ids, occurrence_since, dismissed_ids)
-                  gaps, more_gaps = coverage_gaps(github.comments(repo, pr), started_at, pr_paths)
+                  # GitHub can briefly serve the summary from before PR-Agent updated it, so wait for this run's.
+                  for attempt in range(5):
+                      comments = github.comments(repo, pr)
+                      if has_summary_since(comments, started_at):
+                          gaps, more_gaps = coverage_gaps(comments, started_at, pr_paths)
+                          break
+                      sleep(2)
+                  else:
+                      out("::warning::PR-Agent's summary for this run did not appear; files it left out are unknown, so "
+                          "the next push gets a full review.")
+                      gaps, more_gaps = [], True
                   # The latest review's verdict replaces the earlier one, as with PR-Agent's own summary. A run
                   # that reviewed nothing keeps the earlier verdict.
                   if not review.get("no_text_diff"):
@@ -1431,6 +1467,9 @@ jobs:
                   if not t["resolved"] and history_entry_for(t, history) is not None and \
                           not any(thread_posts(t, f) for f in retained):
                       lines.append(f"- [{t['path']}]({t['url']}) A dismissed finding's thread was unresolved again.")
+                  elif not t["resolved"] and state.get("history_trimmed") and untracked_thread(t, state):
+                      # Its history was trimmed for size, so it may be a withdrawn dismissal: fail closed.
+                      lines.append(f"- [{t['path']}]({t['url']}) An unresolved PR-Agent thread whose finding is no longer tracked.")
               return lines
 
 

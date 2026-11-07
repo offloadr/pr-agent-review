@@ -112,6 +112,10 @@ def run_review(github, head, result, verdicts=None, prompts=None, globs=()):
         calls.append(plan_result)
         if isinstance(result, Exception):
             raise result
+        # PR-Agent posts or updates its summary comment on every review.
+        github.issue_comments.append({"id": len(github.issue_comments) + 1, "user": {"login": "github-actions[bot]"},
+                                      "body": "## PR Reviewer Guide\n<!-- pr-agent:review:full -->",
+                                      "updated_at": cp.now_utc(), "html_url": "https://example/summary"})
         return result
 
     def fake_ask(prompt):
@@ -125,6 +129,10 @@ def run_review(github, head, result, verdicts=None, prompts=None, globs=()):
                           list(globs), run_review=fake_review, ask=fake_ask, out=output.append,
                           sleep=lambda _: None)
     return code, calls, "\n".join(output)
+
+
+def checkpoint_comment(github):
+    return next(c for c in github.issue_comments if c["body"].startswith(cp.CHECKPOINT_MARKER))
 
 
 def finding_ids(state, path, header):
@@ -562,7 +570,7 @@ class ReviewTests(unittest.TestCase):
             # Another run saves its checkpoint between this run's first and second read.
             calls["n"] += 1
             if calls["n"] == 2:
-                github.issue_comments[0]["body"] = newer
+                checkpoint_comment(github)["body"] = newer
             return original(repo, pr)
         github.comments = comments
         with self.assertRaises(cp.RunFailed):
@@ -700,7 +708,7 @@ class ReviewTests(unittest.TestCase):
             # The faster retarget run saves revision 2 while this one is still reviewing.
             calls["n"] += 1
             if calls["n"] == 2:
-                github.issue_comments[0]["body"] = newer
+                checkpoint_comment(github)["body"] = newer
             return original(repo, pr)
         github.comments = comments
         with self.assertRaises(cp.RunFailed):
@@ -1093,6 +1101,37 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(served_stale["done"])
 
+    def test_rerun_at_the_same_head_retries_uncertain_verifications(self):
+        github = self.first_run()
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+        run_review(github, B, review())  # The verifier gives no verdict: uncertain at B.
+        self.assertEqual({f["header"]: f for f in github.state()["findings"]}["Race"]["check"]["verdict"], "uncertain")
+        code, calls, _ = run_review(github, B, review(), verdicts={race: "fixed"})  # Re-run the workflow.
+        self.assertEqual((code, calls), (0, []))  # No new PR-Agent review.
+        self.assertEqual({f["header"]: f for f in github.state()["findings"]}["Race"]["state"], "FIXED")
+
+    def test_coverage_read_waits_for_this_runs_summary(self):
+        github = FakeGitHub(A, ["small.py", "big.py"])
+        original = github.comments
+        reads = {"n": 0}
+
+        def comments(repo, pr):
+            listed = original(repo, pr)
+            summaries = [c for c in listed if "pr-agent:review" in c["body"]]
+            if not summaries:
+                return listed
+            reads["n"] += 1
+            if reads["n"] == 1:  # Stale: the summary from before this run.
+                return [c for c in listed if c not in summaries] + [dict(summaries[-1], updated_at="2000-01-01T00:00:00Z")]
+            footer = dict(summaries[-1], body=summaries[-1]["body"] + "\n⚠️ **Review coverage:** The following files "
+                          "were not included in this review because of the token budget:\n- `big.py`")
+            return [c for c in listed if c not in summaries] + [footer]
+        github.comments = comments
+        run_review(github, A, review())
+        self.assertEqual(github.state()["uncovered"], ["big.py"])
+
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
         run_review(github, A, review(security="SQL injection: the query concatenates input."))
@@ -1226,7 +1265,7 @@ class GateTests(unittest.TestCase):
 
     def test_finding_without_a_fingerprint_counts_as_summary_only(self):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
-        comment = github.issue_comments[0]
+        comment = checkpoint_comment(github)
         state = github.state()
         state["findings"][0]["threads"] = []
         comment["body"] = cp.render_comment(state)
@@ -1259,7 +1298,7 @@ class GateTests(unittest.TestCase):
 
     def test_pruned_identity_is_dropped_once_its_threads_are_resolved(self):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
-        comment = github.issue_comments[0]
+        comment = checkpoint_comment(github)
         state = github.state()
         state["pruned"] = [{"path": "x.py", "fingerprint": "aaaaaaaaaaaa"}, {"path": "y.py", "fingerprint": "bbbbbbbbbbbb"}]
         comment["body"] = cp.render_comment(state)
@@ -1321,7 +1360,7 @@ class GateTests(unittest.TestCase):
         state = github.state()
         record = state["findings"].pop()
         state["pruned"] = [{"id": record["id"], "threads": record["threads"]}]
-        github.issue_comments[0]["body"] = cp.render_comment(state)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
         github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
@@ -1378,7 +1417,7 @@ class GateTests(unittest.TestCase):
         record = state["findings"].pop()
         # Fixed, pruned, its threads resolved, and the pruned record dropped by a later checkpoint.
         state["fixed_ids"], state["pruned"] = [record["id"]], []
-        github.issue_comments[0]["body"] = cp.render_comment(state)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
         github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
@@ -1426,7 +1465,7 @@ class GateTests(unittest.TestCase):
             # A newer review saves between this gate's checkpoint read and its thread resolution.
             calls["n"] += 1
             if calls["n"] == 2:
-                github.issue_comments[0]["body"] = newer_body
+                checkpoint_comment(github)["body"] = newer_body
             return original(repo, pr)
         github.comments = comments
         code, output = self.gate(github, head=B)
@@ -1439,7 +1478,7 @@ class GateTests(unittest.TestCase):
         record = dict(state["findings"].pop(), path="moved.py")  # Followed a rename, then fixed and pruned.
         state["fixed_ids"], state["pruned"] = [record["id"], cp.current_key(record)], []
         github.files = [{"filename": "moved.py"}, {"filename": "y.py"}]
-        github.issue_comments[0]["body"] = cp.render_comment(state)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
         github.threads = [posted("T1", "moved.py", "Race", "Two saves interleave.", resolved=True)]
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "moved.py"}]}
@@ -1500,7 +1539,7 @@ class GateTests(unittest.TestCase):
         github = self.reviewed()
         state = github.state()
         state["dismissed_threads"] = cp.history_entries(record)
-        github.issue_comments[0]["body"] = cp.render_comment(state)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
         github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
         # A push renames x.py to y.py and is saved.
         github.files = [{"filename": "y.py", "patch": "@@"}]
@@ -1527,7 +1566,7 @@ class GateTests(unittest.TestCase):
         github = self.reviewed()
         state = github.state()
         state["dismissed_threads"] = cp.history_entries(dismissed)
-        github.issue_comments[0]["body"] = cp.render_comment(state)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
         github.files = [{"filename": "moved.py", "patch": "@@"}]
         github.contents["moved.py"] = "the moved code"
         github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.")]  # Unresolved: withdrawn.
@@ -1551,11 +1590,24 @@ class GateTests(unittest.TestCase):
         self.assertLessEqual(len(body), cp.COMMENT_LIMIT)
         self.assertTrue(state["history_trimmed"])
 
+    def test_pruned_dismissal_of_a_file_with_a_newline_follows_a_rename(self):
+        old, new = "src/a\nb.py", "src/c\nd.py"
+        github = FakeGitHub(A, [old])
+        run_review(github, A, review())
+        state = github.state()
+        state["dismissed_ids"] = [cp.dismissed_key({"path": old, "content_id": cp.content_id("Race", "Two saves interleave.")})]
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.files = [{"filename": new, "patch": "@@"}]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": new, "previous_filename": old, "status": "renamed"}]}
+        run_review(github, B, review(issue(new, "Race", "Two saves interleave.")))
+        self.assertEqual(github.state()["findings"][0]["state"], "DISMISSED")
+
     def test_pruned_dismissal_follows_a_rename(self):
         github = self.reviewed()
         state = github.state()
         state["dismissed_ids"] = [cp.dismissed_key({"path": "x.py", "content_id": cp.content_id("Race", "Two saves interleave.")})]
-        github.issue_comments[0]["body"] = cp.render_comment(state)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
         github.files = [{"filename": "y.py", "patch": "@@"}]
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [
@@ -1569,7 +1621,7 @@ class GateTests(unittest.TestCase):
         state = github.state()
         moved = {"path": "moved.py", "content_id": cp.content_id("Race", "Two saves interleave.")}
         state["dismissed_ids"] = [cp.current_key(moved)]
-        github.issue_comments[0]["body"] = cp.render_comment(state)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
         run_review(github, B, review({"relevant_file": "x.py", "issue_header": "Race",
@@ -1609,7 +1661,7 @@ class GateTests(unittest.TestCase):
         state = github.state()
         identity = {"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", "Two saves interleave.")}
         state["dismissed_threads"] = [identity]
-        github.issue_comments[0]["body"] = cp.render_comment(state)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
         github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.")]  # Unresolved again.
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
@@ -1631,7 +1683,7 @@ class GateTests(unittest.TestCase):
                   "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", "Two saves interleave.")}]}
         state["dismissed_threads"] = cp.history_entries(record)
         state["dismissed_ids"] = [cp.current_key(record)]
-        github.issue_comments[0]["body"] = cp.render_comment(state)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
         github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
@@ -1645,6 +1697,25 @@ class GateTests(unittest.TestCase):
         self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
         code, _ = self.gate(github, head=C)
         self.assertEqual((code, github.resolved), (0, ["T1"]))
+
+    def test_trimmed_history_fails_closed_on_an_untracked_unresolved_thread(self):
+        github = self.reviewed()
+        state = github.state()
+        state["history_trimmed"] = True  # Its dismissal history was evicted for size.
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.")]
+        code, output = self.gate(github)
+        self.assertEqual(code, 1)
+        self.assertIn("no longer tracked", output)
+        # A Claude review thread (no PR-Agent footer) is not affected.
+        github.threads = [thread("T2", "x.py", "**Claude**\n\nSomething.")]
+        self.assertEqual(self.gate(github)[0], 0)
+        # The review job rebuilds the finding, so it can be verified.
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.")]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+        run_review(github, B, review())
+        self.assertEqual([f["header"] for f in github.state()["findings"]], ["Race"])
 
     def test_unresolving_a_pruned_dismissed_findings_thread_fails_the_gate(self):
         finding = {"id": "1", "path": "x.py", "header": "Race", "content": "c" * 500, "line": 1, "state": "DISMISSED",
