@@ -18,7 +18,9 @@ Every push is reviewed, but only the first review reads the whole pull request:
   also resolves the threads of findings the verifier marked fixed, which PR-Agent does not do on
   GitHub.
 
-To dismiss a finding you disagree with, resolve its thread and re-run the failed **findings** job.
+To dismiss a finding you disagree with, resolve its thread and re-run the failed **findings** job. A
+finding that comes back after it was fixed needs a reply on its thread before you resolve it, so
+the resolution of the earlier occurrence does not dismiss the new one.
 That costs no API credits; only a new push triggers another review. The design and its limits are
 in [docs/checkpoint-gate.md](docs/checkpoint-gate.md).
 

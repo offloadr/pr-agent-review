@@ -207,7 +207,11 @@ jobs:
               pullRequest(number: $pr) {
                 reviewThreads(first: 100, after: $after) {
                   pageInfo { hasNextPage endCursor }
-                  nodes { id isResolved path comments(first: 1) { nodes { author { login } url body } } }
+                  nodes {
+                    id isResolved path
+                    comments(first: 1) { nodes { author { login } url body } }
+                    latest: comments(last: 1) { nodes { createdAt } }
+                  }
                 }
               }
             }
@@ -319,8 +323,10 @@ jobs:
                           first = comments[0]
                           if not ((first.get("author") or {}).get("login") or "").startswith(THREAD_AUTHOR_PREFIX):
                               continue
+                          latest = (node.get("latest") or {}).get("nodes") or [{}]
                           threads.append({"id": node["id"], "resolved": node["isResolved"], "path": node["path"],
-                                          "url": first["url"], "body": first["body"] or ""})
+                                          "url": first["url"], "body": first["body"] or "",
+                                          "last_comment_at": latest[0].get("createdAt") or ""})
                       if not page["pageInfo"]["hasNextPage"]:
                           return threads
                       after = page["pageInfo"]["endCursor"]
@@ -401,10 +407,10 @@ jobs:
                   if fixed:
                       pruned = state["findings"].pop(fixed[0])
                       state["pruned_fixed"] = state.get("pruned_fixed", 0) + 1
-                      if pruned.get("fingerprint"):
-                          # Kept so the findings job can still resolve the pruned finding's threads.
-                          state.setdefault("pruned", []).append({"path": pruned.get("thread_path") or pruned["path"],
-                                                                 "fingerprint": pruned["fingerprint"]})
+                      if identities(pruned):
+                          # Kept so the findings job can still resolve the pruned finding's threads, and so a
+                          # later review raising it again is recognized as a reintroduction.
+                          state.setdefault("pruned", []).append({"id": pruned["id"], "threads": identities(pruned)})
                   elif any(len(f["content"]) > 300 for f in state["findings"]):
                       for f in state["findings"]:
                           f["content"] = f["content"][:300]
@@ -527,7 +533,7 @@ jobs:
                   line = issue.get("start_line")
                   found.append({"id": finding_id(path, header, content), "path": path, "header": header,
                                 # Computed from the full text, so truncating the stored content cannot merge findings.
-                                "fingerprint": inline_fingerprint(path, header, content),
+                                "threads": [{"path": path, "fingerprint": inline_fingerprint(path, header, content)}],
                                 "content": content[:CONTENT_CHARS], "line": line if isinstance(line, int) and line > 0 else None,
                                 "state": "ACTIVE", "first_seen": head_sha, "checked_sha": head_sha, "check": None})
               return found
@@ -538,32 +544,76 @@ jobs:
               return None if not text or text.lower().rstrip(".") == "no" else text
 
 
-          def merge_findings(previous, raised, plan_result, head_sha):
-              """Combine earlier findings with this run's; return (findings, the earlier ones to verify)."""
+          def now_utc():
+              return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+          def identities(finding):
+              """Every (path, fingerprint) a finding's inline threads were posted under."""
+              if "threads" in finding:
+                  return finding["threads"]
+              # Checkpoints and pruned records written before findings kept a list.
+              path = finding.get("thread_path") or finding.get("path")
+              return [{"path": path, "fingerprint": finding["fingerprint"]}] if finding.get("fingerprint") else []
+
+
+          def add_identities(finding, extra):
+              known = identities(finding)
+              finding["threads"] = known + [i for i in extra if i not in known]
+
+
+          def reopen(finding):
+              """Reintroduced after a fix: threads resolved before now dismissed the old occurrence, not this one."""
+              finding["reopened_at"] = now_utc()
+
+
+          def finding_key(finding):
+              return (finding["path"], finding["header"], finding["content"])
+
+
+          def merge_findings(previous, raised, plan_result, head_sha, pruned=()):
+              """Combine earlier findings with this run's.
+
+              Returns (findings, the earlier ones to verify, the pruned records still kept)."""
               raised_by_id = {f["id"]: f for f in raised}
+              raised_by_key = {finding_key(f): f for f in raised}
               changed = set(plan_result.get("changed") or plan_result["files"])
-              merged, to_verify = [], []
               renames = plan_result.get("renames") or {}
+              merged, to_verify = [], []
               for old in previous:
                   f = dict(old)
+                  f["threads"] = list(identities(f))
+                  f.pop("fingerprint", None)
+                  f.pop("thread_path", None)
                   if f["path"] in renames:
                       # The finding follows its file; its threads stay on the path they were posted on.
-                      f.setdefault("thread_path", f["path"])
+                      f.setdefault("renamed_from", f["path"])
                       f["path"] = renames[f["path"]]
-                  new = raised_by_id.pop(f["id"], None)
+                  # Raised again word for word: by id, or at a renamed file's new path by its text.
+                  new = raised_by_id.get(f["id"]) or raised_by_key.get(finding_key(f))
                   if new is not None:
-                      # Raised again word for word: still present, or reintroduced if it had been fixed.
+                      raised_by_id.pop(new["id"], None)
+                      raised_by_key.pop(finding_key(new), None)
                       if f["state"] == "FIXED":
-                          # Reintroduced: its old threads were resolved for the earlier fix, not to dismiss this.
-                          f["reopened"] = True
-                      f.update(state="ACTIVE", line=new["line"], fingerprint=new["fingerprint"], checked_sha=head_sha,
+                          reopen(f)
+                      add_identities(f, new["threads"])
+                      f.update(state="ACTIVE", line=new["line"], checked_sha=head_sha,
                                check={"verdict": "still_present", "reason": "raised again by the review", "sha": head_sha})
                   elif f["state"] == "ACTIVE" and (plan_result["mode"] == "full" or f["path"] in changed
-                                                   or f.get("thread_path") in changed):
+                                                   or f.get("renamed_from") in changed):
                       to_verify.append(f)
                   merged.append(f)
+              # A finding raised again after its fixed record was pruned is a reintroduction too.
+              kept = []
+              for record in pruned:
+                  new = raised_by_id.get(record.get("id"))
+                  if new is None:
+                      kept.append(record)
+                      continue
+                  reopen(new)
+                  add_identities(new, identities(record))
               merged.extend(raised_by_id.values())
-              return merged, to_verify
+              return merged, to_verify, kept
 
 
           # ---- Verifier ----------------------------------------------------------------------------------
@@ -601,7 +651,7 @@ jobs:
               items = "\n\n".join(
                   f"id: {f['id']}\nreported at line: {f.get('line') or 'unknown'} (commit {f['checked_sha'][:7]})\n"
                   f"title: {f['header']}\ndescription: {f['content']}" for f in findings)
-              renamed = sorted({f["thread_path"] for f in findings if f.get("thread_path") and f["thread_path"] != path})
+              renamed = sorted({f["renamed_from"] for f in findings if f.get("renamed_from") and f["renamed_from"] != path})
               note = f" (renamed from {', '.join(renamed)}; the findings were reported against the old name)" if renamed else ""
               return (f"File: {path}{note}\n\nFindings:\n\n{items}\n\n"
                       f"Diff of this file since the findings were last checked:\n```diff\n{(diff or '(no diff available)')[:DIFF_CONTEXT_CHARS]}\n```\n\n"
@@ -810,16 +860,17 @@ jobs:
                   return 0
 
               previous = (checkpoint or {}).get("findings") or []
+              pruned = (checkpoint or {}).get("pruned") or []
               security = (checkpoint or {}).get("security") or {}
               if plan_result["mode"] == "none":
                   # Nothing to review, but a change can still fix a finding, for example by reverting its
                   # file out of the pull request.
-                  findings, to_verify = merge_findings(previous, [], plan_result, head_sha)
+                  findings, to_verify, pruned = merge_findings(previous, [], plan_result, head_sha, pruned)
               else:
                   review = run_review(plan_result, pr_paths, user_globs, model, keys)
                   validate_review(review)
                   raised = findings_from_review(review, head_sha)
-                  findings, to_verify = merge_findings(previous, raised, plan_result, head_sha)
+                  findings, to_verify, pruned = merge_findings(previous, raised, plan_result, head_sha, pruned)
                   # The latest review's verdict replaces the earlier one, as with PR-Agent's own summary.
                   security = {"sha": head_sha, "concern": security_concern(review)}
                   out(f"The review raised {len(raised)} finding(s); {len(to_verify)} earlier finding(s) to re-check.")
@@ -845,7 +896,6 @@ jobs:
               latest_comment, latest = find_checkpoint(github.comments(repo, pr))
               if (latest or {}).get("head_sha") != (checkpoint or {}).get("head_sha"):
                   raise RunFailed("Another run saved a newer checkpoint during this run.")
-              pruned = (checkpoint or {}).get("pruned") or []
               threads = github.bot_threads(repo, pr) if pruned else []
               runs = list((checkpoint or {}).get("runs") or [])
               runs.append({"head_sha": head_sha, "mode": plan_result["mode"], "files": len(plan_result["files"]),
@@ -866,9 +916,8 @@ jobs:
 
           def thread_posts(thread, finding):
               """A thread posts a finding when it carries that finding's PR-Agent dedup fingerprint."""
-              fingerprint = finding.get("fingerprint")
-              return (bool(fingerprint) and thread["path"] == (finding.get("thread_path") or finding["path"])
-                      and f"<!-- pr-agent-dedup: {fingerprint} -->" in thread["body"])
+              return any(thread["path"] == i["path"] and f"<!-- pr-agent-dedup: {i['fingerprint']} -->" in thread["body"]
+                         for i in identities(finding))
 
 
           def open_findings(state, threads, summary_url):
@@ -878,7 +927,9 @@ jobs:
                       continue
                   matching = [t for t in threads if thread_posts(t, f)]
                   unresolved = [t for t in matching if not t["resolved"]]
-                  if matching and not unresolved and not f.get("reopened"):
+                  # A reintroduced finding is dismissed only by a thread someone replied to since it came back.
+                  current = not f.get("reopened_at") or any(t.get("last_comment_at", "") > f["reopened_at"] for t in matching)
+                  if matching and not unresolved and current:
                       continue  # Dismissed: every thread posting it was resolved.
                   location = f["path"] + (f":{f['line']}" if f.get("line") else "")
                   url = unresolved[0]["url"] if unresolved else summary_url

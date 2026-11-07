@@ -66,7 +66,10 @@ covers everything since the last saved checkpoint.
 ## The findings job (the gate)
 
 Reads the checkpoint and fails unless it is for the current head. An active finding blocks until
-it is verified fixed or every inline thread posting it is resolved (a reviewer dismissing it).
+it is verified fixed or every inline thread posting it is resolved (a reviewer dismissing it). A
+finding raised again after it was fixed, even after its record was pruned, is dismissed only by a
+resolved thread with a comment newer than its return. A finding keeps every thread identity it was
+posted under, so a rename adds the new location instead of replacing the old one.
 Threads are tied to findings by PR-Agent's `pr-agent-dedup` fingerprint, computed from the full
 finding text when it is first read, so truncating stored text cannot make two findings share
 threads. A

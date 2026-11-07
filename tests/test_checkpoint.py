@@ -37,14 +37,15 @@ def review(*issues, security="No"):
     return {"key_issues_to_review": list(issues), "security_concerns": security}
 
 
-def thread(tid, path, body, resolved=False):
-    return {"id": tid, "path": path, "body": body, "resolved": resolved, "url": f"https://example/{tid}"}
+def thread(tid, path, body, resolved=False, last_comment_at="2000-01-01T00:00:00Z"):
+    return {"id": tid, "path": path, "body": body, "resolved": resolved, "url": f"https://example/{tid}",
+            "last_comment_at": last_comment_at}
 
 
-def posted(tid, path, header, content, resolved=False):
+def posted(tid, path, header, content, resolved=False, last_comment_at="2000-01-01T00:00:00Z"):
     """An inline thread as PR-Agent posts it, with its dedup marker."""
     marker = f"<!-- pr-agent-dedup: {cp.inline_fingerprint(path, header, content)} -->"
-    return thread(tid, path, f"{cp.inline_body(header, content)}\n\n{marker}", resolved)
+    return thread(tid, path, f"{cp.inline_body(header, content)}\n\n{marker}", resolved, last_comment_at)
 
 
 class FakeGitHub:
@@ -469,9 +470,23 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("File: moved.py (renamed from x.py", prompts[0])
         self.assertIn("the same racy code", prompts[0])
         moved = {f["header"]: f for f in github.state()["findings"]}["Race"]
-        self.assertEqual((moved["path"], moved["thread_path"], moved["state"]), ("moved.py", "x.py", "ACTIVE"))
+        self.assertEqual((moved["path"], moved["renamed_from"], moved["state"]), ("moved.py", "x.py", "ACTIVE"))
+        self.assertEqual([i["path"] for i in moved["threads"]], ["x.py"])
         github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.")]
         self.assertTrue(cp.thread_posts(github.threads[0], moved))
+
+    def test_issue_re_reported_at_a_renamed_path_stays_one_finding(self):
+        github = self.first_run()
+        github.heads = [B]
+        github.files = [f for f in github.files if f["filename"] != "x.py"] + [{"filename": "moved.py", "patch": "@@"}]
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "moved.py", "previous_filename": "x.py", "status": "renamed"}]}
+        prompts = []
+        run_review(github, B, review(issue("moved.py", "Race", "Two saves interleave.")), prompts=prompts)
+        races = [f for f in github.state()["findings"] if f["header"] == "Race"]
+        self.assertEqual(len(races), 1)
+        self.assertEqual(prompts, [])
+        self.assertEqual(sorted(i["path"] for i in races[0]["threads"]), ["moved.py", "x.py"])
 
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
@@ -599,7 +614,7 @@ class GateTests(unittest.TestCase):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
         comment = github.issue_comments[0]
         state = github.state()
-        del state["findings"][0]["fingerprint"]
+        state["findings"][0]["threads"] = []
         comment["body"] = cp.render_comment(state)
         github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
         self.assertEqual(self.gate(github)[0], 1)
@@ -655,6 +670,38 @@ class GateTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("Race: Two saves interleave.", output)
 
+    def test_reintroduced_finding_is_dismissed_by_a_reply_and_resolution(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        race = finding_ids(github.state(), "x.py", "Race")[0]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review(), verdicts={race: "fixed"})
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, C, review(issue("x.py", "Race", "Two saves interleave.")))
+        # Someone replies on the old thread after the finding came back, then resolves it.
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True,
+                                 last_comment_at="2999-01-01T00:00:00Z")]
+        self.assertEqual(self.gate(github, head=C)[0], 0)
+
+    def test_finding_raised_again_after_its_record_was_pruned_counts_as_reintroduced(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        state = github.state()
+        record = state["findings"].pop()
+        state["pruned"] = [{"id": record["id"], "threads": record["threads"]}]
+        github.issue_comments[0]["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        # Raised again with no line, so PR-Agent posts no new thread.
+        run_review(github, B, review({"relevant_file": "x.py", "issue_header": "Race",
+                                      "issue_content": "Two saves interleave."}))
+        new = {f["header"]: f for f in github.state()["findings"]}["Race"]
+        self.assertTrue(new.get("reopened_at"))
+        self.assertEqual(github.state()["pruned"], [])
+        code, _ = self.gate(github, head=B)
+        self.assertEqual(code, 1)
+
     def test_pruned_renamed_finding_still_resolves_its_original_thread(self):
         finding = {"id": "1", "path": "moved.py", "thread_path": "x.py", "header": "Race", "content": "c" * 500,
                    "line": 1, "state": "FIXED", "fingerprint": cp.inline_fingerprint("x.py", "Race", "c" * 500),
@@ -666,7 +713,7 @@ class GateTests(unittest.TestCase):
         finally:
             cp.COMMENT_LIMIT = saved
         self.assertEqual(state["findings"], [])
-        self.assertEqual(state["pruned"][0]["path"], "x.py")
+        self.assertEqual(state["pruned"][0], {"id": "1", "threads": [{"path": "x.py", "fingerprint": finding["fingerprint"]}]})
         thread_on_old_path = posted("T1", "x.py", "Race", "c" * 500)
         self.assertEqual(cp.fixed_thread_ids(state, [thread_on_old_path]), ["T1"])
 
