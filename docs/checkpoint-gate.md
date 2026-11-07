@@ -87,7 +87,8 @@ Re-running only this job re-evaluates dismissals without paying for a review.
 - PR-Agent's `review` output has no coverage data, so the files a review left out or clipped for its
   token budget are read from the coverage footer of its summary comment and reviewed again on later
   runs until one covers them. The footer lists at most 50 files; beyond that the checkpoint records
-  only that more were left out, and the findings job warns about it without failing.
+  that more were left out, and the next push gets a full review to name them. Only pull requests
+  larger than PR-Agent's call budget get there, and for those every push is a full review again.
 - A delta review sees no earlier findings, so it may raise a still-present issue again in different
   words. That becomes a second finding; both close when verified fixed.
 - PR-Agent's security verdict is not tied to files, so while a concern is open every run is a

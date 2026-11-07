@@ -231,6 +231,13 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(cp.plan(checkpoint, B, "main", "N", {"x.py"}, compare, [])["mode"], "full")
         self.assertEqual(cp.plan(checkpoint, B, "main", "F", {"x.py"}, compare, [])["mode"], "delta")
 
+    def test_ignore_list_too_long_for_the_environment_gets_a_full_review(self):
+        long_paths = {f"{'deep/' * 140}file{i}.py" for i in range(150)}  # ~700 characters each, under the count cap
+        paths = long_paths | {"x.py"}
+        result = cp.plan({"head_sha": A, "base_ref": "main", "merge_base": "M"}, B, "main", "M", paths,
+                         self.compare("ahead", ["x.py"]), [])
+        self.assertEqual(result["mode"], "full")
+
     def test_too_many_files_to_leave_out_gets_a_full_review(self):
         paths = {f"f{i}.py" for i in range(cp.MAX_IGNORED_FILES + 2)}
         self.assertEqual(cp.plan({"head_sha": A, "base_ref": "main", "merge_base": "M"}, B, "main", "M", paths, self.compare("ahead", ["f0.py"]), [])["mode"], "full")
@@ -287,6 +294,29 @@ class VerifierFallbackTests(unittest.TestCase):
         os.environ["SERVICE_TIER"] = "flex"
         try:
             answer, _ = cp.call_model("gpt-6.1-sol", "medium", "prompt", {"openai": "k"})
+        finally:
+            cp.send = saved
+        self.assertEqual(answer, {"verdicts": []})
+        self.assertEqual(["service_tier" in b for b in bodies], [True, False])
+
+
+class ResponsesFlexTests(unittest.TestCase):
+    def test_responses_api_retries_on_the_standard_tier_when_flex_is_busy(self):
+        import io
+        import urllib.error
+        bodies = []
+
+        def fake_send(request, timeout, attempts=3):
+            body = json.loads(request.data)
+            bodies.append(body)
+            if "service_tier" in body:
+                raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {},
+                                             io.BytesIO(b'{"error": "Flex does not have sufficient resources available"}'))
+            answer = {"output": [{"type": "message", "content": [{"type": "output_text", "text": '{"verdicts": []}'}]}]}
+            return json.dumps(answer).encode(), {}
+        saved, cp.send = cp.send, fake_send
+        try:
+            answer, _ = cp.call_responses("gpt-6.1-sol-pro", "high", "flex", "prompt", {"openai": "k"})
         finally:
             cp.send = saved
         self.assertEqual(answer, {"verdicts": []})
@@ -512,6 +542,20 @@ class ReviewTests(unittest.TestCase):
         self.assertGreater(state["pruned_fixed"], 0)
         self.assertEqual(sum(f["state"] == "ACTIVE" for f in state["findings"]), 10)
 
+    def test_full_review_for_a_security_concern_still_follows_renames(self):
+        github = FakeGitHub(A, ["x.py", "y.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave."), security="Injection: y.py."))
+        github.heads = [B]
+        github.files = [{"filename": "moved.py", "patch": "@@"}, {"filename": "y.py", "patch": "@@"}]
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "moved.py", "previous_filename": "x.py", "status": "renamed"}]}
+        _, calls, _ = run_review(github, B, review(issue("moved.py", "Race", "Two saves interleave.")))
+        self.assertEqual(calls[0]["mode"], "full")
+        races = [f for f in github.state()["findings"] if f["header"] == "Race"]
+        self.assertEqual(len(races), 1)
+        self.assertEqual(races[0]["path"], "moved.py")
+        self.assertEqual(sorted(i["path"] for i in races[0]["threads"]), ["moved.py", "x.py"])
+
     def test_security_concern_forces_a_full_review_so_an_unrelated_delta_cannot_clear_it(self):
         github = FakeGitHub(A, ["x.py", "y.py"])
         run_review(github, A, review(security="Injection: x.py builds a shell command from input."))
@@ -701,7 +745,7 @@ class ReviewTests(unittest.TestCase):
         _, calls, _ = run_review(github, B, review())
         self.assertIn("big.py ", calls[0]["files"])
 
-    def test_unlisted_coverage_gap_is_kept_until_a_full_review_has_none(self):
+    def test_unlisted_coverage_gap_schedules_a_full_review_that_clears_it(self):
         github = FakeGitHub(A, ["small.py", "big.py"])
         original_comments = github.comments
 
@@ -715,10 +759,11 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(github.state()["uncovered_unlisted"])
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "small.py"}]}
-        run_review(github, B, review())
+        _, calls, _ = run_review(github, B, review())
+        self.assertEqual(calls[0]["mode"], "full")  # Only a full review can name the unlisted files.
         state = github.state()
         self.assertEqual(state["uncovered"], [])
-        self.assertTrue(state["uncovered_unlisted"])
+        self.assertFalse(state["uncovered_unlisted"])
 
     def test_renames_survive_a_comparison_capped_at_300_files(self):
         github = FakeGitHub(A, ["x.py"])

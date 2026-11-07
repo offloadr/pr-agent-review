@@ -182,6 +182,7 @@ jobs:
           THREAD_AUTHOR_PREFIX = "github-actions"
           # Above this many PR files outside the delta, the ignore list gets unwieldy; review in full.
           MAX_IGNORED_FILES = 200
+          MAX_IGNORE_CHARS = 64_000
           PR_AGENT = ["/app/.venv/bin/python", "/app/pr_agent/servers/github_action_runner.py"]
           VERDICTS = ("fixed", "still_present", "uncertain")
           FILE_CONTEXT_CHARS = 150_000
@@ -451,52 +452,62 @@ jobs:
               """Decide what this run reviews: {"mode": "none" | "full" | "delta", "files": [...], "reason": ...}."""
               if checkpoint is None:
                   return {"mode": "full", "files": sorted(pr_paths), "reason": "no checkpoint yet"}
+              previous = checkpoint["head_sha"]
+              # The push's range, when the checkpoint's head is an ancestor of this one: what changed and what
+              # was renamed. Every plan carries it, so earlier findings follow renames even in a full review.
+              changed, renames, comparison = set(), {}, None
+              if previous != head_sha:
+                  comparison = compare(previous, head_sha)
+                  if comparison is not None and comparison.get("status") == "ahead":
+                      for file in comparison.get("files") or []:
+                          changed.add(file["filename"])
+                          if file.get("previous_filename"):
+                              changed.add(file["previous_filename"])
+                              renames[file["previous_filename"]] = file["filename"]
+                  else:
+                      comparison = None
+
+              def full(reason):
+                  return {"mode": "full", "files": sorted(pr_paths), "changed": sorted(changed), "renames": renames,
+                          "reason": reason}
+
               if (checkpoint.get("security") or {}).get("concern"):
                   # The concern is not tied to files, so only a review of everything can clear it.
-                  return {"mode": "full", "files": sorted(pr_paths), "reason": "an earlier review reported a security concern"}
+                  return full("an earlier review reported a security concern")
               if checkpoint.get("ignore_glob", []) != list(user_globs):
                   # A narrower ignore list brings in files no review has seen.
-                  return {"mode": "full", "files": sorted(pr_paths), "reason": "the ignore globs changed"}
+                  return full("the ignore globs changed")
               if checkpoint.get("base_ref") != base_ref:
                   # Retargeting changes the pull request's diff without moving its head.
-                  return {"mode": "full", "files": sorted(pr_paths),
-                          "reason": f"the base branch changed from {checkpoint.get('base_ref')} to {base_ref}"}
+                  return full(f"the base branch changed from {checkpoint.get('base_ref')} to {base_ref}")
               # The pull request's diff runs from the merge base. Moving it forward (base merged in) keeps the
               # earlier review valid; moving it back or sideways (base reset or rewritten) can expose files no
               # review has seen, so that gets a full review.
               if checkpoint.get("merge_base") != merge_base:
                   moved = compare(checkpoint["merge_base"], merge_base) if checkpoint.get("merge_base") else None
                   if moved is None or moved.get("status") != "ahead":
-                      return {"mode": "full", "files": sorted(pr_paths),
-                              "reason": "the merge base with the base branch moved back or sideways"}
-              previous = checkpoint["head_sha"]
+                      return full("the merge base with the base branch moved back or sideways")
               if previous == head_sha:
                   return {"mode": "none", "files": [], "reason": "checkpoint is already at this commit"}
-              comparison = compare(previous, head_sha)
-              if comparison is None or comparison.get("status") != "ahead":
-                  return {"mode": "full", "files": sorted(pr_paths),
-                          "reason": f"{previous[:7]} is not an ancestor of {head_sha[:7]}"}
-              changed, renames = set(), {}
-              for file in comparison.get("files") or []:
-                  changed.add(file["filename"])
-                  if file.get("previous_filename"):
-                      changed.add(file["previous_filename"])
-                      renames[file["previous_filename"]] = file["filename"]
+              if checkpoint.get("uncovered_unlisted"):
+                  # An earlier footer left files unnamed; only a full review can name them. This happens only for
+                  # pull requests larger than PR-Agent's call budget.
+                  return full("an earlier review left out files its coverage footer did not name")
+              if comparison is None:
+                  return full(f"{previous[:7]} is not an ancestor of {head_sha[:7]}")
               if len(comparison.get("files") or []) >= 300:
-                  # GitHub lists at most 300 files, so the change is reviewed in full, but the renames it did
-                  # list still move earlier findings to their new paths.
-                  return {"mode": "full", "files": sorted(pr_paths), "changed": sorted(changed), "renames": renames,
-                          "reason": "the change is too large to list"}
+                  # GitHub lists at most 300 files, so the change is reviewed in full.
+                  return full("the change is too large to list")
               # Files an earlier review left out for its token budget are reviewed again until one covers them.
               pending = set(checkpoint.get("uncovered") or []) & pr_paths
               delta = sorted(p for p in (pr_paths & changed) | pending if reviewable(p) and not ignored_by(p, user_globs))
               if not delta:
                   return {"mode": "none", "files": [], "changed": sorted(changed), "renames": renames,
                           "reason": "no reviewable pull request file changed"}
-              if len(pr_paths) - len(delta) > MAX_IGNORED_FILES:
-                  # Still a known range, so earlier findings keep following their renamed files.
-                  return {"mode": "full", "files": sorted(pr_paths), "changed": sorted(changed), "renames": renames,
-                          "reason": "too many files to leave out"}
+              # The ignore list travels in one environment variable, which Linux caps at 128 KiB.
+              left_out = [glob_escape(p) for p in pr_paths - set(delta)]
+              if len(left_out) > MAX_IGNORED_FILES or len(json.dumps(left_out + list(user_globs))) > MAX_IGNORE_CHARS:
+                  return full("too many files to leave out")
               return {"mode": "delta", "files": delta, "changed": sorted(changed), "renames": renames,
                       "reason": f"files changed since {previous[:7]}"}
 
@@ -789,7 +800,17 @@ jobs:
               request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(body).encode(),
                                                method="POST", headers={"Authorization": f"Bearer {keys['openai']}",
                                                                        "Content-Type": "application/json"})
-              result = json.loads(send(request, timeout=900)[0])
+              try:
+                  result = json.loads(send(request, timeout=900)[0])
+              except urllib.error.HTTPError as error:
+                  detail = error.read().decode(errors="replace")
+                  error.close()
+                  if error.code != 429 or "service_tier" not in body or FLEX_UNAVAILABLE not in detail:
+                      raise
+                  body.pop("service_tier")  # Flex has no capacity: the standard tier.
+                  request = urllib.request.Request(request.full_url, data=json.dumps(body).encode(), method="POST",
+                                                   headers=dict(request.header_items()))
+                  result = json.loads(send(request, timeout=600)[0])
               text = "".join(part.get("text", "") for item in result.get("output") or [] if item.get("type") == "message"
                              for part in item.get("content") or [] if part.get("type") == "output_text")
               return parse_json(text), result.get("usage") or {}
