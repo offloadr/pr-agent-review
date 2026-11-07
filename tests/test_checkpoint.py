@@ -1357,6 +1357,50 @@ class GateTests(unittest.TestCase):
         self.gate(github, head=B)
         self.assertEqual(github.resolved, ["T_old"])
 
+    def test_dismissed_findings_are_pruned_so_saves_keep_succeeding(self):
+        paths = [f"f{i}.py" for i in range(10)]
+        github = FakeGitHub("0" * 40, paths)
+        previous, threads = None, []
+        for round_number in range(12):
+            head = f"{round_number:040d}"
+            github.heads = [head]
+            if previous:
+                github.compares[(previous, head)] = {"status": "ahead", "files": [{"filename": p} for p in paths]}
+            contents = [(p, f"round {round_number} " + "x" * 1500) for p in paths]
+            # Every earlier finding was dismissed by resolving its thread; the verifier keeps saying still_present.
+            still = {f["id"]: "still_present" for f in (github.state() or {}).get("findings", [])}
+            code, _, _ = run_review(github, head, review(*[issue(p, "Bug", c) for p, c in contents]), verdicts=still)
+            self.assertEqual(code, 0, round_number)
+            threads += [posted(f"T{round_number}-{p}", p, "Bug", c, resolved=True) for p, c in contents]
+            github.threads = threads
+            previous = head
+        state = github.state()
+        self.assertGreater(state["pruned_dismissed"], 0)
+        self.assertEqual(self.gate(github, head=previous)[0], 0)
+
+    def test_dismissed_finding_stays_dismissed_when_raised_again_and_reopens_when_unresolved(self):
+        github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review(issue("x.py", "Race", "Two saves interleave.")))
+        self.assertEqual(github.state()["findings"][0]["state"], "DISMISSED")
+        self.assertEqual(self.gate(github, head=B)[0], 0)
+        github.threads[0]["resolved"] = False  # Someone unresolves it: the dismissal is withdrawn.
+        self.assertEqual(self.gate(github, head=B)[0], 1)
+
+    def test_marker_quoted_in_another_threads_text_does_not_dismiss(self):
+        github = self.reviewed({"relevant_file": "x.py", "issue_header": "Design", "issue_content": "Retries duplicate."},
+                               issue("x.py", "Race", "Two saves interleave."))
+        design = next(f for f in github.state()["findings"] if f["header"] == "Design")
+        quoted = f"<!-- pr-agent-dedup: {design['threads'][0]['fingerprint']} -->"
+        race_thread = posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)
+        race_thread["body"] = race_thread["body"].replace("**Race**", f"**Race** (see {quoted})", 1)
+        github.threads = [race_thread]
+        code, output = self.gate(github)
+        self.assertEqual(code, 1)
+        self.assertIn("Design", output)
+
     def test_security_concern_blocks(self):
         code, output = self.gate(self.reviewed(security="Secrets in logs: the token is printed."))
         self.assertEqual(code, 1)

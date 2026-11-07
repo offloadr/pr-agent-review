@@ -384,21 +384,24 @@ jobs:
               findings = state["findings"]
               active = [f for f in findings if f["state"] == "ACTIVE"]
               fixed = [f for f in findings if f["state"] == "FIXED"]
+              dismissed = [f for f in findings if f["state"] == "DISMISSED"]
               run = state["runs"][-1] if state["runs"] else {}
               lines = [CHECKPOINT_MARKER, f"### PR-Agent findings at {state['head_sha'][:7]}", ""]
               scope = {"full": "full review", "delta": f"review of {run.get('files', 0)} changed file(s)",
                        "none": "no reviewable changes"}.get(run.get("mode"), "review")
-              lines.append(f"{len(active)} open, {len(fixed)} fixed. Last run: {scope}, "
+              lines.append(f"{len(active)} open, {len(fixed)} fixed, {len(dismissed)} dismissed. Last run: {scope}, "
                            f"{run.get('verified', 0)} earlier finding(s) re-checked.")
               concern = (state.get("security") or {}).get("concern")
               if concern:
                   lines += ["", f"🔒 **Security concern:** {cell(concern)}"]
               if findings:
                   lines += ["", "| State | Finding | Location |", "| --- | --- | --- |"]
-                  for f in active + fixed:
+                  for f in active + fixed + dismissed:
                       where = f"`{cell(f['path'])}`" + (f":{f['line']}" if f.get("line") else "")
                       if f["state"] == "ACTIVE":
                           status = "open"
+                      elif f["state"] == "DISMISSED":
+                          status = "dismissed"
                       else:
                           status = f"fixed in {(f.get('check') or {}).get('sha', '')[:7]}"
                       text = f"**{cell(f['header'])}** {cell(f['content'])}"
@@ -424,6 +427,11 @@ jobs:
                           # later review raising it again is recognized as a reintroduction.
                           state.setdefault("pruned", []).append({"id": pruned["id"], "key": current_key(pruned),
                                                                  "threads": identities(pruned)})
+                  elif any(f["state"] == "DISMISSED" for f in state["findings"]):
+                      index = next(i for i, f in enumerate(state["findings"]) if f["state"] == "DISMISSED")
+                      dismissed = state["findings"].pop(index)
+                      state["pruned_dismissed"] = state.get("pruned_dismissed", 0) + 1
+                      state.setdefault("dismissed_ids", []).extend([dismissed["id"], current_key(dismissed)])
                   elif any(len(f["content"]) > 300 for f in state["findings"]):
                       for f in state["findings"]:
                           f["content"] = f["content"][:300]
@@ -637,7 +645,8 @@ jobs:
               return hashlib.sha256(f"{header}\n{content}".encode()).hexdigest()[:12]
 
 
-          def merge_findings(previous, raised, plan_result, head_sha, pruned=(), fixed_ids=(), started_at=None):
+          def merge_findings(previous, raised, plan_result, head_sha, pruned=(), fixed_ids=(), started_at=None,
+                             dismissed_ids=()):
               """Combine earlier findings with this run's.
 
               Returns (findings, the earlier ones to verify against their own file's changes, the pruned records
@@ -668,7 +677,9 @@ jobs:
                       if f["state"] == "FIXED":
                           reopen(f, started_at)
                       add_identities(f, new["threads"])
-                      f.update(state="ACTIVE", line=new["line"], checked_sha=head_sha,
+                      # A dismissed finding raised again stays dismissed: it was accepted, not fixed.
+                      f.update(state="DISMISSED" if f["state"] == "DISMISSED" else "ACTIVE", line=new["line"],
+                               checked_sha=head_sha,
                                check={"verdict": "still_present", "reason": "raised again by the review", "sha": head_sha})
                   elif f["state"] == "ACTIVE" and (plan_result["mode"] == "full" or f["path"] in changed
                                                    or f.get("renamed_from") in changed):
@@ -689,7 +700,9 @@ jobs:
                   add_identities(new, identities(record))
               # Its pruned record may be gone too, but its id is remembered.
               for new in raised_by_id.values():
-                  if (new["id"] in fixed_ids or current_key(new) in fixed_ids) and not new.get("reopened_at"):
+                  if new["id"] in dismissed_ids or current_key(new) in dismissed_ids:
+                      new.update(state="DISMISSED", dismissed_sha=head_sha)  # Dismissed before its record was pruned.
+                  elif (new["id"] in fixed_ids or current_key(new) in fixed_ids) and not new.get("reopened_at"):
                       reopen(new, started_at)
               # A new finding can share an id with a retained one (same text at a path a renamed finding came
               # from); verdicts are keyed by id, so it gets its own.
@@ -1090,6 +1103,7 @@ jobs:
               previous = (checkpoint or {}).get("findings") or []
               pruned = (checkpoint or {}).get("pruned") or []
               fixed_ids = set((checkpoint or {}).get("fixed_ids") or [])
+              dismissed_ids = set((checkpoint or {}).get("dismissed_ids") or [])
               security = (checkpoint or {}).get("security") or {}
               uncovered = sorted(set((checkpoint or {}).get("uncovered") or []) & pr_paths)
               more_gaps = bool((checkpoint or {}).get("uncovered_unlisted"))
@@ -1097,13 +1111,13 @@ jobs:
                   # Nothing to review, but a change can still fix a finding, for example by reverting its
                   # file out of the pull request.
                   findings, to_verify, pruned, elsewhere = merge_findings(previous, [], plan_result, head_sha, pruned, fixed_ids,
-                                                                          occurrence_since)
+                                                                          occurrence_since, dismissed_ids)
               else:
                   review = run_review(plan_result, pr_paths, user_globs, model, keys)
                   validate_review(review)
                   raised = findings_from_review(review, head_sha, pr_paths)
                   findings, to_verify, pruned, elsewhere = merge_findings(previous, raised, plan_result, head_sha, pruned,
-                                                                          fixed_ids, occurrence_since)
+                                                                          fixed_ids, occurrence_since, dismissed_ids)
                   gaps, more_gaps = coverage_gaps(github.comments(repo, pr), started_at, pr_paths)
                   # The latest review's verdict replaces the earlier one, as with PR-Agent's own summary.
                   security = {"sha": head_sha, "concern": security_concern(review)}
@@ -1174,13 +1188,14 @@ jobs:
               if (latest or {}).get("revision", 0) != (checkpoint or {}).get("revision", 0) or \
                       (latest or {}).get("head_sha") != (checkpoint or {}).get("head_sha"):
                   raise RunFailed("Another run saved a newer checkpoint during this run.")
-              threads = github.bot_threads(repo, pr) if pruned else []
+              threads = github.bot_threads(repo, pr)
+              record_dismissals(findings, threads, head_sha)
               runs = list((checkpoint or {}).get("runs") or [])
               runs.append({"head_sha": head_sha, "mode": plan_result["mode"], "files": len(plan_result["files"]),
                            "verified": len(to_verify), "verifier_usage": usage, "at": int(time.time())})
               state = {"version": 1, "revision": (checkpoint or {}).get("revision", 0) + 1,
                        "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref, "merge_base": merge_base,
-                       "fixed_ids": sorted(fixed_ids),
+                       "fixed_ids": sorted(fixed_ids), "dismissed_ids": sorted(dismissed_ids),
                        "uncovered": uncovered, "uncovered_unlisted": more_gaps, "saved_at": now_utc(),
                        "ignore_glob": list(user_globs),
                        "findings": findings, "security": security, "runs": runs[-KEPT_RUNS:],
@@ -1199,10 +1214,20 @@ jobs:
 
           # ---- Gate mode ---------------------------------------------------------------------------------
 
+          DEDUP_MARKER_RE = re.compile(r"<!-- pr-agent-dedup: ([a-f0-9]{12}) -->")
+
+
+          def thread_fingerprint(thread):
+              """The fingerprint in the footer PR-Agent appends; a marker quoted in the text above it does not count."""
+              markers = DEDUP_MARKER_RE.findall(thread.get("body") or "")
+              return markers[-1] if markers else None
+
+
           def thread_posts(thread, finding):
-              """A thread posts a finding when it carries that finding's PR-Agent dedup fingerprint."""
-              return any(thread["path"] == i["path"] and f"<!-- pr-agent-dedup: {i['fingerprint']} -->" in thread["body"]
-                         for i in identities(finding))
+              """A thread posts a finding when its footer carries that finding's PR-Agent dedup fingerprint."""
+              fingerprint = thread_fingerprint(thread)
+              return fingerprint is not None and any(
+                  thread["path"] == i["path"] and fingerprint == i["fingerprint"] for i in identities(finding))
 
 
           DISMISSING_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
@@ -1221,15 +1246,36 @@ jobs:
                       and re.match(r"\s*/dismiss\b", thread.get("last_comment_body") or "", re.IGNORECASE) is not None)
 
 
+          def is_dismissed(finding, threads):
+              """Every thread posting the finding is resolved, and for a reintroduction, for this occurrence."""
+              matching = [t for t in threads if thread_posts(t, finding)]
+              if not matching or any(not t["resolved"] for t in matching):
+                  return False
+              return not finding.get("reopened_at") or any(dismisses_reintroduction(t, finding["reopened_at"])
+                                                           for t in matching)
+
+
+          def record_dismissals(findings, threads, head_sha):
+              """Store dismissals in the checkpoint so dismissed findings can be pruned like fixed ones. A
+              dismissed finding whose thread is unresolved again is open again."""
+              for f in findings:
+                  if f["state"] == "ACTIVE" and is_dismissed(f, threads):
+                      f.update(state="DISMISSED", dismissed_sha=head_sha)
+                  elif f["state"] == "DISMISSED" and any(thread_posts(t, f) and not t["resolved"] for t in threads):
+                      f["state"] = "ACTIVE"
+                      f.pop("dismissed_sha", None)
+
+
           def open_findings(state, threads, summary_url):
               lines = []
               for f in state["findings"]:
-                  if f["state"] != "ACTIVE":
+                  if f["state"] == "DISMISSED" and not any(thread_posts(t, f) and not t["resolved"] for t in threads):
+                      continue
+                  if f["state"] not in ("ACTIVE", "DISMISSED"):
                       continue
                   matching = [t for t in threads if thread_posts(t, f)]
                   unresolved = [t for t in matching if not t["resolved"]]
-                  current = not f.get("reopened_at") or any(dismisses_reintroduction(t, f["reopened_at"]) for t in matching)
-                  if matching and not unresolved and current:
+                  if f["state"] == "ACTIVE" and is_dismissed(f, threads):
                       continue  # Dismissed: every thread posting it was resolved.
                   location = f["path"] + (f":{f['line']}" if f.get("line") else "")
                   url = unresolved[0]["url"] if unresolved else summary_url

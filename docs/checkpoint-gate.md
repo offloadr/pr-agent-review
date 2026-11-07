@@ -80,7 +80,10 @@ The findings job resolves only threads that existed when its checkpoint was save
 over from an older run cannot resolve, and so dismiss, a thread a newer review posted. It is not
 in the review job's concurrency group, because GitHub keeps only one pending job per group and a
 rerun findings job could replace a pending review.
-Threads are tied to findings by PR-Agent's `pr-agent-dedup` fingerprint, computed from the full
+The review job stores a dismissal as a `DISMISSED` state, so dismissed findings can be pruned like
+fixed ones (their ids are remembered, so a dismissal outlives pruning and a review raising the
+finding again keeps it dismissed). Unresolving a dismissed finding's thread makes it open again.
+Threads are tied to findings by the `pr-agent-dedup` fingerprint in the footer PR-Agent appends, computed from the full
 finding text when it is first read, so truncating stored text cannot make two findings share
 threads. A
 security concern from the latest review blocks until a later review reports none. Threads of fixed
