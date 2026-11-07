@@ -61,11 +61,12 @@ class FakeGitHub:
         self.resolved = []
         self.saved = 0
         self.base_ref = "main"
+        self.base_sha = "base"
         self.merge_base = "m" * 40
 
     def pull(self, repo, pr):
         head = self.heads.pop(0) if len(self.heads) > 1 else self.heads[0]
-        return {"head": {"sha": head}, "base": {"sha": "base", "ref": self.base_ref}}
+        return {"head": {"sha": head}, "base": {"sha": self.base_sha, "ref": self.base_ref}}
 
     def pull_files(self, repo, pr):
         return self.files
@@ -121,7 +122,8 @@ def run_review(github, head, result, verdicts=None, prompts=None, globs=()):
 
     output = []
     code = cp.review_main(github, "o/r", "1", head, "gpt-6.1-sol", "gpt-6.1-sol", "medium", {"openai": "k"},
-                          list(globs), run_review=fake_review, ask=fake_ask, out=output.append)
+                          list(globs), run_review=fake_review, ask=fake_ask, out=output.append,
+                          sleep=lambda _: None)
     return code, calls, "\n".join(output)
 
 
@@ -1045,6 +1047,52 @@ class ReviewTests(unittest.TestCase):
         with self.assertRaises(cp.RunFailed):
             run_review(github, B, cp.NoReviewOutput("PR-Agent produced no review output."))
 
+    def test_base_reset_during_the_run_saves_nothing(self):
+        github = self.first_run()
+        saved = github.saved
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "z.py"}]}
+        original = github.pull
+        calls = {"n": 0}
+
+        def pull(repo, pr):
+            calls["n"] += 1
+            if calls["n"] == 2:  # The base branch is force-reset behind the fork point mid-run.
+                github.base_sha = "reset"
+                github.compares[("reset", B)] = {"status": "ahead", "files": [], "merge_base_commit": {"sha": "n" * 40}}
+            return original(repo, pr)
+        github.pull = pull
+        with self.assertRaises(cp.RunFailed):
+            run_review(github, B, review())
+        self.assertEqual(github.saved, saved)
+
+    def test_fix_beyond_a_capped_comparison_reaches_the_verifier(self):
+        github = FakeGitHub(A, ["x.py"] + [f"f{i}.py" for i in range(300)])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": f"f{i}.py"} for i in range(300)]}
+        prompts = []
+        run_review(github, B, review(), prompts=prompts)
+        x_prompt = next(p for p in prompts if p.startswith("File: x.py"))
+        self.assertIn("@@ patch of x.py", x_prompt)
+        self.assertNotIn("(no change to this file since then)", x_prompt)
+
+    def test_saved_checkpoint_read_back_tolerates_a_stale_first_read(self):
+        github = FakeGitHub(A, ["x.py"])
+        original = github.comments
+        served_stale = {"done": False}
+
+        def comments(repo, pr):
+            # The first read after the save still shows the comment from before it.
+            if github.saved and not served_stale["done"]:
+                served_stale["done"] = True
+                return []
+            return original(repo, pr)
+        github.comments = comments
+        code, _, _ = run_review(github, A, review())
+        self.assertEqual(code, 0)
+        self.assertTrue(served_stale["done"])
+
     def test_security_concern_is_recorded(self):
         github = FakeGitHub(A, ["x.py"])
         run_review(github, A, review(security="SQL injection: the query concatenates input."))
@@ -1445,6 +1493,32 @@ class GateTests(unittest.TestCase):
         x_prompt = next(p for p in prompts if p.startswith("File: x.py"))
         self.assertNotIn("@@ patch of x.py", x_prompt)
         self.assertIn("(no change to this file since then)", x_prompt)
+
+    def test_pruned_dismissal_renamed_later_restores_at_the_new_path(self):
+        record = {"id": "1", "path": "x.py", "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint(
+            "x.py", "Race", "Two saves interleave.")}]}
+        github = self.reviewed()
+        state = github.state()
+        state["dismissed_threads"] = cp.history_entries(record)
+        github.issue_comments[0]["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        # A push renames x.py to y.py and is saved.
+        github.files = [{"filename": "y.py", "patch": "@@"}]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [
+            {"filename": "y.py", "previous_filename": "x.py", "status": "renamed"}]}
+        run_review(github, B, review())
+        self.assertEqual(github.state()["dismissed_threads"][0]["path"], "y.py")
+        # Later the dismissal is withdrawn and another push lands.
+        github.threads[0]["resolved"] = False
+        github.contents["y.py"] = "the renamed code"
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "y.py", "patch": "+lock"}]}
+        prompts = []
+        run_review(github, C, review(), prompts=prompts)
+        self.assertEqual(github.state()["findings"][0]["path"], "y.py")
+        self.assertTrue(prompts[0].startswith("File: y.py"))
+        self.assertIn("the renamed code", prompts[0])
 
     def test_withdrawn_pruned_dismissal_of_a_renamed_finding_restores_at_its_new_path(self):
         dismissed = {"id": "1", "path": "moved.py", "header": "Race", "content": "Two saves interleave.",

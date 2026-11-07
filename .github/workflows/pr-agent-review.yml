@@ -425,14 +425,11 @@ jobs:
 
 
           def history_entries(finding):
-              """Compact entries for a pruned dismissal's threads: a hash of each thread identity, plus the
-              finding's current path when it moved there through a rename."""
+              """Compact entries for a pruned dismissal's threads: a hash of each thread identity and the
+              finding's current path, which later renames move along."""
               entries = []
               for i in identities(finding):
-                  entry = {"key": history_key(i["path"], i["fingerprint"])}
-                  if finding["path"] != i["path"]:
-                      entry["path"] = finding["path"]
-                  entries.append(entry)
+                  entries.append({"key": history_key(i["path"], i["fingerprint"]), "path": finding["path"]})
               return entries
 
 
@@ -1154,7 +1151,7 @@ jobs:
 
 
           def review_main(github, repo, pr, event_head, model, verifier_model, verifier_effort, keys, user_globs,
-                          run_review=run_pr_agent, ask=None, out=print):
+                          run_review=run_pr_agent, ask=None, out=print, sleep=time.sleep):
               pull = github.pull(repo, pr)
               head_sha, base_sha, base_ref = pull["head"]["sha"], pull["base"]["sha"], pull["base"]["ref"]
               if head_sha != event_head:
@@ -1187,7 +1184,9 @@ jobs:
               pruned = (checkpoint or {}).get("pruned") or []
               fixed_ids = set((checkpoint or {}).get("fixed_ids") or [])
               dismissed_ids = follow_renames(set((checkpoint or {}).get("dismissed_ids") or []), plan_result.get("renames") or {})
-              dismissed_threads = list((checkpoint or {}).get("dismissed_threads") or [])
+              renames = plan_result.get("renames") or {}
+              dismissed_threads = [dict(e, path=renames[e["path"]]) if "key" in e and e.get("path") in renames else e
+                                   for e in (checkpoint or {}).get("dismissed_threads") or []]
               # A withdrawn dismissal (its thread unresolved) is open before this run picks what to verify, so a
               # push that fixes it gets it verified.
               record_dismissals(previous, threads, head_sha)
@@ -1247,7 +1246,9 @@ jobs:
                           for file in comparison.get("files") or []:
                               if path in (file["filename"], file.get("previous_filename")):
                                   return file.get("patch")
-                          return ""  # Unchanged since the finding was checked: no fix evidence in this file.
+                          if len(comparison.get("files") or []) < 300:
+                              return ""  # Unchanged since the finding was checked: no fix evidence in this file.
+                          # GitHub lists at most 300 files, so a missing file may still have changed.
                   return pr_patches.get(path)
 
               if plan_result.get("renames_complete") is False:
@@ -1295,6 +1296,11 @@ jobs:
               current = github.pull(repo, pr)
               if current["head"]["sha"] != head_sha or current["base"]["ref"] != base_ref:
                   raise RunFailed("The pull request moved during the run; the run for the new push or base reviews it.")
+              if current["base"]["sha"] != base_sha:
+                  # The base branch moved; only a changed merge base changes what this run reviewed.
+                  moved = ((github.compare(repo, current["base"]["sha"], head_sha) or {}).get("merge_base_commit") or {}).get("sha")
+                  if moved != merge_base:
+                      raise RunFailed("The base branch was reset during the run; the next run reviews the new diff.")
               latest_comment, latest = find_checkpoint(github.comments(repo, pr))
               if (latest or {}).get("revision", 0) != (checkpoint or {}).get("revision", 0) or \
                       (latest or {}).get("head_sha") != (checkpoint or {}).get("head_sha"):
@@ -1319,8 +1325,15 @@ jobs:
               github.save_comment(repo, pr, (latest_comment or {}).get("id"), fit_comment(state))
               # Review jobs for a pull request are serialized, so this should always hold; if another save
               # slipped in, failing here keeps the findings job from trusting a checkpoint it did not get.
-              if (find_checkpoint(github.comments(repo, pr))[1] or {}).get("revision") != state["revision"]:
-                  raise RunFailed("Another run's checkpoint replaced this one.")
+              for attempt in range(5):
+                  seen = (find_checkpoint(github.comments(repo, pr))[1] or {}).get("revision", 0)
+                  if seen == state["revision"]:
+                      break
+                  if seen > state["revision"]:
+                      raise RunFailed("Another run's checkpoint replaced this one.")
+                  sleep(2)  # GitHub can briefly serve the comment from before the edit.
+              else:
+                  raise RunFailed("The saved checkpoint did not read back.")
               open_count = sum(f["state"] == "ACTIVE" for f in findings)
               out(f"Saved the checkpoint for {head_sha[:7]}: {open_count} open finding(s).")
               return 0
