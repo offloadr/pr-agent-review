@@ -521,6 +521,23 @@ class ShadowVerifierTests(unittest.TestCase):
         with self.assertRaises(cp.RunFailed):
             cp.shadowed(broken, lambda p: ({"verdicts": []}, {}), [])("prompt")
 
+    def test_malformed_shadow_answer_does_not_fail_the_review(self):
+        github = FakeGitHub(A, ["x.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        race = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+        primary = lambda prompt: ({"verdicts": [{"id": race, "verdict": "fixed", "reason": "locked",  # noqa: E731
+                                                 "relies_on": []}]}, {"total_tokens": "many"})
+        shadow = lambda prompt: ({"verdicts": [{"id": race, "verdict": [], "relies_on": 7}]}, None)  # noqa: E731
+        output = []
+        code = cp.review_main(github, "o/r", "1", B, "gpt-6.1-sol", "gpt-6.1-terra", "medium", {"openai": "k"}, [],
+                              run_review=lambda *a: review(), ask=primary, out=output.append, sleep=lambda _: None,
+                              shadow_model="gpt-6-luna", shadow_ask=shadow)
+        self.assertEqual(code, 0)
+        self.assertEqual((github.state()["head_sha"], github.state()["findings"][0]["state"]), (B, "FIXED"))
+        self.assertEqual(cp.answer_entries({"verdicts": [{"id": "1", "verdict": []}]})["1"]["verdict"], "invalid")
+
     def test_model_text_cannot_break_the_summary_table(self):
         self.assertEqual(cp.table_cell("a|b\n`c` <img>"), "a\\|b 'c' &lt;img>")
 

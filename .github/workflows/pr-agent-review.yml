@@ -1347,7 +1347,8 @@ jobs:
                       continue
                   relies = item.get("relies_on")
                   entries[item["id"]] = {
-                      "verdict": item.get("verdict") if item.get("verdict") in VERDICTS else "invalid",
+                      "verdict": item["verdict"] if isinstance(item.get("verdict"), str) and item["verdict"] in VERDICTS
+                      else "invalid",
                       "relies_on": [p for p in relies if isinstance(p, str)] if isinstance(relies, list) else [],
                       "reason": item.get("reason") if isinstance(item.get("reason"), str) else ""}
               return entries
@@ -1875,8 +1876,12 @@ jobs:
                   out(f"- {f['check']['verdict']}: {f['path']} {f['header']} ({f['check']['reason'][:120]})")
 
               if shadow_model:
-                  report_shadow(shadow_records, head_sha, (verifier_model, verifier_effort), (shadow_model, shadow_effort),
-                                out, summary_path)
+                  try:
+                      report_shadow(shadow_records, head_sha, (verifier_model, verifier_effort), (shadow_model, shadow_effort),
+                                    out, summary_path)
+                  except Exception as error:  # noqa: BLE001
+                      # The comparison is for evaluation only; whatever the shadow returned, the review is saved.
+                      out(f"::warning::Could not report the shadow verifier's answers: {type(error).__name__}: {error}")
 
               # Save only if nothing moved while this run worked: not the head, not the base, and no other
               # run's checkpoint (each save bumps the revision this run planned from).
