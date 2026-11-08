@@ -1425,6 +1425,33 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(state["fixed_deps"], deps)
         self.assertTrue(state["history_trimmed"])
 
+    def test_same_head_full_rerun_does_not_reopen_fixed_findings(self):
+        github, null = self.helper_fixed()
+        state = github.state()
+        state["security"] = {"sha": B, "concern": "Injection: something."}  # Forces a full review.
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        _, calls, _ = run_review(github, B, review())  # Rerun at the same head.
+        self.assertEqual(calls[0]["mode"], "full")
+        self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
+
+    def test_pruned_dependency_fix_is_rechecked_when_its_ignored_own_file_changes(self):
+        github, null = self.helper_fixed()
+        state = github.state()
+        record = state["findings"].pop()
+        state["fixed_deps"] = [{"id": record["id"], "path": "caller.py", "header": record["header"],
+                                "content": record["content"][:200], "content_id": record["content_id"],
+                                "fix_files": record["fix_files"], "threads": record["threads"]}]
+        state["ignore_glob"] = ["caller.py"]
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "caller.py", "patch": "-if x:"}]}
+        prompts = []
+        _, calls, _ = run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts,
+                                 globs=["caller.py"])
+        self.assertEqual(calls, [])  # The ignored file is not reviewed.
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
     def test_fix_dependencies_follow_renames(self):
         github, null = self.helper_fixed()
         github.files = [{"filename": "caller.py", "patch": "@@"}, {"filename": "utils.py", "patch": "@@"}]

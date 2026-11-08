@@ -759,7 +759,8 @@ jobs:
               raised_by_id = {f["id"]: f for f in raised}
               # The same full text at the same current path is the same finding, whatever path its id came from.
               raised_by_text = {(f["path"], f["content_id"]): f for f in raised}
-              changed = set(plan_result.get("changed") or plan_result["files"])
+              # An explicitly empty change set (a same-head full review) means nothing changed, not everything.
+              changed = set(plan_result["changed"] if "changed" in plan_result else plan_result["files"])
               renames = plan_result.get("renames") or {}
               merged, to_verify, elsewhere, recheck = [], [], [], []
               for old in previous:
@@ -1355,7 +1356,7 @@ jobs:
               dismissed_threads = list((checkpoint or {}).get("dismissed_threads") or [])
               # A pruned fixed finding whose fix files this push changes comes back as a fixed record, so the
               # recheck below can ask whether the fix still holds.
-              changed_now = set(plan_result.get("changed") or plan_result.get("files") or [])
+              changed_now = set(plan_result["changed"] if "changed" in plan_result else plan_result.get("files") or [])
               fixed_deps, fixed_own = [], []
               for own in (checkpoint or {}).get("fixed_own") or []:
                   own_path = renames.get(own["path"], own["path"])
@@ -1372,7 +1373,9 @@ jobs:
                       fixed_own.append(dict(own, path=renames.get(own["path"], own["path"])))
               for dep in (checkpoint or {}).get("fixed_deps") or []:
                   capped = plan_result.get("renames_complete") is False
-                  own_file_reverted = dep["path"] in changed_now and dep["path"] not in pr_paths
+                  # Its own file changed without any review reading it: reverted out of the PR, or excluded.
+                  own_file_reverted = dep["path"] in changed_now and (
+                      dep["path"] not in pr_paths or dep["path"] in plan_result["unreviewable"])
                   if (set(dep.get("fix_files") or []) & changed_now or capped or own_file_reverted) \
                           and not any(f["id"] == dep["id"] for f in previous):
                       previous.append({"id": dep["id"], "path": dep["path"], "header": dep["header"], "content": dep["content"],
