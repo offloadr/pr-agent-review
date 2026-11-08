@@ -795,7 +795,8 @@ jobs:
                       elsewhere.append(f)
                   elif f["state"] == "FIXED" and (
                           (f.get("fix_files") and (set(f["fix_files"]) & changed or plan_result.get("renames_complete") is False))
-                          or (f["path"] in changed and f["path"] not in (plan_result.get("pr_paths") or {f["path"]}))):
+                          or ((f["path"] in changed or plan_result.get("renames_complete") is False)
+                              and f["path"] not in (plan_result.get("pr_paths") or {f["path"]}))):
                       # With a capped comparison, a changed dependency may be missing from the list. A finding whose
                       # own file was reverted out of the pull request gets no delta review, so it is rechecked too.
                       # A push touching the files that showed the fix may have undone it, even with nothing for
@@ -1139,6 +1140,13 @@ jobs:
                       "Return one verdict per finding id.")
 
 
+          def normalize_path(path):
+              """A repository-relative path as GitHub reports it: no ./ prefix, leading slash or doubled separators."""
+              import posixpath
+              normal = posixpath.normpath(path.strip().replace("\\", "/")).lstrip("/")
+              return "" if normal == "." else normal
+
+
           def relied_on(answer):
               """Each finding id's relies_on list from a verifier answer; anything malformed is an empty list."""
               items = answer.get("verdicts") if isinstance(answer, dict) else None
@@ -1146,7 +1154,8 @@ jobs:
               for item in items if isinstance(items, list) else []:
                   if isinstance(item, dict) and isinstance(item.get("id"), str):
                       files = item.get("relies_on")
-                      found[item["id"]] = [p for p in files if isinstance(p, str)] if isinstance(files, list) else []
+                      found[item["id"]] = [normalize_path(p) for p in files if isinstance(p, str) and p.strip()] \
+                          if isinstance(files, list) else []
               return found
 
 
@@ -1163,8 +1172,10 @@ jobs:
                       # The other files the verifier says the fix relies on, among those this range changed:
                       # undoing them can bring the failure back without touching the finding's own file, which
                       # delta reviews already cover.
+                      # Kept as named, even if unchanged in this range: a later change to any of them is a
+                      # reason to recheck.
                       named = set((relies or {}).get(f["id"]) or [])
-                      f["fix_files"] = sorted((named & set(evidence_files)) - {f["path"]})
+                      f["fix_files"] = sorted(named - {f["path"], ""})
 
 
           def verify(findings, head_sha, read_file, read_diff, ask, changes_since=lambda sha: []):
@@ -1328,7 +1339,8 @@ jobs:
               changed_now = set(plan_result.get("changed") or plan_result.get("files") or [])
               fixed_deps, fixed_own = [], []
               for own in (checkpoint or {}).get("fixed_own") or []:
-                  if own["path"] in changed_now and own["path"] not in pr_paths and not any(f["id"] == own["id"] for f in previous):
+                  reverted = (own["path"] in changed_now or plan_result.get("renames_complete") is False) and own["path"] not in pr_paths
+                  if reverted and not any(f["id"] == own["id"] for f in previous):
                       previous.append({"id": own["id"], "path": own["path"], "header": own["header"], "content": own["content"],
                                        "content_id": own.get("content_id"), "threads": own.get("threads") or [],
                                        "fix_files": [], "state": "FIXED", "line": None,
@@ -1402,16 +1414,20 @@ jobs:
                   findings, to_verify, pruned, elsewhere, recheck = merge_findings(previous, raised, plan_result, head_sha, pruned,
                                                                           fixed_ids, occurrence_since, dismissed_ids)
                   # GitHub can briefly serve the summary from before PR-Agent updated it, so wait for this run's.
-                  for attempt in range(5):
+                  # A run where PR-Agent reviewed nothing (no text diff) posts no summary and has no coverage.
+                  for attempt in range(0 if review.get("no_text_diff") else 5):
                       comments = github.comments(repo, pr)
                       if has_summary_since(comments, started_at):
                           gaps, more_gaps = coverage_gaps(comments, started_at, pr_paths)
                           break
                       sleep(2)
                   else:
-                      out("::warning::PR-Agent's summary for this run did not appear; files it left out are unknown, so "
-                          "the next push gets a full review.")
-                      gaps, more_gaps = [], True
+                      if review.get("no_text_diff"):
+                          gaps, more_gaps = [], bool((checkpoint or {}).get("uncovered_unlisted"))
+                      else:
+                          out("::warning::PR-Agent's summary for this run did not appear; files it left out are unknown, so "
+                              "the next push gets a full review.")
+                          gaps, more_gaps = [], True
                   # The latest review's verdict replaces the earlier one, as with PR-Agent's own summary. A run
                   # that reviewed nothing keeps the earlier verdict.
                   if not review.get("no_text_diff"):
@@ -1505,7 +1521,7 @@ jobs:
                       verdict, reason = verdicts[f["id"]]
                       if verdict == "fixed":
                           # The fix holds; it may now rely on files this push changed too.
-                          now = set(relied_on(answer).get(f["id"]) or []) & {c["filename"] for c in changes_since(since_checkpoint)}
+                          now = set(relied_on(answer).get(f["id"]) or []) - {""}
                           f["fix_files"] = sorted((set(f.get("fix_files") or []) | now) - {f["path"]})
                           f["check"] = {"verdict": "fixed", "reason": reason, "sha": head_sha}
                           continue
@@ -1582,12 +1598,15 @@ jobs:
           # ---- Gate mode ---------------------------------------------------------------------------------
 
           DEDUP_MARKER_RE = re.compile(r"<!-- pr-agent-dedup: ([a-f0-9]{12}) -->")
+          # PR-Agent appends its dedup marker, optionally followed by its location marker, as the body's last lines.
+          DEDUP_FOOTER_RE = re.compile(r"<!-- pr-agent-dedup: ([a-f0-9]{12}) -->"
+                                       r"(?:\s*<!-- pr-agent-key-issue-location: [a-f0-9]{12} -->)?\s*\Z")
 
 
           def thread_fingerprint(thread):
               """The fingerprint in the footer PR-Agent appends; a marker quoted in the text above it does not count."""
-              markers = DEDUP_MARKER_RE.findall(thread.get("body") or "")
-              return markers[-1] if markers else None
+              match = DEDUP_FOOTER_RE.search(thread.get("body") or "")
+              return match.group(1) if match else None
 
 
           def thread_posts(thread, finding):

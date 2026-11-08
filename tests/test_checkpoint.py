@@ -1301,6 +1301,51 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(any("fixed earlier" in p for p in prompts))
         self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
 
+    def test_own_file_revert_beyond_a_capped_comparison_is_rechecked(self):
+        github = FakeGitHub(A, ["caller.py", "helper.py"])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        null = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "caller.py", "patch": "+if x:"}]}
+        run_review(github, B, review(), verdicts={null: "fixed"})
+        github.files = [{"filename": "helper.py", "patch": "@@"}] + [{"filename": f"f{i}.py"} for i in range(300)]
+        github.heads = [C]
+        # caller.py was reverted out of the PR, beyond the 300 files GitHub lists.
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": f"f{i}.py"} for i in range(300)]}
+        prompts = []
+        run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
+    def test_dependency_named_with_a_dot_slash_is_kept(self):
+        github = FakeGitHub(A, ["caller.py", "helper.py"])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        null = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "+    return ''"}]}
+        run_review(github, B, review(), verdicts={null: "fixed"}, relies={null: ["./helper.py"]})
+        self.assertEqual(github.state()["findings"][0]["fix_files"], ["helper.py"])
+        github.files = [{"filename": "caller.py", "patch": "@@"}]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "-    return ''"}]}
+        prompts = []
+        run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+
+    def test_binary_only_push_leaves_no_coverage_gap(self):
+        github = FakeGitHub(A, ["x.py", "assets/image"])
+        run_review(github, A, review())
+        github.files = [{"filename": "x.py", "patch": "@@"}, {"filename": "assets/image"}]
+        github.binary = {"assets/image"}
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "assets/image"}]}
+        run_review(github, B, cp.NoReviewOutput("PR-Agent produced no review output."))
+        self.assertFalse(github.state()["uncovered_unlisted"])
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        _, calls, _ = run_review(github, C, review())
+        self.assertEqual(calls[0]["mode"], "delta")
+
     def test_rewind_to_before_a_fix_reopens_it_when_no_diff_can_be_shown(self):
         github, null = self.helper_fixed()
         github.heads = [A]  # Force-pushed back to the commit before the fix.
@@ -2077,6 +2122,16 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.gate(github, head=B)[0], 0)
         github.threads[0]["resolved"] = False  # Someone unresolves it: the dismissal is withdrawn.
         self.assertEqual(self.gate(github, head=B)[0], 1)
+
+    def test_marker_quoted_inside_an_unrelated_bot_thread_does_not_dismiss(self):
+        github = self.reviewed({"relevant_file": "x.py", "issue_header": "Design", "issue_content": "Retries duplicate."})
+        design = github.state()["findings"][0]
+        marker = f"<!-- pr-agent-dedup: {design['threads'][0]['fingerprint']} -->"
+        github.threads = [thread("T_claude", "x.py", f"**Claude**\n\nAs PR-Agent's {marker} said, retries duplicate.\n\nDone.",
+                                 resolved=True)]
+        code, output = self.gate(github)
+        self.assertEqual(code, 1)
+        self.assertIn("Design", output)
 
     def test_marker_quoted_in_another_threads_text_does_not_dismiss(self):
         github = self.reviewed({"relevant_file": "x.py", "issue_header": "Design", "issue_content": "Retries duplicate."},
