@@ -29,6 +29,12 @@ jobs:
       OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
     with:
       model: gpt-6.1-sol
+      # Trial: Terra decides verifications, and Luna answers the same requests in the job summary
+      # for comparison only.
+      verifier-model: gpt-6.1-terra
+      verifier-reasoning-effort: medium
+      shadow-verifier-model: gpt-6-luna
+      shadow-verifier-reasoning-effort: high
       instructions: |
         This repository holds a reusable GitHub Actions workflow that reviews pull requests with PR-Agent in a pinned container, and a standard-library Python gate that fails the check while findings are open and resolves the threads of fixed ones.
         Focus on expression injection and over-broad token permissions in workflows, API keys reaching steps or processes that do not need them, shell and Python errors, gate logic that disagrees with the PR-Agent summary and state format it parses, and pagination, retry or error handling in the GitHub API calls.
