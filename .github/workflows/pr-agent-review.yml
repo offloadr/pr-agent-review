@@ -1502,21 +1502,29 @@ jobs:
                   # When the footer left some files unnamed, any changed file may have been among them.
                   skipped, unnamed = set(gaps), more_gaps
 
+                  # After a capped comparison or a force-push the change set is incomplete, so any file may
+                  # have changed.
+                  change_set_complete = plan_result.get("renames_complete") is not False
+
                   def went_unreviewed(path):
-                      return path in changed_now and (path in skipped or unnamed)
+                      return (path in changed_now or not change_set_complete) and (path in skipped or unnamed)
                   recheck += [f for f in findings if f["state"] == "FIXED" and went_unreviewed(f["path"]) and f not in recheck]
-                  # So may a pruned own-file fix in such a file: it comes back for the same recheck.
-                  for own in list(fixed_own):
-                      if went_unreviewed(own["path"]) and not any(f["id"] == own["id"] for f in findings):
-                          restored = {"id": own["id"], "path": own["path"], "header": own["header"], "content": own["content"],
-                                      "content_id": own.get("content_id"), "threads": own.get("threads") or [],
-                                      "fix_files": [], "state": "FIXED", "line": None,
-                                      "checked_sha": (checkpoint or {}).get("head_sha") or head_sha,
-                                      "check": {"verdict": "fixed", "reason": "pruned after an earlier fix in its own file",
-                                                "sha": (checkpoint or {}).get("head_sha") or head_sha}}
-                          findings.append(restored)
-                          recheck.append(restored)
-                          fixed_own.remove(own)
+                  # So may a pruned fix in such a file, whether it relied on other files or only its own: it
+                  # comes back for the same recheck.
+                  for records, reason in ((fixed_own, "pruned after an earlier fix in its own file"),
+                                          (fixed_deps, "pruned after an earlier fix")):
+                      for record in list(records):
+                          if went_unreviewed(record["path"]) and not any(f["id"] == record["id"] for f in findings):
+                              restored = {"id": record["id"], "path": record["path"], "header": record["header"],
+                                          "content": record["content"], "content_id": record.get("content_id"),
+                                          "threads": record.get("threads") or [], "fix_files": record.get("fix_files") or [],
+                                          "state": "FIXED", "line": None,
+                                          "checked_sha": (checkpoint or {}).get("head_sha") or head_sha,
+                                          "check": {"verdict": "fixed", "reason": reason,
+                                                    "sha": (checkpoint or {}).get("head_sha") or head_sha}}
+                              findings.append(restored)
+                              recheck.append(restored)
+                              records.remove(record)
                   if plan_result["mode"] != "full":
                       # Only a full review accounts for files an earlier footer did not name.
                       more_gaps = more_gaps or bool((checkpoint or {}).get("uncovered_unlisted"))

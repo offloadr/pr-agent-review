@@ -1519,6 +1519,36 @@ class ReviewTests(unittest.TestCase):
         run_review(github, B, review(), verdicts={race: "fixed"})
         return github, race
 
+    def test_fixed_file_skipped_after_a_force_push_is_rechecked(self):
+        github, race = self.own_file_fixed()
+        self.footer_for(github, C, "- `x.py`")
+        github.heads = [C]
+        # Force-pushed: the comparison from the merge base does not list x.py, though it changed.
+        github.compares[(B, C)] = {"status": "diverged", "files": [{"filename": "y.py"}]}
+        github.compares[(C, B)] = {"status": "diverged", "files": [{"filename": "x.py"}]}
+        github.contents[("x.py", B)] = "with lock:\n    save()\n"
+        github.contents[("x.py", C)] = "save()\n"
+        prompts = []
+        run_review(github, C, review(), verdicts={race: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
+    def test_pruned_helper_backed_fix_in_a_skipped_file_is_rechecked(self):
+        github, null = self.helper_fixed()
+        state = github.state()
+        record = state["findings"].pop()  # Pruned for size, as fit_comment would.
+        state["fixed_deps"] = [{"id": record["id"], "path": record["path"], "header": record["header"],
+                                "content": record["content"][:200], "content_id": record["content_id"],
+                                "fix_files": record["fix_files"], "threads": record["threads"]}]
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        self.footer_for(github, C, "- `caller.py`")
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "caller.py", "patch": "-  if s:"}]}
+        prompts = []
+        run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
     def test_fixed_file_among_unnamed_coverage_gaps_is_rechecked(self):
         github, race = self.own_file_fixed()
         self.footer_for(github, C, "- `y.py`\n... and 3 more")
