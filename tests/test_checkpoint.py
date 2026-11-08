@@ -474,6 +474,14 @@ class VerdictTests(unittest.TestCase):
                        {"verdicts": [{"id": "1", "verdict": ["fixed"]}]}, None, ["fixed"]):
             self.assertEqual(cp.parse_verdicts(answer, ["1"])["1"][0], "uncertain", answer)
 
+    def test_repeated_verdicts_for_one_id_are_uncertain_and_carry_no_dependencies(self):
+        answer = {"verdicts": [{"id": "1", "verdict": "fixed", "reason": "r", "relies_on": ["helper.py"]},
+                               {"id": "1", "verdict": "fixed", "reason": "", "relies_on": []}]}
+        self.assertEqual(cp.parse_verdicts(answer, ["1"])["1"][0], "uncertain")
+        self.assertEqual(cp.relied_on(answer), {})
+        single = {"verdicts": [{"id": "1", "verdict": "fixed", "reason": "r", "relies_on": ["./helper.py"]}]}
+        self.assertEqual(cp.relied_on(single), {"1": ["helper.py"]})
+
     def test_verdict_without_a_reason_is_uncertain(self):
         for item in ({"id": "1", "verdict": "fixed"}, {"id": "1", "verdict": "fixed", "reason": ""},
                      {"id": "1", "verdict": "fixed", "reason": 7}):
@@ -2038,6 +2046,37 @@ class GateTests(unittest.TestCase):
         code, _, _ = run_review(github, B, review())  # Batches with and without a check commit sort fine.
         self.assertEqual(code, 0)
         self.assertEqual(sorted(f["header"] for f in github.state()["findings"]), ["Leak", "Race"])
+
+    def test_restored_dismissal_is_verified_once_on_a_no_review_push(self):
+        github = self.reviewed()
+        state = github.state()
+        record = {"id": "1", "path": "x.py", "content_id": "c", "threads": [{"path": "x.py", "fingerprint":
+                  cp.inline_fingerprint("x.py", "Race", "Two saves interleave.")}]}
+        state["dismissed_threads"] = cp.history_entries(record)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.")]  # Withdrawn.
+        github.files = [{"filename": "x.py", "patch": "@@"}]  # y.py reverted out of the PR: nothing to review.
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "y.py", "patch": "-change"}]}
+        prompts = []
+        _, calls, _ = run_review(github, B, review(), prompts=prompts)
+        self.assertEqual(calls, [])
+        self.assertEqual(sum("Two saves interleave." in p for p in prompts), 1)
+
+    def test_restoring_a_dismissal_with_a_suggestion_fence_retires_its_original_key(self):
+        content = "Two saves interleave.\n```suggestion\nwith lock:\n```"
+        github = self.reviewed()
+        state = github.state()
+        record = {"id": "1", "path": "x.py", "content_id": cp.content_id("Race", content),
+                  "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", content)}]}
+        state["dismissed_threads"] = cp.history_entries(record)
+        state["dismissed_ids"] = [cp.dismissed_key(record)]
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", content)]  # Withdrawn; the body shows a text fence.
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+        run_review(github, B, review())
+        self.assertEqual(github.state()["dismissed_ids"], [])
 
     def test_pruned_dismissal_withdrawn_and_then_fixed_clears_through_verification(self):
         github = self.reviewed()

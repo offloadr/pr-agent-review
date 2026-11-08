@@ -441,7 +441,8 @@ jobs:
               finding's current path, which later renames move along."""
               entries = []
               for i in identities(finding):
-                  entries.append({"key": history_key(i["path"], i["fingerprint"]), "path": finding["path"]})
+                  entries.append({"key": history_key(i["path"], i["fingerprint"]), "path": finding["path"],
+                                  "cid": finding.get("content_id")})
               return entries
 
 
@@ -1076,20 +1077,31 @@ jobs:
               return parse_json(content), result.get("usage") or {}
 
 
-          def parse_verdicts(answer, ids):
-              """Map each finding id to (verdict, reason). Missing or malformed verdicts are 'uncertain'."""
-              verdicts = {i: ("uncertain", "the verifier returned no verdict for this finding") for i in ids}
+          def valid_entries(answer, ids):
+              """Each finding id's one valid verifier entry. Malformed entries are ignored; an id answered more
+              than once has no valid entry, so its verdict is 'uncertain'."""
               items = answer.get("verdicts") if isinstance(answer, dict) else None
+              seen, valid = {}, {}
               for item in items if isinstance(items, list) else []:
-                  if not isinstance(item, dict) or not isinstance(item.get("id"), str) or item["id"] not in verdicts:
+                  if not isinstance(item, dict) or not isinstance(item.get("id"), str) or item["id"] not in ids:
                       continue
-                  verdict, reason = item.get("verdict"), item.get("reason")
-                  # A verdict without its reason is no evidence, least of all for "fixed".
-                  relies = item.get("relies_on")
+                  seen[item["id"]] = seen.get(item["id"], 0) + 1
+                  verdict, reason, relies = item.get("verdict"), item.get("reason"), item.get("relies_on")
+                  # A verdict without its reason is no evidence, and a fix without what it relies on cannot be
+                  # rechecked later.
+                  if not (isinstance(verdict, str) and verdict in VERDICTS and isinstance(reason, str) and reason.strip()):
+                      continue
                   if verdict == "fixed" and not (isinstance(relies, list) and all(isinstance(p, str) for p in relies)):
-                      continue  # Without what it relies on, a fix cannot be rechecked later: uncertain.
-                  if isinstance(verdict, str) and verdict in VERDICTS and isinstance(reason, str) and reason.strip():
-                      verdicts[item["id"]] = (verdict, reason[:500])
+                      continue
+                  valid[item["id"]] = item
+              return {i: item for i, item in valid.items() if seen[i] == 1}
+
+
+          def parse_verdicts(answer, ids):
+              """Map each finding id to (verdict, reason). Missing, malformed or repeated verdicts are 'uncertain'."""
+              verdicts = {i: ("uncertain", "the verifier returned no single valid verdict for this finding") for i in ids}
+              for i, item in valid_entries(answer, set(ids)).items():
+                  verdicts[i] = (item["verdict"], item["reason"][:500])
               return verdicts
 
 
@@ -1150,15 +1162,12 @@ jobs:
 
 
           def relied_on(answer):
-              """Each finding id's relies_on list from a verifier answer; anything malformed is an empty list."""
+              """Each finding id's relies_on list, from the same validated entry its verdict came from."""
               items = answer.get("verdicts") if isinstance(answer, dict) else None
-              found = {}
-              for item in items if isinstance(items, list) else []:
-                  if isinstance(item, dict) and isinstance(item.get("id"), str):
-                      files = item.get("relies_on")
-                      found[item["id"]] = [normalize_path(p) for p in files if isinstance(p, str) and p.strip()] \
-                          if isinstance(files, list) else []
-              return found
+              ids = {item["id"] for item in items if isinstance(item, dict) and isinstance(item.get("id"), str)} \
+                  if isinstance(items, list) else set()
+              return {i: [normalize_path(p) for p in item.get("relies_on") or [] if isinstance(p, str) and p.strip()]
+                      for i, item in valid_entries(answer, ids).items()}
 
 
           def apply_verdicts(group, verdicts, head_sha, evidence_files=(), relies=None):
@@ -1385,6 +1394,10 @@ jobs:
                   # Checked against nothing yet: its file's whole PR patch is the verification range, so a fix
                   # already in the pull request (even at this same commit) counts.
                   restored = finding_from_thread(t, None, entry.get("path"))
+                  if restored is not None and entry.get("cid"):
+                      # The thread shows PR-Agent's rewritten text (suggestion fences become text fences); the
+                      # original hash is what its remembered dismissal was keyed by.
+                      restored["content_id"] = entry["cid"]
                   if restored is not None:
                       previous.append(restored)
                       restored_ids.append(restored["id"])
@@ -1403,6 +1416,9 @@ jobs:
                                                                           occurrence_since, dismissed_ids)
                   to_verify += [f for f in findings if f["id"] in (plan_result.get("retry_ids") or []) + restored_ids
                                 and f["state"] == "ACTIVE" and f not in to_verify]
+                  # A finding is verified once per run: one in to_verify is not also checked in the cross-file batch.
+                  queued = {id(f) for f in to_verify}
+                  elsewhere = [f for f in elsewhere if id(f) not in queued]
               else:
                   try:
                       review = run_review(plan_result, pr_paths, user_globs, model, keys)
