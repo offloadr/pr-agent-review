@@ -42,6 +42,12 @@ def thread(tid, path, body, resolved=False, last_comment_at="2000-01-01T00:00:00
             "last_comment_at": last_comment_at}
 
 
+def current(t):
+    """Mark a thread as posted for the finding's current occurrence (after the previous save)."""
+    t["created_at"] = "9999-01-01T00:00:00Z"
+    return t
+
+
 def posted(tid, path, header, content, resolved=False, last_comment_at="2000-01-01T00:00:00Z"):
     """An inline thread as PR-Agent posts it, with its dedup marker."""
     marker = f"<!-- pr-agent-dedup: {cp.inline_fingerprint(path, header, content)} -->"
@@ -77,6 +83,8 @@ class FakeGitHub:
         return self.compares.get((base, head))
 
     def is_binary(self, repo, path, ref):
+        if (path, ref) in getattr(self, "binary_at", {}):
+            return self.binary_at[(path, ref)]
         return path in getattr(self, "binary", set())
 
     def file_at(self, repo, path, ref):
@@ -1080,6 +1088,17 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual((code, calls[0]["files"]), (0, ["assets/image"]))
         self.assertEqual(github.state()["head_sha"], B)
 
+    def test_deleting_a_binary_file_counts_as_nothing_to_review(self):
+        github = FakeGitHub(A, ["x.py", "assets/image"])
+        run_review(github, A, review())
+        github.files = [{"filename": "x.py", "patch": "@@"}, {"filename": "assets/image", "status": "removed"}]
+        github.contents[("assets/image", B)] = None  # Gone at the head.
+        github.binary_at = {("assets/image", A): True, ("assets/image", B): False}
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "assets/image", "status": "removed"}]}
+        code, _, _ = run_review(github, B, cp.NoReviewOutput("PR-Agent produced no review output."))
+        self.assertEqual((code, github.state()["head_sha"]), (0, B))
+
     def test_large_text_file_without_a_patch_is_not_nothing_to_review(self):
         github = FakeGitHub(A, ["x.py", "big.py"])
         run_review(github, A, review())
@@ -1558,7 +1577,7 @@ class GateTests(unittest.TestCase):
 
     def test_open_finding_fails_and_resolved_threads_dismiss_it(self):
         github = self.reviewed(issue("x.py", "Possible bug", "Two saves interleave."))
-        github.threads = [posted("T1", "x.py", "Possible Issue", "Two saves interleave.")]
+        github.threads = [current(posted("T1", "x.py", "Possible Issue", "Two saves interleave."))]
         code, output = self.gate(github)
         self.assertEqual(code, 1)
         self.assertIn("(https://example/T1) Possible Issue: Two saves interleave.", output)
@@ -1583,7 +1602,7 @@ class GateTests(unittest.TestCase):
         stored = github.state()["findings"]
         self.assertEqual(stored[0]["content"], stored[1]["content"])
         # Only the first was posted inline, and that thread was resolved; the second is summary-only.
-        github.threads = [posted("T_old", "x.py", "Race", shared + " on create.", resolved=True)]
+        github.threads = [current(posted("T_old", "x.py", "Race", shared + " on create.", resolved=True))]
         code, output = self.gate(github)
         self.assertEqual(code, 1)
         self.assertIn("1 open PR-Agent finding", output)
@@ -1735,6 +1754,19 @@ class GateTests(unittest.TestCase):
         github.threads = [attempt_thread]
         self.assertEqual(self.gate(github, head=C)[0], 0)
 
+    def test_new_finding_is_not_dismissed_by_a_thread_from_an_evicted_earlier_occurrence(self):
+        github = self.reviewed()
+        state = github.state()
+        state["fixed_ids"], state["history_trimmed"] = [], True  # Its fixed history was evicted.
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]  # Old, resolved.
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review({"relevant_file": "x.py", "issue_header": "Race",
+                                      "issue_content": "Two saves interleave."}))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+        self.assertEqual(self.gate(github, head=B)[0], 1)
+
     def test_reintroduction_is_recognized_after_its_pruned_record_is_gone(self):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
         state = github.state()
@@ -1838,7 +1870,7 @@ class GateTests(unittest.TestCase):
             still = {f["id"]: "still_present" for f in (github.state() or {}).get("findings", [])}
             code, _, _ = run_review(github, head, review(*[issue(p, "Bug", c) for p, c in contents]), verdicts=still)
             self.assertEqual(code, 0, round_number)
-            threads += [posted(f"T{round_number}-{p}", p, "Bug", c, resolved=True) for p, c in contents]
+            threads += [current(posted(f"T{round_number}-{p}", p, "Bug", c, resolved=True)) for p, c in contents]
             github.threads = threads
             previous = head
         state = github.state()
@@ -2006,7 +2038,7 @@ class GateTests(unittest.TestCase):
 
     def test_dismissal_withdrawn_after_the_fixing_push_is_verified_on_a_rerun(self):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
-        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        github.threads = [current(posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True))]
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
         run_review(github, B, review())  # Still dismissed, so the fix is not verified.
@@ -2019,7 +2051,7 @@ class GateTests(unittest.TestCase):
 
     def test_withdrawn_dismissal_is_verified_by_the_push_that_fixes_it(self):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
-        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        github.threads = [current(posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True))]
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "y.py"}]}
         run_review(github, B, review())
@@ -2187,7 +2219,7 @@ class GateTests(unittest.TestCase):
 
     def test_dismissed_finding_stays_dismissed_when_raised_again_and_reopens_when_unresolved(self):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
-        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        github.threads = [current(posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True))]
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
         run_review(github, B, review(issue("x.py", "Race", "Two saves interleave.")))

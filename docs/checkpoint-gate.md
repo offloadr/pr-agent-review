@@ -74,7 +74,7 @@ covers everything since the last saved checkpoint.
 
 Reads the checkpoint and fails unless it is for the current head. An active finding blocks until
 it is verified fixed or every inline thread posting it is resolved (a reviewer dismissing it). A
-finding raised again after it was fixed, even after its record was pruned, is dismissed only by
+new finding, or one raised again after it was fixed (even after its record was pruned), is dismissed only by
 resolving a thread opened since it came back, or by a resolved thread whose latest comment, written
 since then by an owner, member or collaborator, starts with `/dismiss`. GitHub does not report when a
 thread was resolved, so an old resolution or a plain later reply is no evidence. A finding keeps every thread identity it was

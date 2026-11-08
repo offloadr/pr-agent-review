@@ -825,6 +825,11 @@ jobs:
               # from); verdicts are keyed by id, so it gets its own.
               taken = {f["id"] for f in merged}
               for new in raised_by_id.values():
+                  if not new.get("reopened_at"):
+                      # A new finding is timed like a reintroduction: a thread resolved before the previous
+                      # checkpoint was saved belonged to an earlier occurrence, even one whose history was
+                      # trimmed, so it cannot dismiss this one. The thread PR-Agent posts now still can.
+                      reopen(new, started_at)
                   if new["id"] in taken:
                       new["id"] = hashlib.sha256(f"{new['id']}\n{head_sha}\n{new['path']}".encode()).hexdigest()[:12]
                       # Its threads' fingerprint is the older finding's, so their resolutions belong to that one.
@@ -1428,7 +1433,9 @@ jobs:
                       # GitHub patch, but PR-Agent fetches those itself, so this applies only when it produced
                       # nothing at all.
                       if plan_result["mode"] != "delta" or any(pr_patches.get(p) for p in plan_result["files"]) or \
-                              not all(github.is_binary(repo, p, head_sha) for p in plan_result["files"]):
+                              not all(github.is_binary(repo, p, head_sha) or (
+                                  github.file_at(repo, p, head_sha) is None and checkpoint is not None
+                                  and github.is_binary(repo, p, checkpoint["head_sha"])) for p in plan_result["files"]):
                           raise  # A large text file also lacks a GitHub patch; only binary content is nothing to review.
                       out("PR-Agent found nothing to review in the changed files (no text diff).")
                       review = {"key_issues_to_review": [], "security_concerns": "No", "no_text_diff": True}
