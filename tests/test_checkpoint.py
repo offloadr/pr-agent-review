@@ -1476,6 +1476,66 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(any("fixed earlier" in p for p in prompts))
         self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
 
+    def footer_for(self, github, head, listing):
+        original = github.comments
+
+        def with_footer(repo, pr):
+            listed = original(repo, pr)
+            if github.heads != [head]:
+                return listed
+            return listed + [{"user": {"login": "github-actions[bot]"}, "updated_at": "9999-01-01T00:00:00Z",
+                              "body": "<!-- pr-agent:review:full -->\n⚠️ **Review coverage:** The following files were "
+                                      "not included in this review because of the token budget:\n" + listing}]
+        github.comments = with_footer
+
+    def own_file_fixed(self):
+        github = FakeGitHub(A, ["x.py", "y.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        race = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+        run_review(github, B, review(), verdicts={race: "fixed"})
+        return github, race
+
+    def test_fixed_file_among_unnamed_coverage_gaps_is_rechecked(self):
+        github, race = self.own_file_fixed()
+        self.footer_for(github, C, "- `y.py`\n... and 3 more")
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "-lock"}]}
+        prompts = []
+        run_review(github, C, review(), verdicts={race: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
+    def test_pruned_own_file_fix_skipped_for_the_token_budget_is_rechecked(self):
+        github, race = self.own_file_fixed()
+        state = github.state()
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 50
+        try:
+            checkpoint_comment(github)["body"] = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertEqual(github.state()["findings"], [])
+        self.footer_for(github, C, "- `x.py`")
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "-lock"}]}
+        prompts = []
+        run_review(github, C, review(), verdicts={race: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
+    def test_verifier_gets_the_real_diff_after_a_diverged_force_push(self):
+        github = FakeGitHub(A, ["x.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "diverged", "files": []}  # GitHub compares from the merge base.
+        github.contents[("x.py", A)] = "save()\n"
+        github.contents[("x.py", B)] = "with lock:\n    save()\n"
+        prompts = []
+        run_review(github, B, review(), prompts=prompts)
+        x_prompt = next(p for p in prompts if p.startswith("File: x.py"))
+        self.assertIn("+with lock:", x_prompt)
+
     def test_fix_dependencies_follow_renames(self):
         github, null = self.helper_fixed()
         github.files = [{"filename": "caller.py", "patch": "@@"}, {"filename": "utils.py", "patch": "@@"}]
