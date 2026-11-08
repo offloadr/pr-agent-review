@@ -796,7 +796,8 @@ jobs:
                   elif f["state"] == "FIXED" and (
                           (f.get("fix_files") and (set(f["fix_files"]) & changed or plan_result.get("renames_complete") is False))
                           or ((f["path"] in changed or plan_result.get("renames_complete") is False)
-                              and f["path"] not in (plan_result.get("pr_paths") or {f["path"]}))):
+                              and (f["path"] not in (plan_result.get("pr_paths") or {f["path"]})
+                                   or f["path"] in (plan_result.get("unreviewable") or ())))):
                       # With a capped comparison, a changed dependency may be missing from the list. A finding whose
                       # own file was reverted out of the pull request gets no delta review, so it is rechecked too.
                       # A push touching the files that showed the fix may have undone it, even with nothing for
@@ -1141,10 +1142,11 @@ jobs:
 
 
           def normalize_path(path):
-              """A repository-relative path as GitHub reports it: no ./ prefix, leading slash or doubled separators."""
-              import posixpath
-              normal = posixpath.normpath(path.strip().replace("\\", "/")).lstrip("/")
-              return "" if normal == "." else normal
+              """A repository-relative path as GitHub reports it: without ./ prefixes or a leading slash. Spaces
+              and backslashes are kept, since they can be part of a real file name."""
+              while path.startswith("./"):
+                  path = path[2:]
+              return path.lstrip("/")
 
 
           def relied_on(answer):
@@ -1301,6 +1303,9 @@ jobs:
                   raise RunFailed("GitHub did not report a merge base for the pull request.")
               plan_result = plan(checkpoint, head_sha, base_ref, merge_base, pr_paths, compare, user_globs)
               plan_result["pr_paths"] = pr_paths
+              # PR files no review reads (minified, lockfiles, binaries, the caller's ignore globs): a change to
+              # one undoes nothing PR-Agent would see.
+              plan_result["unreviewable"] = {p for p in pr_paths if not reviewable(p) or ignored_by(p, user_globs)}
               out(f"Plan: {plan_result['mode']} ({plan_result['reason']}); {len(plan_result['files'])} file(s).")
               if plan_result["mode"] == "none" and checkpoint["head_sha"] == head_sha:
                   retry_ids = [f["id"] for f in checkpoint.get("findings") or [] if f["state"] == "ACTIVE"
@@ -1339,7 +1344,9 @@ jobs:
               changed_now = set(plan_result.get("changed") or plan_result.get("files") or [])
               fixed_deps, fixed_own = [], []
               for own in (checkpoint or {}).get("fixed_own") or []:
-                  reverted = (own["path"] in changed_now or plan_result.get("renames_complete") is False) and own["path"] not in pr_paths
+                  own_path = renames.get(own["path"], own["path"])
+                  reverted = (own_path in changed_now or plan_result.get("renames_complete") is False) and \
+                      (own_path not in pr_paths or own_path in plan_result["unreviewable"])
                   if reverted and not any(f["id"] == own["id"] for f in previous):
                       previous.append({"id": own["id"], "path": own["path"], "header": own["header"], "content": own["content"],
                                        "content_id": own.get("content_id"), "threads": own.get("threads") or [],

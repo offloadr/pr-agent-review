@@ -1332,6 +1332,40 @@ class ReviewTests(unittest.TestCase):
         run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts)
         self.assertTrue(any("fixed earlier" in p for p in prompts))
 
+    def test_dependency_with_a_trailing_space_keeps_its_exact_name(self):
+        self.assertEqual(cp.normalize_path("./helper.py "), "helper.py ")
+        self.assertEqual(cp.normalize_path("src\\a.py"), "src\\a.py")
+        github = FakeGitHub(A, ["caller.py", "helper.py "])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        null = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "helper.py ", "patch": "+    return ''"}]}
+        run_review(github, B, review(), verdicts={null: "fixed"}, relies={null: ["helper.py "]})
+        self.assertEqual(github.state()["findings"][0]["fix_files"], ["helper.py "])
+        github.files = [{"filename": "caller.py", "patch": "@@"}]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "helper.py ", "patch": "-    return ''"}]}
+        prompts = []
+        run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+
+    def test_own_file_fix_renamed_to_an_unreviewed_file_is_rechecked(self):
+        github = FakeGitHub(A, ["app.js"])
+        run_review(github, A, review(issue("app.js", "Null", "render() reads a missing key.")))
+        null = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "app.js", "patch": "+guard"}]}
+        run_review(github, B, review(), verdicts={null: "fixed"})
+        github.files = [{"filename": "app.min.js", "patch": "@@"}]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [
+            {"filename": "app.min.js", "previous_filename": "app.js", "status": "renamed", "patch": "-guard"}]}
+        prompts = []
+        _, calls, _ = run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts)
+        self.assertEqual(calls, [])  # The minified file is not reviewed.
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
     def test_binary_only_push_leaves_no_coverage_gap(self):
         github = FakeGitHub(A, ["x.py", "assets/image"])
         run_review(github, A, review())
