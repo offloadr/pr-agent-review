@@ -185,6 +185,10 @@ jobs:
           # Above this many PR files outside the delta, the ignore list gets unwieldy; review in full.
           MAX_IGNORED_FILES = 200
           MAX_IGNORE_CHARS = 64_000
+          # Files rebuilt by hand after a force-push, where GitHub's comparison starts at the merge base.
+          FORCE_PUSH_FILES = 60
+          # Waits before retrying Flex when it has no capacity, before falling back to the standard tier.
+          FLEX_BACKOFF = (30, 60, 120)
           PR_AGENT = ["/app/.venv/bin/python", "/app/pr_agent/servers/github_action_runner.py"]
           VERDICTS = ("fixed", "still_present", "uncertain")
           FILE_CONTEXT_CHARS = 150_000
@@ -827,7 +831,8 @@ jobs:
               # from); verdicts are keyed by id, so it gets its own.
               taken = {f["id"] for f in merged}
               for new in raised_by_id.values():
-                  if not new.get("reopened_at"):
+                  if not new.get("reopened_at") and new["state"] != "DISMISSED":
+                      # A remembered dismissal is not a new occurrence, so its original thread still counts.
                       # A new finding is timed like a reintroduction: a thread resolved before the previous
                       # checkpoint was saved belonged to an earlier occurrence, even one whose history was
                       # trimmed, so it cannot dismiss this one. The thread PR-Agent posts now still can.
@@ -998,7 +1003,8 @@ jobs:
               if tier and (tier != "flex" or supports_flex(model)):
                   body["service_tier"] = tier
               headers = {"Authorization": f"Bearer {keys['openai']}", "Content-Type": "application/json"}
-              for _ in range(3):
+              flex_waits = 0
+              for _ in range(3 + len(FLEX_BACKOFF)):
                   request = urllib.request.Request("https://api.openai.com/v1/responses", data=json.dumps(body).encode(),
                                                    method="POST", headers=headers)
                   try:
@@ -1007,8 +1013,12 @@ jobs:
                   except urllib.error.HTTPError as error:
                       detail = error.read().decode(errors="replace")
                       error.close()
-                      if "service_tier" in body and ((error.code == 429 and FLEX_UNAVAILABLE in detail)
-                                                     or (error.code == 400 and "service_tier" in detail)):
+                      if "service_tier" in body and error.code == 429 and FLEX_UNAVAILABLE in detail and \
+                              flex_waits < len(FLEX_BACKOFF):
+                          time.sleep(FLEX_BACKOFF[flex_waits])  # Wait and try Flex again first.
+                          flex_waits += 1
+                      elif "service_tier" in body and ((error.code == 429 and FLEX_UNAVAILABLE in detail)
+                                                       or (error.code == 400 and "service_tier" in detail)):
                           body.pop("service_tier")  # Flex has no capacity or is not offered for this model.
                       elif "reasoning" in body and error.code == 400 and "reasoning" in detail:
                           body.pop("reasoning")  # The model rejects this effort; let it use its own default.
@@ -1052,7 +1062,8 @@ jobs:
                                                method="POST", headers={"Authorization": f"Bearer {keys['openai']}",
                                                                        "Content-Type": "application/json"})
               headers = dict(request.header_items())
-              for _ in range(3):
+              flex_waits = 0
+              for _ in range(3 + len(FLEX_BACKOFF)):
                   try:
                       result = json.loads(send(request, timeout=900 if "service_tier" in body else 600)[0])
                       break
@@ -1062,7 +1073,11 @@ jobs:
                       if error.code in (400, 404) and "v1/responses" in detail:
                           # Chat Completions does not serve this model; the Responses API does.
                           return call_responses(model, effort, tier if "service_tier" in body else "", prompt, keys)
-                      if "service_tier" in body and (
+                      if "service_tier" in body and error.code == 429 and FLEX_UNAVAILABLE in detail and \
+                              flex_waits < len(FLEX_BACKOFF):
+                          time.sleep(FLEX_BACKOFF[flex_waits])  # Wait and try Flex again first.
+                          flex_waits += 1
+                      elif "service_tier" in body and (
                               (error.code == 429 and FLEX_UNAVAILABLE in detail) or (error.code == 400 and "service_tier" in detail)):
                           body.pop("service_tier")  # Flex has no capacity or is not offered for this model: standard tier.
                       elif error.code == 400 and "reasoning_effort" in body and "reasoning_effort" in detail:
@@ -1277,6 +1292,18 @@ jobs:
                       # Earlier chunks may already have been billed, so this run does not start over by itself.
                       raise RunFailed("Flex ran out of capacity partway through a chunked review. Re-running the job "
                                       "reviews again from the start, so its completed chunks are paid for again.")
+                  for wait in FLEX_BACKOFF:
+                      # Flex refused a single-call review before any model output, so waiting and retrying Flex
+                      # costs nothing; OpenAI suggests backing off for this error.
+                      if code == 0 or FLEX_UNAVAILABLE not in log or "LITELLM.EXTRA_BODY" not in env:
+                          break
+                      print(f"Flex has no capacity right now; retrying Flex in {wait} seconds.", flush=True)
+                      time.sleep(wait)
+                      open(output_path, "w").close()
+                      code, log, chunks = run_streaming(PR_AGENT, env)
+                      if code != 0 and chunks > 1 and flex_refused(log):
+                          raise RunFailed("Flex ran out of capacity partway through a chunked review. Re-running the job "
+                                          "reviews again from the start, so its completed chunks are paid for again.")
                   if code != 0 and "LITELLM.EXTRA_BODY" in env and flex_refused(log):
                       # A single-call review that Flex refused produced no model output, so the retry is not
                       # billed twice.
@@ -1546,8 +1573,24 @@ jobs:
                       if base and base != head_sha:
                           comparison = compare(base, head_sha)
                           if comparison is not None:
-                              return comparison.get("files") or []
+                              if comparison.get("status") in ("ahead", "identical"):
+                                  return comparison.get("files") or []
+                              return changes_between(base, comparison)
                   return []
+
+              def changes_between(base, comparison):
+                  """After a force-push GitHub compares from the merge base, so the files that really differ
+                  between base and head are rebuilt from both sides of it, each diffed between its versions."""
+                  names = {f["filename"] for f in comparison.get("files") or []}
+                  names |= {f["filename"] for f in (compare(head_sha, base) or {}).get("files") or []}
+                  files = []
+                  for name in sorted(names)[:FORCE_PUSH_FILES]:
+                      old, new = github.file_at(repo, name, base), github.file_at(repo, name, head_sha)
+                      if old != new:
+                          files.append({"filename": name, "patch": "".join(difflib.unified_diff(
+                              (old or "").splitlines(keepends=True), (new or "").splitlines(keepends=True),
+                              f"a/{name}", f"b/{name}"))})
+                  return files
 
               if to_verify:
                   usage = verify(to_verify, head_sha, read_file, read_diff, ask, changes_since)

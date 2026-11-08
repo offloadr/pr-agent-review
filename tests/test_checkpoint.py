@@ -27,6 +27,7 @@ def load_script():
 
 
 cp = load_script()
+cp.FLEX_BACKOFF = (0, 0, 0)  # No real waiting in tests.
 
 
 def issue(path, header, content, line=10):
@@ -356,7 +357,28 @@ class VerifierFallbackTests(unittest.TestCase):
         finally:
             cp.send = saved
         self.assertEqual(answer, {"verdicts": []})
-        self.assertEqual(["service_tier" in b for b in bodies], [True, False])
+        # Flex is retried with backoff before the standard tier.
+        self.assertEqual(["service_tier" in b for b in bodies], [True] * (1 + len(cp.FLEX_BACKOFF)) + [False])
+
+    def test_flex_that_frees_up_on_a_retry_stays_on_flex(self):
+        import io
+        import os
+        import urllib.error
+        bodies = []
+
+        def fake_send(request, timeout, attempts=3):
+            bodies.append(json.loads(request.data))
+            if len(bodies) == 1:
+                raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {},
+                                             io.BytesIO(b'{"error": "Flex does not have sufficient resources available"}'))
+            return json.dumps({"choices": [{"message": {"content": '{"verdicts": []}'}}]}).encode(), {}
+        saved, cp.send = cp.send, fake_send
+        os.environ["SERVICE_TIER"] = "flex"
+        try:
+            cp.call_model("gpt-6.1-sol", "medium", "prompt", {"openai": "k"})
+        finally:
+            cp.send = saved
+        self.assertEqual(["service_tier" in b for b in bodies], [True, True])
 
 
 class ResponsesFlexTests(unittest.TestCase):
@@ -379,7 +401,7 @@ class ResponsesFlexTests(unittest.TestCase):
         finally:
             cp.send = saved
         self.assertEqual(answer, {"verdicts": []})
-        self.assertEqual(["service_tier" in b for b in bodies], [True, False])
+        self.assertEqual(["service_tier" in b for b in bodies], [True] * (1 + len(cp.FLEX_BACKOFF)) + [False])
 
 
 class VerifierEffortTests(unittest.TestCase):
@@ -1536,6 +1558,19 @@ class ReviewTests(unittest.TestCase):
         x_prompt = next(p for p in prompts if p.startswith("File: x.py"))
         self.assertIn("+with lock:", x_prompt)
 
+    def test_cross_file_evidence_after_a_diverged_force_push_is_the_real_change(self):
+        github = FakeGitHub(A, ["caller.py", "helper.py"])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        github.heads = [B]
+        # Force-pushed: GitHub compares from the merge base, which hides what changed in helper.py.
+        github.compares[(A, B)] = {"status": "diverged", "files": [{"filename": "caller.py"}]}
+        github.compares[(B, A)] = {"status": "diverged", "files": [{"filename": "helper.py"}]}
+        github.contents[("helper.py", A)] = "return None\n"
+        github.contents[("helper.py", B)] = "return ''\n"
+        prompts = []
+        run_review(github, B, review(), prompts=prompts)
+        self.assertTrue(any("+return ''" in p and "-return None" in p for p in prompts))
+
     def test_fix_dependencies_follow_renames(self):
         github, null = self.helper_fixed()
         github.files = [{"filename": "caller.py", "patch": "@@"}, {"filename": "utils.py", "patch": "@@"}]
@@ -1582,13 +1617,18 @@ class PrAgentProcessTests(unittest.TestCase):
         import sys
         import tempfile
         probe = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+        runs = probe.name + ".runs"
         probe.write(textwrap.dedent(f"""
             import json, os
+            with open({runs!r}, "a") as count:
+                count.write("run\\n")
+            with open({runs!r}) as count:
+                run = len(count.read().split())
             seen = {{k: os.environ.get(k) for k in ("OPENAI_KEY", "ANTHROPIC_KEY", "ANTHROPIC.KEY", "IGNORE.GLOB", "LITELLM.EXTRA_BODY",
                                                      "PR_REVIEWER.PERSISTENT_FINDING_STATE", "PR_REVIEWER.PERSISTENT_COMMENT")}}
             if {chunked!r}:
                 print("Number of PR chunk calls: 2")
-            if {flex_busy!r} and os.environ.get("LITELLM.EXTRA_BODY"):
+            if run <= {int(flex_busy) if flex_busy is not True else 99} and os.environ.get("LITELLM.EXTRA_BODY"):
                 print("RateLimitError: Flex does not have sufficient resources available")
                 raise SystemExit(1)
             if {write_review!r}:
@@ -1605,6 +1645,8 @@ class PrAgentProcessTests(unittest.TestCase):
         finally:
             cp.PR_AGENT = saved
             os.unlink(probe.name)
+            if os.path.exists(runs):
+                os.unlink(runs)
 
     def test_delta_run_ignores_other_files_and_gets_only_its_providers_key(self):
         result = self.run_with("anthropic/claude-opus-5-5", {"anthropic": "a-key", "openai": "o-key"},
@@ -1633,6 +1675,11 @@ class PrAgentProcessTests(unittest.TestCase):
         seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
                              {"mode": "full", "files": ["x.py"]}, {"x.py"}, flex_busy=True)["seen"]
         self.assertIsNone(seen["LITELLM.EXTRA_BODY"])
+
+    def test_flex_that_frees_up_on_a_retry_reviews_on_flex(self):
+        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                             {"mode": "full", "files": ["x.py"]}, {"x.py"}, flex_busy=2)["seen"]
+        self.assertEqual(json.loads(seen["LITELLM.EXTRA_BODY"]), {"service_tier": "flex"})
 
     def test_chunked_review_is_not_rerun_after_flex_runs_out(self):
         with self.assertRaises(cp.RunFailed) as failure:
@@ -2090,6 +2137,26 @@ class GateTests(unittest.TestCase):
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": new, "previous_filename": old, "status": "renamed"}]}
         run_review(github, B, review(issue(new, "Race", "Two saves interleave.")))
         self.assertEqual(github.state()["findings"][0]["state"], "DISMISSED")
+
+    def test_remembered_dismissal_keeps_its_original_thread(self):
+        github = self.reviewed()
+        state = github.state()
+        state["dismissed_ids"] = [cp.dismissed_key({"path": "x.py", "content_id": cp.content_id("Race", "Two saves interleave.")})]
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]  # The original thread.
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py"}]}
+        run_review(github, B, review(issue("x.py", "Race", "Two saves interleave.")))
+        finding = github.state()["findings"][0]
+        self.assertEqual(finding["state"], "DISMISSED")
+        self.assertFalse(finding.get("reopened_at"))
+        github.threads[0]["resolved"] = False  # Withdrawn, then resolved again: dismissed again.
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "y.py"}]}
+        run_review(github, C, review())
+        self.assertEqual(self.gate(github, head=C)[0], 1)
+        github.threads[0]["resolved"] = True
+        self.assertEqual(self.gate(github, head=C)[0], 0)
 
     def test_pruned_dismissal_follows_a_rename(self):
         github = self.reviewed()
