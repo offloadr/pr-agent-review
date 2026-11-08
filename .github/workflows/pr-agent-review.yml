@@ -1459,9 +1459,11 @@ jobs:
                       fixed_own.append(dict(own, path=renames.get(own["path"], own["path"])))
               for dep in (checkpoint or {}).get("fixed_deps") or []:
                   capped = plan_result.get("renames_complete") is False
-                  # Its own file changed without any review reading it: reverted out of the PR, or excluded.
-                  own_file_reverted = dep["path"] in changed_now and (
-                      dep["path"] not in pr_paths or dep["path"] in plan_result["unreviewable"])
+                  # Its own file changed without any review reading it: reverted out of the PR, or excluded. A
+                  # renamed file is judged at its new path (moved into an ignored directory, say).
+                  dep_path = renames.get(dep["path"], dep["path"])
+                  own_file_reverted = dep_path in changed_now and (
+                      dep_path not in pr_paths or dep_path in plan_result["unreviewable"])
                   if (set(dep.get("fix_files") or []) & changed_now or capped or own_file_reverted) \
                           and not any(f["id"] == dep["id"] for f in previous):
                       previous.append({"id": dep["id"], "path": dep["path"], "header": dep["header"], "content": dep["content"],
@@ -1626,13 +1628,19 @@ jobs:
               # A finding whose file vanished in a push too large to list every rename may live on under another
               # name; a missing file is then no evidence of a fix. It stays open without asking the verifier, on
               # this run and later ones (reruns included), until its file is back or a review raises it again.
-              for queue in (to_verify, elsewhere):
+              for queue in (to_verify, elsewhere, recheck):
                   for f in list(queue):
                       if plan_result.get("renames_complete") is False or f.get("rename_unknown"):
                           if file_at(f["path"], head_sha) is None:
                               f["rename_unknown"] = True
                               f["check"] = {"verdict": "uncertain", "sha": head_sha,
                                             "reason": "the file is gone and the push was too large to see whether it was renamed"}
+                              if f["state"] == "FIXED":
+                                  # The fix may have moved with the file and been undone there, so it is open again,
+                                  # and the threads resolved for the fix do not dismiss it.
+                                  f["state"] = "ACTIVE"
+                                  reopen(f, occurrence_since)
+                                  out(f"- reopened: {f['path']} {f['header']} (its file is gone; a rename could not be ruled out)")
                               queue.remove(f)
                           else:
                               f.pop("rename_unknown", None)

@@ -1731,6 +1731,37 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
 
+    def test_pruned_helper_backed_fix_moved_into_an_ignored_directory_is_rechecked(self):
+        globs = ("vendor/**",)
+        github = FakeGitHub(A, ["caller.py", "helper.py"])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")), globs=globs)
+        null = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "+    return ''"}]}
+        run_review(github, B, review(), verdicts={null: "fixed"}, relies={null: ["helper.py"]}, globs=globs)
+        self.prune_helper_fix(github)
+        # caller.py moves into the ignored directory, losing its guard, and a new caller.py takes its place.
+        github.files = [{"filename": f, "patch": "@@"} for f in ("caller.py", "vendor/caller.py", "helper.py")]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [
+            {"filename": "vendor/caller.py", "previous_filename": "caller.py", "status": "renamed"},
+            {"filename": "caller.py", "status": "added", "patch": "+other"}]}
+        prompts = []
+        run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts, globs=globs)
+        moved = [f for f in github.state()["findings"] if f["id"] == null]
+        self.assertEqual([(f["path"], f["state"]) for f in moved], [("vendor/caller.py", "ACTIVE")])
+
+    def test_fixed_finding_whose_file_vanished_in_a_capped_push_reopens(self):
+        github, race = self.own_file_fixed()
+        github.files = [{"filename": f"f{i}.py", "patch": "@@"} for i in range(300)]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": f"f{i}.py"} for i in range(300)]}
+        github.contents[("x.py", C)] = None  # Gone, or renamed beyond the listed files.
+        run_review(github, C, review(), verdicts={race: "fixed"})
+        finding = github.state()["findings"][0]
+        self.assertEqual((finding["state"], finding["check"]["verdict"]), ("ACTIVE", "uncertain"))
+        self.assertEqual(cp.gate_main(github, "o/r", "1", C, out=lambda _: None, sleep=lambda _: None), 1)
+
     def test_fix_dependencies_follow_renames(self):
         github, null = self.helper_fixed()
         github.files = [{"filename": "caller.py", "patch": "@@"}, {"filename": "utils.py", "patch": "@@"}]
