@@ -211,6 +211,9 @@ jobs:
           GENERATED_SUFFIXES = (".min.js", ".min.css", ".js.map", ".ts.map", ".css.map")
           # OpenAI's answer when Flex has no capacity; the request then goes to the standard tier instead.
           FLEX_UNAVAILABLE = "Flex does not have sufficient resources"
+          # A ceiling on each verifier call's output, reasoning included, so one call cannot run up the bill. A
+          # verdict list needs a small fraction of it; an answer cut off at the limit fails the run.
+          VERIFIER_MAX_OUTPUT_TOKENS = 16_000
           # read_diff's answer when no comparison reaches the commit a finding was checked on.
           RANGE_UNAVAILABLE = object()
           SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
@@ -503,6 +506,9 @@ jobs:
                       # budget and can be trimmed.
                       record = {"id": pruned["id"], "path": pruned["path"], "header": pruned["header"][:80],
                                 "content_id": pruned.get("content_id"), "threads": identities(pruned)}
+                      # One compact record per finding: a newer prune replaces an older record of it.
+                      for name in ("fixed_deps", "fixed_own"):
+                          state[name] = [r for r in state.get(name) or [] if r["id"] != pruned["id"]]
                       if pruned.get("fix_files"):
                           state.setdefault("fixed_deps", []).append(dict(record, content=pruned["content"][:200],
                                                                            fix_files=pruned["fix_files"]))
@@ -756,7 +762,7 @@ jobs:
 
 
           def merge_findings(previous, raised, plan_result, head_sha, pruned=(), fixed_ids=(), started_at=None,
-                             dismissed_ids=()):
+                             dismissed_ids=(), compact=()):
               """Combine earlier findings with this run's.
 
               Returns (findings, the earlier ones to verify against their own file's changes, the pruned records
@@ -830,8 +836,10 @@ jobs:
                   elif (new["id"] in fixed_ids or current_key(new) in fixed_ids) and not new.get("reopened_at"):
                       reopen(new, started_at)
               # A new finding can share an id with a retained one (same text at a path a renamed finding came
-              # from); verdicts are keyed by id, so it gets its own.
+              # from); verdicts are keyed by id, so it gets its own. So can a compact fixed record that followed a
+              # rename: raised at the record's current path it is that finding again, elsewhere a different one.
               taken = {f["id"] for f in merged}
+              compact_paths = {r["id"]: r["path"] for r in compact}
               for new in raised_by_id.values():
                   if not new.get("reopened_at") and new["state"] != "DISMISSED":
                       # A remembered dismissal is not a new occurrence, so its original thread still counts.
@@ -839,7 +847,7 @@ jobs:
                       # checkpoint was saved belonged to an earlier occurrence, even one whose history was
                       # trimmed, so it cannot dismiss this one. The thread PR-Agent posts now still can.
                       reopen(new, started_at)
-                  if new["id"] in taken:
+                  if new["id"] in taken or compact_paths.get(new["id"], new["path"]) != new["path"]:
                       new["id"] = hashlib.sha256(f"{new['id']}\n{head_sha}\n{new['path']}".encode()).hexdigest()[:12]
                       # Its threads' fingerprint is the older finding's, so their resolutions belong to that one.
                       if not new.get("reopened_at"):
@@ -982,7 +990,8 @@ jobs:
               body = {"model": model.removeprefix("openai/"),
                       "messages": [{"role": "system", "content": VERIFIER_SYSTEM}, {"role": "user", "content": prompt}],
                       "response_format": {"type": "json_schema",
-                                          "json_schema": {"name": "verdicts", "strict": True, "schema": VERDICT_SCHEMA}}}
+                                          "json_schema": {"name": "verdicts", "strict": True, "schema": VERDICT_SCHEMA}},
+                      "max_completion_tokens": VERIFIER_MAX_OUTPUT_TOKENS}
               if effort and supports_reasoning_effort(model):
                   body["reasoning_effort"] = effort
               if tier and (tier != "flex" or supports_flex(model)):
@@ -998,7 +1007,8 @@ jobs:
           def call_responses(model, effort, tier, prompt, keys):
               """The verifier call on OpenAI's Responses API, for models Chat Completions does not serve."""
               body = {"model": model.removeprefix("openai/"), "instructions": VERIFIER_SYSTEM, "input": prompt,
-                      "text": {"format": {"type": "json_schema", "name": "verdicts", "strict": True, "schema": VERDICT_SCHEMA}}}
+                      "text": {"format": {"type": "json_schema", "name": "verdicts", "strict": True, "schema": VERDICT_SCHEMA}},
+                      "max_output_tokens": VERIFIER_MAX_OUTPUT_TOKENS}
               if effort and supports_reasoning_effort(model):
                   # The -pro models accept only high effort.
                   body["reasoning"] = {"effort": "high" if responses_only(model) else effort}
@@ -1044,7 +1054,7 @@ jobs:
           def call_model(model, effort, prompt, keys):
               """Ask the verifier model for verdicts; returns (parsed object, usage)."""
               if provider_of(model) == "anthropic":
-                  body = {"model": model.removeprefix("anthropic/"), "max_tokens": 8000, "system": VERIFIER_SYSTEM,
+                  body = {"model": model.removeprefix("anthropic/"), "max_tokens": VERIFIER_MAX_OUTPUT_TOKENS, "system": VERIFIER_SYSTEM,
                           "messages": [{"role": "user", "content": prompt}],
                           "tools": [{"name": "record_verdicts", "description": "Record one verdict per finding.",
                                      "input_schema": VERDICT_SCHEMA}],
@@ -1469,7 +1479,8 @@ jobs:
                   # Nothing to review, but a change can still fix a finding, for example by reverting its
                   # file out of the pull request.
                   findings, to_verify, pruned, elsewhere, recheck = merge_findings(previous, [], plan_result, head_sha, pruned, fixed_ids,
-                                                                          occurrence_since, dismissed_ids)
+                                                                          occurrence_since, dismissed_ids,
+                                                                          fixed_deps + fixed_own)
                   to_verify += [f for f in findings if f["id"] in (plan_result.get("retry_ids") or []) + restored_ids
                                 and f["state"] == "ACTIVE" and f not in to_verify]
                   # A finding is verified once per run: one in to_verify is not also checked in the cross-file batch.
@@ -1493,7 +1504,13 @@ jobs:
                   validate_review(review)
                   raised = findings_from_review(review, head_sha, pr_paths)
                   findings, to_verify, pruned, elsewhere, recheck = merge_findings(previous, raised, plan_result, head_sha, pruned,
-                                                                          fixed_ids, occurrence_since, dismissed_ids)
+                                                                          fixed_ids, occurrence_since, dismissed_ids,
+                                                                          fixed_deps + fixed_own)
+                  # A compact record whose finding was raised again is owned by that full record now; keeping both
+                  # would store a second copy when it is pruned again.
+                  owned = {(f["id"], f["path"]) for f in findings}
+                  fixed_deps[:] = [r for r in fixed_deps if (r["id"], r["path"]) not in owned]
+                  fixed_own[:] = [r for r in fixed_own if (r["id"], r["path"]) not in owned]
                   # GitHub can briefly serve the summary from before PR-Agent updated it, so wait for this run's.
                   # A run where PR-Agent reviewed nothing (no text diff) posts no summary and has no coverage.
                   for attempt in range(0 if review.get("no_text_diff") else 5):

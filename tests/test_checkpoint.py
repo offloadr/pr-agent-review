@@ -330,6 +330,10 @@ class VerifierRequestTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", body)
         self.assertNotIn("service_tier", body)
 
+    def test_verifier_output_is_bounded(self):
+        self.assertEqual(cp.openai_body("gpt-6.1-sol", "medium", "", "p")["max_completion_tokens"],
+                         cp.VERIFIER_MAX_OUTPUT_TOKENS)
+
     def test_service_tier_is_sent_when_set(self):
         self.assertEqual(cp.openai_body("gpt-6.1-sol", "", "flex", "p")["service_tier"], "flex")
         self.assertNotIn("service_tier", cp.openai_body("gpt-6.1-sol", "", "", "p"))
@@ -427,6 +431,9 @@ class VerifierEffortTests(unittest.TestCase):
 
     def test_pro_models_get_high_effort(self):
         self.assertEqual(self.capture("gpt-5-pro", "medium")[0]["reasoning"], {"effort": "high"})
+
+    def test_responses_output_is_bounded(self):
+        self.assertEqual(self.capture("gpt-5-pro", "medium")[0]["max_output_tokens"], cp.VERIFIER_MAX_OUTPUT_TOKENS)
 
     def test_rejected_effort_is_dropped_and_retried(self):
         bodies = self.capture("gpt-6.1-sol", "medium", reject_reasoning=True)
@@ -1632,6 +1639,49 @@ class ReviewTests(unittest.TestCase):
         run_review(github, B, review(), prompts=prompts)
         self.assertGreaterEqual(len([p for p in prompts if p.startswith("File:")]), 2)  # Two batches.
         self.assertEqual(len(fetched), len(set(fetched)))
+
+    def prune_helper_fix(self, github, path=None):
+        state = github.state()
+        record = state["findings"].pop()  # Pruned for size, as fit_comment would.
+        state["fixed_deps"] = [{"id": record["id"], "path": path or record["path"], "header": record["header"],
+                                "content": record["content"][:200], "content_id": record["content_id"],
+                                "fix_files": record["fix_files"], "threads": record["threads"]}]
+        state["fixed_ids"] = [record["id"]]
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+
+    def test_recreated_finding_at_a_pruned_moved_fixes_old_path_gets_its_own_id(self):
+        github, null = self.helper_fixed()
+        self.prune_helper_fix(github, path="moved.py")  # The fixed finding followed caller.py to moved.py.
+        github.files = [{"filename": f, "patch": "@@"} for f in ("caller.py", "moved.py", "helper.py")]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "caller.py", "patch": "+new"}]}
+        run_review(github, C, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        recreated = github.state()["findings"][0]
+        self.assertNotEqual(recreated["id"], null)
+        self.assertEqual(github.state()["fixed_deps"][0]["id"], null)
+        # Reverting the helper rechecks the moved fix, whatever happened to the recreated finding.
+        github.heads = ["d" * 40]
+        github.compares[(C, "d" * 40)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "-    return ''"}]}
+        run_review(github, "d" * 40, review(), verdicts={null: "still_present"})
+        moved = [f for f in github.state()["findings"] if f["id"] == null]
+        self.assertEqual([(f["path"], f["state"]) for f in moved], [("moved.py", "ACTIVE")])
+
+    def test_raising_a_pruned_fix_again_retires_its_compact_record(self):
+        github, null = self.helper_fixed()
+        self.prune_helper_fix(github)
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "caller.py", "patch": "+again"}]}
+        run_review(github, C, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        state = github.state()
+        self.assertEqual([(f["id"], f["state"]) for f in state["findings"]], [(null, "ACTIVE")])
+        self.assertEqual(state.get("fixed_deps") or [], [])
+
+    def test_pruning_a_finding_again_keeps_one_compact_record(self):
+        record = {"id": "1", "path": "caller.py", "header": "Null", "content": "old", "fix_files": ["helper.py"]}
+        state = {"head_sha": A, "findings": [dict(record, state="FIXED", content="x" * 70_000)],
+                 "security": {}, "runs": [], "fixed_deps": [record]}
+        cp.fit_comment(state)
+        self.assertEqual([r["id"] for r in state["fixed_deps"]], ["1"])
 
     def test_fix_dependencies_follow_renames(self):
         github, null = self.helper_fixed()
