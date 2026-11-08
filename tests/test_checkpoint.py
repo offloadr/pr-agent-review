@@ -1257,6 +1257,39 @@ class ReviewTests(unittest.TestCase):
                      {"id": "1", "verdict": "fixed", "reason": "r", "relies_on": [7]}):
             self.assertEqual(cp.parse_verdicts({"verdicts": [item]}, ["1"])["1"][0], "uncertain", item)
 
+    def test_fixed_finding_whose_file_is_reverted_out_of_the_pr_is_rechecked(self):
+        github = FakeGitHub(A, ["caller.py", "helper.py"])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        null = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "caller.py", "patch": "+if x:"}]}
+        run_review(github, B, review(), verdicts={null: "fixed"})  # Fixed in its own file.
+        github.files = [{"filename": "helper.py", "patch": "@@"}]  # caller.py reverted to its base version.
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "caller.py", "patch": "-if x:"}]}
+        prompts = []
+        run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
+    def test_rewind_to_before_a_fix_reopens_it_when_no_diff_can_be_shown(self):
+        github, null = self.helper_fixed()
+        github.heads = [A]  # Force-pushed back to the commit before the fix.
+        github.compares[(B, A)] = {"status": "behind", "files": []}
+        prompts = []
+        _, calls, _ = run_review(github, A, review(), prompts=prompts)
+        self.assertEqual(calls[0]["mode"], "full")
+        finding = github.state()["findings"][0]
+        self.assertEqual((finding["state"], finding["check"]["verdict"]), ("ACTIVE", "uncertain"))
+
+    def test_history_trimming_never_drops_fix_dependencies(self):
+        deps = [{"id": str(i), "path": "caller.py", "header": "H", "content": "c", "fix_files": ["helper.py"],
+                 "threads": []} for i in range(5)]
+        state = {"fixed_ids": [f"{i:012x}" for i in range(3000)], "fixed_deps": list(deps)}
+        cp.bound_history(state)
+        self.assertEqual(state["fixed_deps"], deps)
+        self.assertTrue(state["history_trimmed"])
+
     def test_fix_dependencies_follow_renames(self):
         github, null = self.helper_fixed()
         github.files = [{"filename": "caller.py", "patch": "@@"}, {"filename": "utils.py", "patch": "@@"}]
@@ -1863,6 +1896,20 @@ class GateTests(unittest.TestCase):
         run_review(github, C, review(), verdicts={race["id"]: "fixed"}, prompts=prompts)
         self.assertEqual(len(prompts), 1)
         self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
+
+    def test_restored_dismissal_and_an_active_finding_in_one_file_verify_together(self):
+        github = self.reviewed(issue("x.py", "Leak", "The handle is never closed."))
+        state = github.state()
+        record = {"id": "1", "path": "x.py", "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint(
+            "x.py", "Race", "Two saves interleave.")}]}
+        state["dismissed_threads"] = cp.history_entries(record)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.")]  # Withdrawn.
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+close()"}]}
+        code, _, _ = run_review(github, B, review())  # Batches with and without a check commit sort fine.
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(f["header"] for f in github.state()["findings"]), ["Leak", "Race"])
 
     def test_pruned_dismissal_withdrawn_and_then_fixed_clears_through_verification(self):
         github = self.reviewed()

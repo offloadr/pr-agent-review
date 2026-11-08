@@ -469,8 +469,10 @@ jobs:
 
           def bound_history(state):
               """Keep the pruned-finding history within its budget, dropping the oldest entries first."""
-              lists = ("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned", "fixed_deps")
-              while len(json.dumps([state.get(name) or [] for name in lists])) > HISTORY_CHARS:
+              # fixed_deps is not trimmed: dropping one would forget a fix that a later revert can undo.
+              lists = ("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned")
+              while len(json.dumps([state.get(name) or [] for name in lists])) > HISTORY_CHARS and \
+                      any(state.get(name) for name in lists):
                   longest = max(lists, key=lambda name: len(json.dumps(state.get(name) or [])))
                   state[longest] = (state.get(longest) or [])[1:]
                   state["history_trimmed"] = True
@@ -780,9 +782,11 @@ jobs:
                   elif f["state"] == "ACTIVE" and changed:
                       # A change elsewhere can fix it too, as when a helper stops returning None.
                       elsewhere.append(f)
-                  elif f["state"] == "FIXED" and f.get("fix_files") and (
-                          set(f["fix_files"]) & changed or plan_result.get("renames_complete") is False):
-                      # With a capped comparison, a changed dependency may be missing from the list.
+                  elif f["state"] == "FIXED" and (
+                          (f.get("fix_files") and (set(f["fix_files"]) & changed or plan_result.get("renames_complete") is False))
+                          or (f["path"] in changed and f["path"] not in (plan_result.get("pr_paths") or {f["path"]}))):
+                      # With a capped comparison, a changed dependency may be missing from the list. A finding whose
+                      # own file was reverted out of the pull request gets no delta review, so it is rechecked too.
                       # A push touching the files that showed the fix may have undone it, even with nothing for
                       # PR-Agent to review (a helper reverted to its base version drops out of the diff).
                       recheck.append(f)
@@ -1156,7 +1160,7 @@ jobs:
               batches = {}
               for f in findings:
                   batches.setdefault((f["path"], f["checked_sha"]), []).append(f)
-              for (path, base), group in sorted(batches.items()):
+              for (path, base), group in sorted(batches.items(), key=lambda item: (item[0][0], item[0][1] or "")):
                   others = "\n".join(f"--- {f['filename']}\n{f.get('patch') or '(no patch)'}" for f in changes_since(base)
                                       if path not in (f["filename"], f.get("previous_filename")))
                   prompt = verifier_prompt(path, group, read_file(path), read_diff(path, base), others)
@@ -1256,6 +1260,7 @@ jobs:
               if not merge_base:
                   raise RunFailed("GitHub did not report a merge base for the pull request.")
               plan_result = plan(checkpoint, head_sha, base_ref, merge_base, pr_paths, compare, user_globs)
+              plan_result["pr_paths"] = pr_paths
               out(f"Plan: {plan_result['mode']} ({plan_result['reason']}); {len(plan_result['files'])} file(s).")
               if plan_result["mode"] == "none" and checkpoint["head_sha"] == head_sha:
                   retry_ids = [f["id"] for f in checkpoint.get("findings") or [] if f["state"] == "ACTIVE"
@@ -1439,6 +1444,13 @@ jobs:
               # Fixed findings whose fix files this push changed: one call asks whether the fix still holds.
               recheck_diff = "\n".join(f"--- {c['filename']}\n{c.get('patch') or '(no patch)'}"
                                         for c in changes_since(since_checkpoint)) if recheck else ""
+              if recheck and not recheck_diff:
+                  # A rewind or a missing comparison leaves nothing to show the verifier; the fix is unconfirmed.
+                  for f in recheck:
+                      reopen(f, occurrence_since)
+                      f.update(state="ACTIVE", check={"verdict": "uncertain", "sha": head_sha,
+                                                      "reason": "what its fix relied on changed, and no diff was available to recheck it"})
+                      out(f"- reopened: {f['path']} {f['header']} (no diff available to recheck its fix)")
               if recheck and recheck_diff:
                   answer, used = ask(recheck_prompt(recheck, read_file, recheck_diff))
                   usage.append(used)

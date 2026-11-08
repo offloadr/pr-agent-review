@@ -102,7 +102,9 @@ Re-running only this job re-evaluates dismissals without paying for a review.
   larger than PR-Agent's call budget get there, and for those every push is a full review again.
 - The history of pruned findings (fixed and dismissed ids, hashed thread identities of dismissed
   ones) is kept within about 20,000 characters, oldest dropped first. On a very long-lived pull
-  request, unresolving the thread of a long-pruned dismissal may then go unnoticed.
+  request, unresolving the thread of a long-pruned dismissal may then go unnoticed; once trimmed,
+  the gate fails closed on any unresolved PR-Agent thread it cannot place. Fix dependencies are
+  never trimmed: if they cannot fit, the save fails rather than forget a fix a revert could undo.
 - A delta review sees no earlier findings, so it may raise a still-present issue again in different
   words. That becomes a second finding; both close when verified fixed.
 - PR-Agent's security verdict is not tied to files, so while a concern is open every run is a
