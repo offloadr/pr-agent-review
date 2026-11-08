@@ -755,7 +755,8 @@ jobs:
 
               Returns (findings, the earlier ones to verify against their own file's changes, the pruned records
               still kept, the active ones in files this push did not change)."""
-              started_at = started_at or now_utc()
+              # An empty boundary means there was no earlier occurrence (before the first checkpoint).
+              started_at = now_utc() if started_at is None else started_at
               raised_by_id = {f["id"]: f for f in raised}
               # The same full text at the same current path is the same finding, whatever path its id came from.
               raised_by_text = {(f["path"], f["content_id"]): f for f in raised}
@@ -1344,7 +1345,9 @@ jobs:
 
               started_at = now_utc()
               # Threads created after the previous checkpoint was saved belong to whatever this run raises.
-              occurrence_since = (checkpoint or {}).get("saved_at") or started_at
+              # Before the first checkpoint there is no earlier occurrence, so any thread (even one an earlier
+              # failed attempt posted) belongs to what this run raises.
+              occurrence_since = (checkpoint or {}).get("saved_at") or ("" if checkpoint is None else started_at)
               threads = github.bot_threads(repo, pr)
               previous = [dict(f) for f in (checkpoint or {}).get("findings") or []]
               pruned = (checkpoint or {}).get("pruned") or []
@@ -1467,6 +1470,10 @@ jobs:
                       security = {"sha": head_sha, "concern": security_concern(review)}
                   reviewed = pr_paths if plan_result["mode"] == "full" else set(plan_result["files"])
                   uncovered = sorted(((set((checkpoint or {}).get("uncovered") or []) - reviewed) | set(gaps)) & pr_paths)
+                  # A fixed finding whose file changed but went unreviewed for the token budget: neither PR-Agent
+                  # nor a delta saw whether the change undid its fix, so the recheck below asks.
+                  recheck += [f for f in findings if f["state"] == "FIXED" and f["path"] in set(gaps)
+                              and f["path"] in changed_now and f not in recheck]
                   if plan_result["mode"] != "full":
                       # Only a full review accounts for files an earlier footer did not name.
                       more_gaps = more_gaps or bool((checkpoint or {}).get("uncovered_unlisted"))

@@ -1452,6 +1452,30 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(any("fixed earlier" in p for p in prompts))
         self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
 
+    def test_fixed_file_left_out_for_the_token_budget_is_rechecked(self):
+        github = FakeGitHub(A, ["x.py", "y.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        race = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+        run_review(github, B, review(), verdicts={race: "fixed"})
+        original = github.comments
+
+        def with_gap(repo, pr):
+            listed = original(repo, pr)
+            if github.heads != [C]:
+                return listed
+            return listed + [{"user": {"login": "github-actions[bot]"}, "updated_at": "9999-01-01T00:00:00Z",
+                              "body": "<!-- pr-agent:review:full -->\n⚠️ **Review coverage:** The following files were "
+                                      "not included in this review because of the token budget:\n- `x.py`"}]
+        github.comments = with_gap
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "-lock"}]}
+        prompts = []
+        run_review(github, C, review(), verdicts={race: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
     def test_fix_dependencies_follow_renames(self):
         github, null = self.helper_fixed()
         github.files = [{"filename": "caller.py", "patch": "@@"}, {"filename": "utils.py", "patch": "@@"}]
@@ -2308,6 +2332,14 @@ class GateTests(unittest.TestCase):
         thread_for_new = current(posted("T_new", "x.py", "Race", "Two saves interleave.", resolved=True))
         lines = cp.open_findings(state, [thread_for_new], "https://example/checkpoint")
         self.assertEqual(len(lines), 2)
+
+    def test_thread_from_a_failed_first_attempt_dismisses_after_a_retry(self):
+        github = FakeGitHub(A, ["x.py"])
+        with self.assertRaises(cp.RunFailed):
+            run_review(github, A, cp.RunFailed("PR-Agent exited with code 1."))  # Posted its thread, then failed.
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]  # From that attempt.
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))  # The retry, deduplicated.
+        self.assertEqual(self.gate(github)[0], 0)
 
     def test_security_concern_blocks(self):
         code, output = self.gate(self.reviewed(security="Secrets in logs: the token is printed."))
