@@ -57,7 +57,10 @@ findings are kept with their evidence rather than deleted.
    finding. A missing, malformed or `uncertain` verdict keeps it active, and keeps its range: the
    next verification still sees every change since the last definite verdict. Active findings in files the push did
    not change go to the verifier too, all in one call with the push's diff and a window of each
-   finding's file, because a change elsewhere (a helper that stops returning None) can fix them. A verifier error fails the
+   finding's file, because a change elsewhere (a helper that stops returning None) can fix them.
+   For a `fixed` verdict the verifier names the other files the fix relies on; a later push changing
+   any of them (even reverting one out of the pull request) rechecks the fix, and a `still_present`
+   or inconclusive answer reopens the finding. A verifier error fails the
    run.
 4. **Save.** Re-read the pull request and the checkpoint. If the head moved or another run saved a
    newer checkpoint, fail without saving. Otherwise write the new checkpoint for the reviewed head.

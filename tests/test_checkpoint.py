@@ -108,7 +108,7 @@ class FakeGitHub:
         return cp.find_checkpoint(self.issue_comments)[1]
 
 
-def run_review(github, head, result, verdicts=None, prompts=None, globs=()):
+def run_review(github, head, result, verdicts=None, prompts=None, globs=(), relies=None):
     calls = []
 
     def fake_review(plan_result, pr_paths, user_globs, model, keys):
@@ -124,7 +124,8 @@ def run_review(github, head, result, verdicts=None, prompts=None, globs=()):
     def fake_ask(prompt):
         if prompts is not None:
             prompts.append(prompt)
-        answer = {"verdicts": [{"id": i, "verdict": v, "reason": f"{v} because"} for i, v in (verdicts or {}).items()]}
+        answer = {"verdicts": [{"id": i, "verdict": v, "reason": f"{v} because", "relies_on": (relies or {}).get(i, [])}
+                               for i, v in (verdicts or {}).items()]}
         return answer, {"total_tokens": 100}
 
     output = []
@@ -1156,9 +1157,9 @@ class ReviewTests(unittest.TestCase):
         null = github.state()["findings"][0]["id"]
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "+    return ''"}]}
-        run_review(github, B, review(), verdicts={null: "fixed"})
+        run_review(github, B, review(), verdicts={null: "fixed"}, relies={null: ["helper.py"]})
         fixed = github.state()["findings"][0]
-        self.assertEqual((fixed["state"], fixed["fix_files"]), ("FIXED", ["caller.py", "helper.py"]))
+        self.assertEqual((fixed["state"], fixed["fix_files"]), ("FIXED", ["helper.py"]))
         # The helper change is reverted to its base version, so helper.py leaves the PR diff entirely.
         github.files = [{"filename": "caller.py", "patch": "@@"}]
         github.heads = [C]
@@ -1176,7 +1177,7 @@ class ReviewTests(unittest.TestCase):
         null = github.state()["findings"][0]["id"]
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "+    return ''"}]}
-        run_review(github, B, review(), verdicts={null: "fixed"})
+        run_review(github, B, review(), verdicts={null: "fixed"}, relies={null: ["helper.py"]})
         return github, null
 
     def test_reverted_fix_is_rechecked_even_after_the_fixed_record_was_pruned(self):
@@ -1195,6 +1196,36 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("fixed earlier", prompts[0])
         self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
 
+    def test_inconclusive_recheck_blocks_and_a_rerun_retries_it(self):
+        github, null = self.helper_fixed()
+        github.files = [{"filename": "caller.py", "patch": "@@"}]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "-    return ''"}]}
+        run_review(github, C, review())  # The verifier gives no verdict.
+        finding = github.state()["findings"][0]
+        self.assertEqual((finding["state"], finding["check"]["verdict"]), ("ACTIVE", "uncertain"))
+        self.assertEqual(cp.gate_main(github, "o/r", "1", C, out=lambda _: None, sleep=lambda _: None), 1)
+        code, calls, _ = run_review(github, C, review(), verdicts={null: "fixed"})  # Re-run at the same head.
+        self.assertEqual((code, calls), (0, []))
+        self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
+
+    def test_confirmed_recheck_refreshes_what_the_fix_relies_on(self):
+        github, null = self.helper_fixed()
+        github.files = [{"filename": "caller.py", "patch": "@@"}, {"filename": "helper_b.py", "patch": "@@"}]
+        github.heads = [C]
+        # A refactor moves the fix into helper_b.py.
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "-moved"},
+                                                                 {"filename": "helper_b.py", "patch": "+    return ''"}]}
+        run_review(github, C, review(), verdicts={null: "fixed"}, relies={null: ["helper_b.py"]})
+        self.assertEqual(github.state()["findings"][0]["fix_files"], ["helper.py", "helper_b.py"])
+        github.files = [{"filename": "caller.py", "patch": "@@"}]
+        github.heads = ["d" * 40]
+        github.compares[(C, "d" * 40)] = {"status": "ahead", "files": [{"filename": "helper_b.py", "patch": "-    return ''"}]}
+        prompts = []
+        run_review(github, "d" * 40, review(), verdicts={null: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
     def test_fix_dependencies_follow_renames(self):
         github, null = self.helper_fixed()
         github.files = [{"filename": "caller.py", "patch": "@@"}, {"filename": "utils.py", "patch": "@@"}]
@@ -1202,7 +1233,7 @@ class ReviewTests(unittest.TestCase):
         github.compares[(B, C)] = {"status": "ahead", "files": [
             {"filename": "utils.py", "previous_filename": "helper.py", "status": "renamed"}]}
         run_review(github, C, review(), verdicts={null: "fixed"})
-        self.assertEqual(github.state()["findings"][0]["fix_files"], ["caller.py", "utils.py"])
+        self.assertEqual(github.state()["findings"][0]["fix_files"], ["utils.py"])
         github.heads = ["d" * 40]
         github.compares[(C, "d" * 40)] = {"status": "ahead", "files": [{"filename": "utils.py", "patch": "-    return ''"}]}
         prompts = []
@@ -1753,6 +1784,25 @@ class GateTests(unittest.TestCase):
         state["findings"] = [fixed]
         state["dismissed_threads"] = [identity]
         self.assertEqual(cp.fixed_thread_ids(state, [thread]), [])
+
+    def test_pruned_dismissal_withdrawn_after_the_fixing_push_is_verified_on_a_rerun(self):
+        github = self.reviewed()
+        state = github.state()
+        record = {"id": "1", "path": "x.py", "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint(
+            "x.py", "Race", "Two saves interleave.")}]}
+        state["dismissed_threads"] = cp.history_entries(record)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+        run_review(github, B, review())  # The fixing push, saved while still dismissed.
+        github.threads[0]["resolved"] = False  # Withdrawn after the save.
+        restored_id = cp.finding_id("x.py", "Race", "Two saves interleave.")
+        prompts = []
+        code, calls, _ = run_review(github, B, review(), verdicts={restored_id: "fixed"}, prompts=prompts)
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("@@ patch of x.py", prompts[0])  # Verified against its whole PR patch.
+        self.assertEqual(github.state()["findings"][0]["state"], "FIXED")
 
     def test_dismissal_withdrawn_after_the_fixing_push_is_verified_on_a_rerun(self):
         github = self.reviewed(issue("x.py", "Race", "Two saves interleave."))
