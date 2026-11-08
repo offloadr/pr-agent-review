@@ -334,6 +334,42 @@ class VerifierRequestTests(unittest.TestCase):
         self.assertEqual(cp.openai_body("gpt-6.1-sol", "medium", "", "p")["max_completion_tokens"],
                          cp.VERIFIER_MAX_OUTPUT_TOKENS)
 
+    def limited(self, call, error, field):
+        import io
+        import urllib.error
+        bodies = []
+
+        def fake_send(request, timeout, attempts=3):
+            body = json.loads(request.data)
+            bodies.append(body)
+            if body.get(field, 0) > 4096:
+                raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(error.encode()))
+            return json.dumps({"choices": [{"message": {"content": '{"verdicts": []}'}}],
+                               "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"verdicts": []}'}]}],
+                               "content": [{"type": "tool_use", "input": {"verdicts": []}}]}).encode(), {}
+        saved, cp.send = cp.send, fake_send
+        try:
+            answer, _ = call()
+        finally:
+            cp.send = saved
+        self.assertEqual(answer, {"verdicts": []})
+        return [b.get(field) for b in bodies]
+
+    def test_a_verifier_with_a_lower_output_limit_gets_that_limit(self):
+        import os
+        os.environ["SERVICE_TIER"] = ""
+        chat = self.limited(lambda: cp.call_model("gpt-4-turbo", "", "p", {"openai": "k"}),
+                            '{"error": {"message": "max_tokens is too large: 16000. This model supports at most 4096 '
+                            'completion tokens, whereas you provided 16000."}}', "max_completion_tokens")
+        self.assertEqual(chat, [cp.VERIFIER_MAX_OUTPUT_TOKENS, 4096])
+        responses = self.limited(lambda: cp.call_responses("gpt-5-pro", "", "", "p", {"openai": "k"}),
+                                 '{"error": {"message": "max_output_tokens must be at most 4096"}}', "max_output_tokens")
+        self.assertEqual(responses, [cp.VERIFIER_MAX_OUTPUT_TOKENS, 4096])
+        claude = self.limited(lambda: cp.call_model("anthropic/claude-3-haiku", "", "p", {"anthropic": "k"}),
+                              '{"error": {"message": "max_tokens: 16000 > 4096, which is the maximum allowed number '
+                              'of output tokens for claude-3-haiku"}}', "max_tokens")
+        self.assertEqual(claude, [cp.VERIFIER_MAX_OUTPUT_TOKENS, 4096])
+
     def test_service_tier_is_sent_when_set(self):
         self.assertEqual(cp.openai_body("gpt-6.1-sol", "", "flex", "p")["service_tier"], "flex")
         self.assertNotIn("service_tier", cp.openai_body("gpt-6.1-sol", "", "", "p"))
@@ -1682,6 +1718,18 @@ class ReviewTests(unittest.TestCase):
                  "security": {}, "runs": [], "fixed_deps": [record]}
         cp.fit_comment(state)
         self.assertEqual([r["id"] for r in state["fixed_deps"]], ["1"])
+
+    def test_malformed_dependencies_on_a_still_present_verdict_are_ignored(self):
+        answer = {"verdicts": [{"id": "1", "verdict": "still_present", "reason": "still racy", "relies_on": 7}]}
+        self.assertEqual(cp.relied_on(answer), {"1": []})
+        github = FakeGitHub(A, ["x.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        race = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+tweak"}]}
+        code, _, _ = run_review(github, B, review(), verdicts={race: "still_present"}, relies={race: 7})
+        self.assertEqual(code, 0)
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
 
     def test_fix_dependencies_follow_renames(self):
         github, null = self.helper_fixed()
