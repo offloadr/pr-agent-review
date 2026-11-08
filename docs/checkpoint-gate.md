@@ -109,8 +109,9 @@ Re-running only this job re-evaluates dismissals without paying for a review.
   (rechecked if that file is reverted out of the pull request) that counts toward the history budget,
   so on a very long-lived pull request the oldest of those can be trimmed.
 - GitHub documents a 21,000-character limit for a step's `run` value. The shared script is about
-  64,000 characters and runs today; moving it into a pinned script or action would remove that
-  dependency on undocumented behavior.
+  105,000 characters and runs today; moving it into a pinned script or action would remove that
+  dependency on undocumented behavior. Its size also stalls actionlint's pyflakes check (the
+  script is piped to pyflakes, and stalls past 64 KiB), so CI runs actionlint with pyflakes off.
 - A delta review sees no earlier findings, so it may raise a still-present issue again in different
   words. That becomes a second finding; both close when verified fixed.
 - PR-Agent's security verdict is not tied to files, so while a concern is open every run is a

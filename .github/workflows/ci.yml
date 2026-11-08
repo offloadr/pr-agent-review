@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -17,11 +17,22 @@ jobs:
         with:
           persist-credentials: false
 
-      # rhysd/actionlint:1.7.12, pinned by its multi-platform index digest.
+      # rhysd/actionlint:1.7.12, pinned by its multi-platform index digest. Its pyflakes check is off:
+      # actionlint stalls piping a script larger than 64 KiB into pyflakes, and the shared review
+      # script is larger. The tests below load and run that script instead.
       - name: actionlint
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
         with:
-          args: -color
+          args: -color -pyflakes=
+
+  # A separate job, so a stalled lint cannot keep the test result from being reported.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Findings script tests
         run: python3 -m unittest discover -s tests -v
