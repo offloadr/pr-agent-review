@@ -1702,6 +1702,18 @@ class ReviewTests(unittest.TestCase):
         moved = [f for f in github.state()["findings"] if f["id"] == null]
         self.assertEqual([(f["path"], f["state"]) for f in moved], [("moved.py", "ACTIVE")])
 
+    def test_pruned_fix_raised_again_at_its_renamed_path_keeps_one_record(self):
+        github, null = self.helper_fixed()
+        self.prune_helper_fix(github, path="moved.py")  # The fixed finding followed caller.py to moved.py.
+        github.files = [{"filename": f, "patch": "@@"} for f in ("moved.py", "helper.py")]
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "moved.py", "patch": "+again"}]}
+        run_review(github, C, review(issue("moved.py", "Null", "helper() can return None, and .upper() fails.")))
+        state = github.state()
+        self.assertEqual([(f["id"], f["path"], f["state"]) for f in state["findings"]], [(null, "moved.py", "ACTIVE")])
+        self.assertTrue(state["findings"][0].get("reopened_at") is not None)
+        self.assertEqual(state.get("fixed_deps") or [], [])
+
     def test_raising_a_pruned_fix_again_retires_its_compact_record(self):
         github, null = self.helper_fixed()
         self.prune_helper_fix(github)

@@ -837,6 +837,16 @@ jobs:
                       # PR-Agent to review (a helper reverted to its base version drops out of the diff).
                       recheck.append(f)
                   merged.append(f)
+              # A pruned fixed finding raised again at its current path, word for word, keeps its identity (its id
+              # came from the path it was first reported at), so its compact record is retired, not duplicated.
+              compact_by_text = {(r["path"], r.get("content_id")): r for r in compact if r.get("content_id")}
+              retained_ids = {f["id"] for f in merged}
+              for key, new in list(raised_by_id.items()):
+                  record = compact_by_text.get((new["path"], new.get("content_id")))
+                  if record and record["id"] != key and record["id"] not in raised_by_id and record["id"] not in retained_ids:
+                      del raised_by_id[key]
+                      new["id"] = record["id"]
+                      raised_by_id[new["id"]] = new
               # A finding raised again after its fixed record was pruned is a reintroduction too.
               kept = []
               raised_by_current = {current_key(f): f for f in raised_by_id.values()}
