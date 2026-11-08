@@ -103,8 +103,14 @@ Re-running only this job re-evaluates dismissals without paying for a review.
 - The history of pruned findings (fixed and dismissed ids, hashed thread identities of dismissed
   ones) is kept within about 20,000 characters, oldest dropped first. On a very long-lived pull
   request, unresolving the thread of a long-pruned dismissal may then go unnoticed; once trimmed,
-  the gate fails closed on any unresolved PR-Agent thread it cannot place. Fix dependencies are
-  never trimmed: if they cannot fit, the save fails rather than forget a fix a revert could undo.
+  the gate fails closed on any unresolved PR-Agent thread it cannot place. Fixes that rely on other
+  files keep a compact recheck record that is never trimmed: if those cannot fit, the save fails
+  rather than forget a fix a revert could undo. Fixes in a finding's own file keep a smaller record
+  (rechecked if that file is reverted out of the pull request) that counts toward the history budget,
+  so on a very long-lived pull request the oldest of those can be trimmed.
+- GitHub documents a 21,000-character limit for a step's `run` value. The shared script is about
+  64,000 characters and runs today; moving it into a pinned script or action would remove that
+  dependency on undocumented behavior.
 - A delta review sees no earlier findings, so it may raise a still-present issue again in different
   words. That becomes a second finding; both close when verified fixed.
 - PR-Agent's security verdict is not tied to files, so while a concern is open every run is a

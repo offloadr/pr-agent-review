@@ -159,6 +159,7 @@ jobs:
         # Standard library only; tests/test_checkpoint.py loads this script from this file.
         run: &checkpoint_script |
           import calendar
+          import difflib
           import fnmatch
           import hashlib
           import json
@@ -470,7 +471,7 @@ jobs:
           def bound_history(state):
               """Keep the pruned-finding history within its budget, dropping the oldest entries first."""
               # fixed_deps is not trimmed: dropping one would forget a fix that a later revert can undo.
-              lists = ("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned")
+              lists = ("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned", "fixed_own")
               while len(json.dumps([state.get(name) or [] for name in lists])) > HISTORY_CHARS and \
                       any(state.get(name) for name in lists):
                   longest = max(lists, key=lambda name: len(json.dumps(state.get(name) or [])))
@@ -489,12 +490,17 @@ jobs:
                       state["pruned_fixed"] = state.get("pruned_fixed", 0) + 1
                       # About 15 characters per id, so the history stays small for any realistic pull request.
                       state.setdefault("fixed_ids", []).extend([pruned["id"], current_key(pruned)])
+                      # A compact record, enough to recheck the fix later; the full text and history go. A fix
+                      # relying on other files keeps its record for good. An own-file fix only needs one if its
+                      # file is reverted out of the pull request, so its smaller record counts toward the history
+                      # budget and can be trimmed.
+                      record = {"id": pruned["id"], "path": pruned["path"], "header": pruned["header"][:80],
+                                "content_id": pruned.get("content_id"), "threads": identities(pruned)}
                       if pruned.get("fix_files"):
-                          # Enough to recheck the fix if a later push changes the files it relied on.
-                          state.setdefault("fixed_deps", []).append({
-                              "id": pruned["id"], "path": pruned["path"], "header": pruned["header"],
-                              "content": pruned["content"][:300], "content_id": pruned.get("content_id"),
-                              "fix_files": pruned["fix_files"], "threads": identities(pruned)})
+                          state.setdefault("fixed_deps", []).append(dict(record, content=pruned["content"][:200],
+                                                                           fix_files=pruned["fix_files"]))
+                      else:
+                          state.setdefault("fixed_own", []).append(dict(record, content=pruned["content"][:160]))
                       if identities(pruned):
                           # Kept so the findings job can still resolve the pruned finding's threads, and so a
                           # later review raising it again is recognized as a reintroduction.
@@ -512,6 +518,11 @@ jobs:
                   elif any(len(f["content"]) > 300 for f in state["findings"]):
                       for f in state["findings"]:
                           f["content"] = f["content"][:300]
+                  elif any(state.get(name) for name in ("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned", "fixed_own")):
+                      longest = max(("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned", "fixed_own"),
+                                    key=lambda name: len(json.dumps(state.get(name) or [])))
+                      state[longest] = state[longest][1:]
+                      state["history_trimmed"] = True
                   else:
                       raise RunFailed("Too many open findings to store in one checkpoint comment.")
                   bound_history(state)
@@ -917,7 +928,10 @@ jobs:
               renamed = sorted({f["renamed_from"] for f in findings if f.get("renamed_from") and f["renamed_from"] != path})
               note = f" (renamed from {', '.join(renamed)}; the findings were reported against the old name)" if renamed else ""
               return (f"File: {path}{note}\n\nFindings:\n\n{items}\n\n"
-                      f"Diff of this file since the findings were last checked:\n```diff\n"
+                      + ("Diff of this file in the whole pull request (these findings have no earlier check to diff from):"
+                         if any(f.get("checked_sha") is None for f in findings) else
+                         "Diff of this file since the findings were last checked:")
+                      + f"\n```diff\n"
                       f"{('(no change to this file since then)' if diff == '' else diff or '(no diff available)')[:DIFF_CONTEXT_CHARS]}"
                       f"\n```\n\n"
                       f"Current file:\n```\n{file_context(content, findings)}\n```\n\n"
@@ -1173,17 +1187,33 @@ jobs:
 
           # ---- Review mode -------------------------------------------------------------------------------
 
+          CHUNK_CALLS_RE = re.compile(r"Number of PR chunk calls: (\d+)")
+          TIER_REJECTED_RE = re.compile(r"service_tier[^\n]{0,160}(not supported|unsupported|invalid)|"
+                                        r"(not supported|unsupported|invalid)[^\n]{0,160}service_tier", re.IGNORECASE)
+
+
           def run_streaming(command, env):
-              """Run a command, echoing its output as it arrives; returns (exit code, the output's tail)."""
-              tail = []
+              """Run a command, echoing its output as it arrives.
+
+              Returns (exit code, the output's tail, the most PR chunk calls PR-Agent announced). The chunk count
+              is read as lines pass, so a long log cannot push it out of the tail."""
+              tail, chunks = [], 0
               with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, errors="replace") as process:
                   for line in process.stdout:
                       sys.stdout.write(line)
+                      match = CHUNK_CALLS_RE.search(line)
+                      if match:
+                          chunks = max(chunks, int(match.group(1)))
                       tail.append(line)
                       del tail[:-2000]
               sys.stdout.flush()
-              return process.returncode, "".join(tail)
+              return process.returncode, "".join(tail), chunks
+
+
+          def flex_refused(log):
+              """Flex had no capacity, or the model does not offer the tier."""
+              return FLEX_UNAVAILABLE in log or TIER_REJECTED_RE.search(log) is not None
 
 
           def run_pr_agent(plan_result, pr_paths, user_globs, model, keys):
@@ -1213,19 +1243,18 @@ jobs:
                       # A full review keeps one summary comment; each delta review posts its own.
                       "PR_REVIEWER.PERSISTENT_COMMENT": "true" if plan_result["mode"] == "full" else "false",
                   })
-                  code, log = run_streaming(PR_AGENT, env)
-                  chunks = re.search(r"Number of PR chunk calls: (\d+)", log)
-                  if code != 0 and "LITELLM.EXTRA_BODY" in env and chunks and int(chunks.group(1)) > 1 and \
-                          (FLEX_UNAVAILABLE in log or "service_tier" in log):
-                      # Earlier chunks may already have been billed; a rerun here would pay for them again.
-                      raise RunFailed("Flex ran out of capacity partway through a chunked review. Re-run the job: it "
-                                      "tries Flex again, without paying twice for the chunks that finished.")
-                  if code != 0 and "LITELLM.EXTRA_BODY" in env and (FLEX_UNAVAILABLE in log or "service_tier" in log):
-                      # Flex failed before any model output, so the retry is not billed twice.
+                  code, log, chunks = run_streaming(PR_AGENT, env)
+                  if code != 0 and "LITELLM.EXTRA_BODY" in env and chunks > 1 and flex_refused(log):
+                      # Earlier chunks may already have been billed, so this run does not start over by itself.
+                      raise RunFailed("Flex ran out of capacity partway through a chunked review. Re-running the job "
+                                      "reviews again from the start, so its completed chunks are paid for again.")
+                  if code != 0 and "LITELLM.EXTRA_BODY" in env and flex_refused(log):
+                      # A single-call review that Flex refused produced no model output, so the retry is not
+                      # billed twice.
                       print("Flex has no capacity right now; retrying the review on the standard tier.", flush=True)
                       del env["LITELLM.EXTRA_BODY"]
                       open(output_path, "w").close()
-                      code, log = run_streaming(PR_AGENT, env)
+                      code, log, _ = run_streaming(PR_AGENT, env)
                   if code != 0:
                       raise RunFailed(f"PR-Agent exited with code {code}.")
                   review = None
@@ -1297,11 +1326,22 @@ jobs:
               # A pruned fixed finding whose fix files this push changes comes back as a fixed record, so the
               # recheck below can ask whether the fix still holds.
               changed_now = set(plan_result.get("changed") or plan_result.get("files") or [])
-              fixed_deps = []
+              fixed_deps, fixed_own = [], []
+              for own in (checkpoint or {}).get("fixed_own") or []:
+                  if own["path"] in changed_now and own["path"] not in pr_paths and not any(f["id"] == own["id"] for f in previous):
+                      previous.append({"id": own["id"], "path": own["path"], "header": own["header"], "content": own["content"],
+                                       "content_id": own.get("content_id"), "threads": own.get("threads") or [],
+                                       "fix_files": [], "state": "FIXED", "line": None,
+                                       "checked_sha": (checkpoint or {}).get("head_sha") or head_sha,
+                                       "check": {"verdict": "fixed", "reason": "pruned after an earlier fix in its own file",
+                                                 "sha": (checkpoint or {}).get("head_sha") or head_sha}})
+                  else:
+                      fixed_own.append(dict(own, path=renames.get(own["path"], own["path"])))
               for dep in (checkpoint or {}).get("fixed_deps") or []:
                   capped = plan_result.get("renames_complete") is False
-                  if (set(dep.get("fix_files") or []) & changed_now or (capped and dep.get("fix_files"))) and \
-                          not any(f["id"] == dep["id"] for f in previous):
+                  own_file_reverted = dep["path"] in changed_now and dep["path"] not in pr_paths
+                  if (set(dep.get("fix_files") or []) & changed_now or capped or own_file_reverted) \
+                          and not any(f["id"] == dep["id"] for f in previous):
                       previous.append({"id": dep["id"], "path": dep["path"], "header": dep["header"], "content": dep["content"],
                                        "content_id": dep.get("content_id"), "threads": dep.get("threads") or [],
                                        "fix_files": dep["fix_files"], "state": "FIXED", "line": None,
@@ -1395,7 +1435,13 @@ jobs:
                                   return file.get("patch")
                           if len(comparison.get("files") or []) < 300:
                               return ""  # Unchanged since the finding was checked: no fix evidence in this file.
-                          # GitHub lists at most 300 files, so a missing file may still have changed.
+                          # GitHub lists at most 300 files, so build this file's diff for the range itself.
+                          old, new = github.file_at(repo, path, since), github.file_at(repo, path, head_sha)
+                          if old == new:
+                              return ""
+                          return "".join(difflib.unified_diff((old or "").splitlines(keepends=True),
+                                                              (new or "").splitlines(keepends=True),
+                                                              f"a/{path}", f"b/{path}"))
                   return pr_patches.get(path)
 
               # A finding whose file vanished in a push too large to list every rename may live on under another
@@ -1506,6 +1552,7 @@ jobs:
               state = {"version": 1, "revision": (checkpoint or {}).get("revision", 0) + 1,
                        "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref, "merge_base": merge_base,
                        "fixed_ids": sorted(fixed_ids), "dismissed_ids": sorted(dismissed_ids), "fixed_deps": fixed_deps,
+                       "fixed_own": fixed_own,
                        "dismissed_threads": dismissed_threads,
                        "uncovered": uncovered, "uncovered_unlisted": more_gaps, "saved_at": now_utc(),
                        # Once history was trimmed, the gate keeps failing closed on untracked threads.

@@ -80,6 +80,8 @@ class FakeGitHub:
         return path in getattr(self, "binary", set())
 
     def file_at(self, repo, path, ref):
+        if (path, ref) in self.contents:
+            return self.contents[(path, ref)]
         return self.contents.get(path, f"contents of {path}")
 
     def comments(self, repo, pr):
@@ -1112,11 +1114,14 @@ class ReviewTests(unittest.TestCase):
         run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": f"f{i}.py"} for i in range(300)]}
+        github.contents[("x.py", A)] = "save()\n"
+        github.contents[("x.py", B)] = "with lock:\n    save()\n"
         prompts = []
         run_review(github, B, review(), prompts=prompts)
         x_prompt = next(p for p in prompts if p.startswith("File: x.py"))
-        self.assertIn("@@ patch of x.py", x_prompt)
-        self.assertNotIn("(no change to this file since then)", x_prompt)
+        self.assertIn("+with lock:", x_prompt)  # This file's own diff for the range, not its whole PR patch.
+        self.assertNotIn("@@ patch of x.py", x_prompt)
+        self.assertIn("since the findings were last checked", x_prompt)
 
     def test_saved_checkpoint_read_back_tolerates_a_stale_first_read(self):
         github = FakeGitHub(A, ["x.py"])
@@ -1272,6 +1277,30 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(any("fixed earlier" in p for p in prompts))
         self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
 
+    def test_pruned_own_file_fix_reverted_out_of_the_pr_is_rechecked(self):
+        github = FakeGitHub(A, ["caller.py", "helper.py"])
+        run_review(github, A, review(issue("caller.py", "Null", "helper() can return None, and .upper() fails.")))
+        null = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "caller.py", "patch": "+if x:"}]}
+        run_review(github, B, review(), verdicts={null: "fixed"})
+        state = github.state()
+        # Just under the current size, so the fixed record has to be pruned.
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 50
+        try:
+            checkpoint_comment(github)["body"] = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertEqual(github.state()["findings"], [])
+        self.assertEqual(github.state()["fixed_own"][0]["path"], "caller.py")
+        github.files = [{"filename": "helper.py", "patch": "@@"}]  # caller.py reverted out of the PR.
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "caller.py", "patch": "-if x:"}]}
+        prompts = []
+        run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
     def test_rewind_to_before_a_fix_reopens_it_when_no_diff_can_be_shown(self):
         github, null = self.helper_fixed()
         github.heads = [A]  # Force-pushed back to the commit before the fix.
@@ -1393,6 +1422,26 @@ class PrAgentProcessTests(unittest.TestCase):
             self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
                           {"mode": "full", "files": ["x.py"]}, {"x.py"}, flex_busy=True, chunked=True)
         self.assertIn("partway through a chunked review", str(failure.exception))
+
+    def test_chunk_count_is_seen_even_when_the_log_is_long(self):
+        import sys
+        import tempfile
+        import os
+        probe = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+        probe.write("print('Number of PR chunk calls: 3')\nfor i in range(5000):\n    print('line', i)\n"
+                    "print('Flex does not have sufficient resources available')\nraise SystemExit(1)\n")
+        probe.close()
+        try:
+            code, tail, chunks = cp.run_streaming([sys.executable, probe.name], dict(os.environ))
+        finally:
+            os.unlink(probe.name)
+        self.assertEqual((code, chunks), (1, 3))
+        self.assertNotIn("Number of PR chunk calls", tail)  # Gone from the tail, still counted.
+
+    def test_only_a_tier_rejection_counts_as_flex_refused(self):
+        self.assertTrue(cp.flex_refused("Invalid value for 'service_tier': flex is not supported"))
+        self.assertTrue(cp.flex_refused("Flex does not have sufficient resources available"))
+        self.assertFalse(cp.flex_refused("timeout while waiting; request had service_tier=flex"))
 
     def test_failure_or_missing_output_is_a_failed_run(self):
         with self.assertRaises(cp.RunFailed):
