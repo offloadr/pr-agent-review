@@ -135,7 +135,7 @@ def run_review(github, head, result, verdicts=None, prompts=None, globs=(), reli
                                       "updated_at": cp.now_utc(), "html_url": "https://example/summary"})
         return result
 
-    def fake_ask(prompt):
+    def fake_ask(prompt, ids=None):
         if prompts is not None:
             prompts.append(prompt)
         answer = {"verdicts": [{"id": i, "verdict": v, "reason": f"{v} because", "relies_on": (relies or {}).get(i, [])}
@@ -485,41 +485,86 @@ class VerifierEffortTests(unittest.TestCase):
 
 
 class ShadowVerifierTests(unittest.TestCase):
+    def answer(self, verdict, finding="1", relies=(), reason=None):
+        return lambda prompt, ids: ({"verdicts": [{"id": finding, "verdict": verdict, "relies_on": list(relies),
+                                                   "reason": reason or f"{verdict} because"}]}, {"total_tokens": 5})
+
     def test_primary_answer_decides_and_shadow_answer_is_recorded(self):
         records = []
-        ask = cp.shadowed(lambda p: ({"verdicts": [{"id": "1", "verdict": "fixed"}]}, {"total_tokens": 5}),
-                          lambda p: ({"verdicts": [{"id": "1", "verdict": "still_present"}]}, {"total_tokens": 1}),
-                          records)
-        answer, used = ask("prompt")
+        ask = cp.shadowed(self.answer("fixed"), self.answer("still_present"), records)
+        answer, used = ask("prompt", ["1"])
         self.assertEqual((answer["verdicts"][0]["verdict"], used), ("fixed", {"total_tokens": 5}))
         self.assertEqual(records[0]["shadow"]["answer"]["verdicts"][0]["verdict"], "still_present")
-        self.assertEqual(records[0]["prompt_sha"], cp.hashlib.sha256(b"prompt").hexdigest()[:12])
+        self.assertEqual((records[0]["prompt_sha"], records[0]["ids"]),
+                         (cp.hashlib.sha256(b"prompt").hexdigest()[:12], ["1"]))
 
     def test_shadow_failure_is_recorded_without_failing_the_run(self):
-        def broken(prompt):
+        def broken(prompt, ids):
             raise cp.RunFailed("The verifier request kept failing.")
         records = []
-        answer, _ = cp.shadowed(lambda p: ({"verdicts": []}, {}), broken, records)("prompt")
-        self.assertEqual(answer, {"verdicts": []})
+        answer, _ = cp.shadowed(self.answer("fixed"), broken, records)("prompt", ["1"])
+        self.assertEqual(answer["verdicts"][0]["verdict"], "fixed")
         self.assertIn("kept failing", records[0]["shadow"]["error"])
 
-    def test_slow_shadow_times_out_without_holding_up_the_run(self):
+    def test_stalled_shadows_share_one_waiting_budget_for_the_run(self):
         import threading
+        import time
         release = threading.Event()
-        saved, cp.SHADOW_TIMEOUT = cp.SHADOW_TIMEOUT, 0.05
+        saved, cp.SHADOW_BUDGET = cp.SHADOW_BUDGET, 0.1
         records = []
         try:
-            cp.shadowed(lambda p: ({"verdicts": []}, {}), lambda p: (release.wait(5), {}), records)("prompt")
+            ask = cp.shadowed(self.answer("fixed"), lambda p, ids: (release.wait(5), {}), records)
+            started = time.monotonic()
+            for batch in range(5):
+                ask(f"prompt {batch}", ["1"])
+            elapsed = time.monotonic() - started
         finally:
-            cp.SHADOW_TIMEOUT = saved
+            cp.SHADOW_BUDGET = saved
             release.set()
-        self.assertIn("no answer within", records[0]["shadow"]["error"])
+        self.assertLess(elapsed, 0.5)  # One budget in all, not one per batch.
+        self.assertIn("budget ran out", records[0]["shadow"]["error"])
+        self.assertIn("not sent", records[-1]["shadow"]["error"])
+        self.assertEqual(len(records), 5)
 
     def test_primary_failure_still_fails_the_run(self):
-        def broken(prompt):
+        def broken(prompt, ids):
             raise cp.RunFailed("The verifier request kept failing.")
         with self.assertRaises(cp.RunFailed):
-            cp.shadowed(broken, lambda p: ({"verdicts": []}, {}), [])("prompt")
+            cp.shadowed(broken, self.answer("fixed"), [])("prompt", ["1"])
+
+    def test_comparison_shows_the_verdict_the_gate_would_apply(self):
+        fixed_without_deps = {"verdicts": [{"id": "1", "verdict": "fixed", "reason": "locked"}]}
+        repeated = {"verdicts": [{"id": "1", "verdict": "fixed", "reason": "a", "relies_on": []},
+                                 {"id": "1", "verdict": "still_present", "reason": "b", "relies_on": []}]}
+        list_verdict = {"verdicts": [{"id": "1", "verdict": [], "reason": "c", "relies_on": 7}]}
+        for answer in (fixed_without_deps, repeated, list_verdict, None, {}):
+            entry = cp.answer_entries(answer, ["1"])["1"]
+            self.assertEqual((entry["verdict"], entry["valid"]), ("uncertain", False), answer)
+        good = cp.answer_entries({"verdicts": [{"id": "1", "verdict": "fixed", "reason": "locked",
+                                                "relies_on": ["helper.py"]}]}, ["1"])["1"]
+        self.assertEqual((good["verdict"], good["relies_on"], good["valid"]), ("fixed", ["helper.py"], True))
+
+    def test_served_tier_and_sent_effort_come_from_the_accepted_request(self):
+        import io
+        import os
+        import urllib.error
+        bodies = []
+
+        def fake_send(request, timeout, attempts=3):
+            body = json.loads(request.data)
+            bodies.append(body)
+            if "reasoning_effort" in body:
+                raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(
+                    b"{\"error\": \"Unsupported value: 'reasoning_effort' does not support 'medium' with this model.\"}"))
+            return json.dumps({"choices": [{"message": {"content": '{"verdicts": []}'}}], "service_tier": "flex",
+                               "usage": {"total_tokens": 3}}).encode(), {}
+        saved, cp.send = cp.send, fake_send
+        os.environ["SERVICE_TIER"] = "flex"
+        try:
+            _, used = cp.call_model("gpt-6.1-terra", "medium", "p", {"openai": "k"})
+        finally:
+            cp.send = saved
+        self.assertEqual(used, {"total_tokens": 3, "service_tier": "flex", "reasoning_effort": None})
 
     def test_malformed_shadow_answer_does_not_fail_the_review(self):
         github = FakeGitHub(A, ["x.py"])
@@ -527,16 +572,18 @@ class ShadowVerifierTests(unittest.TestCase):
         race = github.state()["findings"][0]["id"]
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
-        primary = lambda prompt: ({"verdicts": [{"id": race, "verdict": "fixed", "reason": "locked",  # noqa: E731
-                                                 "relies_on": []}]}, {"total_tokens": "many"})
-        shadow = lambda prompt: ({"verdicts": [{"id": race, "verdict": [], "relies_on": 7}]}, None)  # noqa: E731
+        primary = lambda prompt, ids: ({"verdicts": [{"id": race, "verdict": "fixed", "reason": "locked",  # noqa: E731
+                                                      "relies_on": []}]}, {"total_tokens": "many"})
+        shadow = lambda prompt, ids: ({"verdicts": [{"id": race, "verdict": [], "relies_on": 7}]}, None)  # noqa: E731
         output = []
         code = cp.review_main(github, "o/r", "1", B, "gpt-6.1-sol", "gpt-6.1-terra", "medium", {"openai": "k"}, [],
                               run_review=lambda *a: review(), ask=primary, out=output.append, sleep=lambda _: None,
                               shadow_model="gpt-6-luna", shadow_ask=shadow)
         self.assertEqual(code, 0)
         self.assertEqual((github.state()["head_sha"], github.state()["findings"][0]["state"]), (B, "FIXED"))
-        self.assertEqual(cp.answer_entries({"verdicts": [{"id": "1", "verdict": []}]})["1"]["verdict"], "invalid")
+        logged = json.loads(next(l for l in output if l.startswith("shadow-verifier: ")).split(": ", 1)[1])
+        self.assertEqual(logged["shadow"]["raw"], {"verdicts": [{"id": race, "verdict": [], "relies_on": 7}]})
+        self.assertIsNone(logged["primary"]["raw"])  # A valid answer is not repeated raw.
 
     def test_model_text_cannot_break_the_summary_table(self):
         self.assertEqual(cp.table_cell("a|b\n`c` <img>"), "a\\|b 'c' &lt;img>")
@@ -549,18 +596,14 @@ class ShadowVerifierTests(unittest.TestCase):
         race = github.state()["findings"][0]["id"]
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
-
-        def answer(verdict):
-            return lambda prompt: ({"verdicts": [{"id": race, "verdict": verdict, "reason": f"{verdict} because",
-                                                  "relies_on": []}]}, {"total_tokens": 10})
         summary = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
         summary.close()
         output = []
         try:
             cp.review_main(github, "o/r", "1", B, "gpt-6.1-sol", "gpt-6.1-terra", "medium", {"openai": "k"}, [],
-                           run_review=lambda *a: review(), ask=answer("fixed"), out=output.append,
+                           run_review=lambda *a: review(), ask=self.answer("fixed", race), out=output.append,
                            sleep=lambda _: None, shadow_model="gpt-6-luna", shadow_effort="high",
-                           shadow_ask=answer("still_present"), summary_path=summary.name)
+                           shadow_ask=self.answer("still_present", race), summary_path=summary.name)
             report = open(summary.name).read()
         finally:
             os.unlink(summary.name)

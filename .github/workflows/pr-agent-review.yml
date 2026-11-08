@@ -1079,7 +1079,13 @@ jobs:
                   raise RunFailed("The verifier request kept failing.")
               text = "".join(part.get("text", "") for item in result.get("output") or [] if item.get("type") == "message"
                              for part in item.get("content") or [] if part.get("type") == "output_text")
-              return parse_json(text), result.get("usage") or {}
+              return parse_json(text), served(result, (body.get("reasoning") or {}).get("effort"))
+
+
+          def served(result, effort):
+              """A call's usage, with the tier OpenAI reports serving it on and the effort the accepted request
+              carried: a retry may have dropped either, so the configured values are not evidence."""
+              return dict(result.get("usage") or {}, service_tier=result.get("service_tier"), reasoning_effort=effort)
 
 
           def parse_json(text):
@@ -1155,7 +1161,7 @@ jobs:
               else:
                   raise RunFailed("The verifier request kept failing.")
               content = ((result.get("choices") or [{}])[0].get("message") or {}).get("content") or "{}"
-              return parse_json(content), result.get("usage") or {}
+              return parse_json(content), served(result, body.get("reasoning_effort"))
 
 
           def valid_entries(answer, ids):
@@ -1291,7 +1297,7 @@ jobs:
                   others = "\n".join(f"--- {f['filename']}\n{f.get('patch') or '(no patch)'}" for f in changes_since(base)
                                       if path not in (f["filename"], f.get("previous_filename")))
                   prompt = verifier_prompt(path, group, read_file(path), diff, others)
-                  answer, used = ask(prompt)
+                  answer, used = ask(prompt, [f["id"] for f in group])
                   usage.append(used)
                   evidence = [c["filename"] for c in changes_since(base)]
                   apply_verdicts(group, parse_verdicts(answer, [f["id"] for f in group]), head_sha, evidence, relied_on(answer))
@@ -1300,9 +1306,10 @@ jobs:
 
           # ---- Shadow verifier ---------------------------------------------------------------------------
 
-          # How long the run waits for a shadow answer, counted from when the request was sent: room for a Flex
-          # call with its backoff.
-          SHADOW_TIMEOUT = 1200
+          # How long one run waits for shadow answers in all, after the primary's answers are in. The budget is
+          # shared by every request, so stalled shadows cannot hold the job past it however many batches there
+          # are; once it is used up, later requests go to the primary only.
+          SHADOW_BUDGET = 600
 
 
           def shadowed(primary, shadow, records, clock=time.monotonic):
@@ -1310,13 +1317,23 @@ jobs:
 
               The primary's answer is returned as usual. The shadow's answer, or its error, is only recorded: a
               shadow failure or timeout never fails the run, and a primary failure still does."""
-              def ask(prompt):
+              waited = [0.0]
+
+              def ask(prompt, ids):
+                  record = {"prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12], "ids": list(ids)}
+                  if waited[0] >= SHADOW_BUDGET:
+                      started = clock()
+                      answer, used = primary(prompt, ids)
+                      records.append(dict(record, primary={"answer": answer, "usage": used,
+                                                           "seconds": round(clock() - started, 1)},
+                                          shadow={"error": f"not sent: the run's {SHADOW_BUDGET}-second shadow budget is used up"}))
+                      return answer, used
                   shadow_result = {}
 
                   def run_shadow():
                       started = clock()
                       try:
-                          shadow_result["answer"], shadow_result["usage"] = shadow(prompt)
+                          shadow_result["answer"], shadow_result["usage"] = shadow(prompt, ids)
                       except Exception as error:  # noqa: BLE001
                           shadow_result["error"] = f"{type(error).__name__}: {error}"[:300]
                       shadow_result["seconds"] = round(clock() - started, 1)
@@ -1325,33 +1342,27 @@ jobs:
                   thread = threading.Thread(target=run_shadow, daemon=True)
                   started = clock()
                   thread.start()
-                  answer, used = primary(prompt)
+                  answer, used = primary(prompt, ids)
                   primary_seconds = round(clock() - started, 1)
-                  thread.join(max(0.0, SHADOW_TIMEOUT - (clock() - started)))
+                  waiting = clock()
+                  thread.join(max(0.0, SHADOW_BUDGET - waited[0]))
+                  waited[0] += clock() - waiting
                   result = dict(shadow_result) if not thread.is_alive() else {
-                      "error": f"no answer within {SHADOW_TIMEOUT} seconds", "seconds": round(clock() - started, 1)}
-                  records.append({"prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
-                                  "primary": {"answer": answer, "usage": used, "seconds": primary_seconds},
-                                  "shadow": result})
+                      "error": "no answer before the run's shadow budget ran out", "seconds": round(clock() - started, 1)}
+                  records.append(dict(record, primary={"answer": answer, "usage": used, "seconds": primary_seconds},
+                                      shadow=result))
                   return answer, used
               return ask
 
 
-          def answer_entries(answer):
-              """A verifier answer's entries by finding id, as shown in the comparison: verdict (or 'invalid'),
-              relies_on and reason. Entries are only displayed, so a malformed one is shown, not trusted."""
-              items = answer.get("verdicts") if isinstance(answer, dict) else None
-              entries = {}
-              for item in items if isinstance(items, list) else []:
-                  if not isinstance(item, dict) or not isinstance(item.get("id"), str):
-                      continue
-                  relies = item.get("relies_on")
-                  entries[item["id"]] = {
-                      "verdict": item["verdict"] if isinstance(item.get("verdict"), str) and item["verdict"] in VERDICTS
-                      else "invalid",
-                      "relies_on": [p for p in relies if isinstance(p, str)] if isinstance(relies, list) else [],
-                      "reason": item.get("reason") if isinstance(item.get("reason"), str) else ""}
-              return entries
+          def answer_entries(answer, ids):
+              """A verifier answer as the gate would apply it, for each expected finding id: verdict, reason and
+              relies_on. A missing, malformed or repeated entry, or a fix without its dependencies, counts as
+              'uncertain' here too, so the comparison is between the verdicts each model would really have had."""
+              verdicts, relies = parse_verdicts(answer, ids), relied_on(answer)
+              valid = valid_entries(answer, set(ids))
+              return {i: {"verdict": verdicts[i][0], "reason": verdicts[i][1], "relies_on": relies.get(i, []),
+                          "valid": i in valid} for i in ids}
 
 
           def table_cell(text, limit=160):
@@ -1365,13 +1376,18 @@ jobs:
               rows, totals = [], {"primary": [0, 0, 0.0], "shadow": [0, 0, 0.0]}
               errors = []
               for record in records:
-                  primary = answer_entries(record["primary"]["answer"])
-                  shadow = answer_entries(record["shadow"].get("answer"))
+                  primary = answer_entries(record["primary"]["answer"], record["ids"])
+                  shadow = answer_entries(record["shadow"].get("answer"), record["ids"])
+                  def raw(answer, entries):
+                      # An answer the gate would not accept is kept as returned, so it can still be inspected.
+                      return None if all(e["valid"] for e in entries.values()) else answer
                   out("shadow-verifier: " + json.dumps({
-                      "head_sha": head_sha, "prompt_sha": record["prompt_sha"],
+                      "head_sha": head_sha, "prompt_sha": record["prompt_sha"], "ids": record["ids"],
                       "primary": {"model": primary_config[0], "effort": primary_config[1], "verdicts": primary,
+                                  "raw": raw(record["primary"]["answer"], primary),
                                   "usage": record["primary"]["usage"], "seconds": record["primary"]["seconds"]},
                       "shadow": {"model": shadow_config[0], "effort": shadow_config[1], "verdicts": shadow,
+                                 "raw": raw(record["shadow"].get("answer"), shadow),
                                  "usage": record["shadow"].get("usage"), "seconds": record["shadow"].get("seconds"),
                                  "error": record["shadow"].get("error")}}, sort_keys=True))
                   for name in ("primary", "shadow"):
@@ -1382,12 +1398,17 @@ jobs:
                       totals[name][2] += record[name].get("seconds") or 0
                   if record["shadow"].get("error"):
                       errors.append(f"`{record['prompt_sha']}`: {table_cell(record['shadow']['error'], 200)}")
-                  for finding_id in sorted(set(primary) | set(shadow)):
-                      p, s = primary.get(finding_id, {}), shadow.get(finding_id, {})
+                  for finding_id in record["ids"]:
+                      p, s = primary[finding_id], shadow[finding_id]
+
+                      def shown(entry):
+                          # An answer the gate would not accept is marked, with the verdict it would get instead.
+                          return entry["verdict"] if entry["valid"] else f"{entry['verdict']} (no valid answer)"
                       rows.append("| `{}` | {} | {} | {} | {} | {} |".format(
-                          table_cell(finding_id, 40), p.get("verdict", "—"), table_cell(", ".join(p.get("relies_on") or [])),
-                          s.get("verdict", "—"), table_cell(", ".join(s.get("relies_on") or [])),
-                          "yes" if p.get("verdict") == s.get("verdict") and p else "**no**"))
+                          table_cell(finding_id, 40), shown(p), table_cell(", ".join(p["relies_on"])),
+                          shown(s) if record["shadow"].get("answer") is not None else "—",
+                          table_cell(", ".join(s["relies_on"])),
+                          "yes" if p["verdict"] == s["verdict"] and record["shadow"].get("answer") is not None else "**no**"))
               if not summary_path:
                   return
               lines = [f"### Shadow verifier on {head_sha[:7]}", "",
@@ -1779,11 +1800,11 @@ jobs:
                           else:
                               f.pop("rename_unknown", None)
               usage = []
-              ask = ask or (lambda prompt: call_model(verifier_model, verifier_effort, prompt, keys))
+              ask = ask or (lambda prompt, ids: call_model(verifier_model, verifier_effort, prompt, keys))
               # A shadow verifier answers the same requests for comparison only; its answers never touch the state.
               shadow_records = []
               if shadow_model:
-                  shadow_ask = shadow_ask or (lambda prompt: call_model(shadow_model, shadow_effort, prompt, keys))
+                  shadow_ask = shadow_ask or (lambda prompt, ids: call_model(shadow_model, shadow_effort, prompt, keys))
                   ask = shadowed(ask, shadow_ask, shadow_records)
               read_file = lambda path: file_at(path, head_sha)  # noqa: E731
               since_checkpoint = (checkpoint or {}).get("head_sha")
@@ -1835,7 +1856,7 @@ jobs:
                   push_diff = "\n".join(f"--- {f['filename']}\n{f.get('patch') or '(no patch)'}" for f in changes_since(since))
                   if not push_diff:
                       continue
-                  answer, used = ask(elsewhere_prompt(group, read_file, push_diff))
+                  answer, used = ask(elsewhere_prompt(group, read_file, push_diff), [f["id"] for f in group])
                   usage.append(used)
                   apply_verdicts(group, parse_verdicts(answer, [f["id"] for f in group]), head_sha,
                                  [c["filename"] for c in changes_since(since)], relied_on(answer))
@@ -1851,7 +1872,7 @@ jobs:
                                                       "reason": "what its fix relied on changed, and no diff was available to recheck it"})
                       out(f"- reopened: {f['path']} {f['header']} (no diff available to recheck its fix)")
               if recheck and recheck_diff:
-                  answer, used = ask(recheck_prompt(recheck, read_file, recheck_diff))
+                  answer, used = ask(recheck_prompt(recheck, read_file, recheck_diff), [f["id"] for f in recheck])
                   usage.append(used)
                   verdicts = parse_verdicts(answer, [f["id"] for f in recheck])
                   for f in recheck:
