@@ -211,6 +211,8 @@ jobs:
           GENERATED_SUFFIXES = (".min.js", ".min.css", ".js.map", ".ts.map", ".css.map")
           # OpenAI's answer when Flex has no capacity; the request then goes to the standard tier instead.
           FLEX_UNAVAILABLE = "Flex does not have sufficient resources"
+          # read_diff's answer when no comparison reaches the commit a finding was checked on.
+          RANGE_UNAVAILABLE = object()
           SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
 
           THREADS_QUERY = """
@@ -1219,9 +1221,17 @@ jobs:
               for f in findings:
                   batches.setdefault((f["path"], f["checked_sha"]), []).append(f)
               for (path, base), group in sorted(batches.items(), key=lambda item: (item[0][0], item[0][1] or "")):
+                  diff = read_diff(path, base)
+                  if diff is RANGE_UNAVAILABLE:
+                      # Without the changes since the check, the file alone cannot tell a fix from an issue
+                      # that was never there, so these stay open and keep their range.
+                      for f in group:
+                          f["check"] = {"verdict": "uncertain", "sha": head_sha,
+                                        "reason": "the changes since this finding was checked are unavailable"}
+                      continue
                   others = "\n".join(f"--- {f['filename']}\n{f.get('patch') or '(no patch)'}" for f in changes_since(base)
                                       if path not in (f["filename"], f.get("previous_filename")))
-                  prompt = verifier_prompt(path, group, read_file(path), read_diff(path, base), others)
+                  prompt = verifier_prompt(path, group, read_file(path), diff, others)
                   answer, used = ask(prompt)
                   usage.append(used)
                   evidence = [c["filename"] for c in changes_since(base)]
@@ -1340,6 +1350,14 @@ jobs:
                   if (base, head) not in compares:
                       compares[(base, head)] = github.compare(repo, base, head)
                   return compares[(base, head)]
+
+              # Verification asks for the same file versions many times (once per batch after a force-push).
+              versions = {}
+
+              def file_at(path, ref):
+                  if (path, ref) not in versions:
+                      versions[(path, ref)] = github.file_at(repo, path, ref)
+                  return versions[(path, ref)]
 
               merge_base = ((compare(base_sha, head_sha) or {}).get("merge_base_commit") or {}).get("sha")
               if not merge_base:
@@ -1467,7 +1485,7 @@ jobs:
                       # nothing at all.
                       if plan_result["mode"] != "delta" or any(pr_patches.get(p) for p in plan_result["files"]) or \
                               not all(github.is_binary(repo, p, head_sha) or (
-                                  github.file_at(repo, p, head_sha) is None and checkpoint is not None
+                                  file_at(p, head_sha) is None and checkpoint is not None
                                   and github.is_binary(repo, p, checkpoint["head_sha"])) for p in plan_result["files"]):
                           raise  # A large text file also lacks a GitHub patch; only binary content is nothing to review.
                       out("PR-Agent found nothing to review in the changed files (no text diff).")
@@ -1534,24 +1552,31 @@ jobs:
                   out(f"The review raised {len(raised)} finding(s); {len(to_verify)} earlier finding(s) to re-check.")
 
               def read_diff(path, since):
-                  if since:
-                      comparison = compare(since, head_sha)
-                      if comparison is not None:
-                          straight = comparison.get("status") in ("ahead", "identical")
-                          for file in comparison.get("files") or [] if straight else []:
-                              if path in (file["filename"], file.get("previous_filename")):
-                                  return file.get("patch")
-                          if straight and len(comparison.get("files") or []) < 300:
-                              return ""  # Unchanged since the finding was checked: no fix evidence in this file.
-                          # Past GitHub's 300-file list, or after a force-push (GitHub then compares from the merge
-                          # base, not from the checked commit): build this file's diff between the two versions.
-                          old, new = github.file_at(repo, path, since), github.file_at(repo, path, head_sha)
-                          if old == new:
-                              return ""
-                          return "".join(difflib.unified_diff((old or "").splitlines(keepends=True),
-                                                              (new or "").splitlines(keepends=True),
-                                                              f"a/{path}", f"b/{path}"))
-                  return pr_patches.get(path)
+                  if not since:
+                      # Never checked against a commit: the file's whole pull-request diff, labelled as such.
+                      return pr_patches.get(path)
+                  # When the checked commit can no longer be compared, the range since the last checkpoint is the
+                  # next best: it may leave out a fix, which only keeps the finding open.
+                  for base in dict.fromkeys(b for b in (since, since_checkpoint) if b):
+                      comparison = compare(base, head_sha)
+                      if comparison is None:
+                          continue
+                      straight = comparison.get("status") in ("ahead", "identical")
+                      for file in comparison.get("files") or [] if straight else []:
+                          if path in (file["filename"], file.get("previous_filename")):
+                              return file.get("patch")
+                      if straight and len(comparison.get("files") or []) < 300:
+                          return ""  # Unchanged since the finding was checked: no fix evidence in this file.
+                      # Past GitHub's 300-file list, or after a force-push (GitHub then compares from the merge
+                      # base, not from the checked commit): build this file's diff between the two versions.
+                      old, new = file_at(path, base), file_at(path, head_sha)
+                      if old == new:
+                          return ""
+                      return "".join(difflib.unified_diff((old or "").splitlines(keepends=True),
+                                                          (new or "").splitlines(keepends=True),
+                                                          f"a/{path}", f"b/{path}"))
+                  # The pull request's own diff would pass changes that predate the finding off as its fix.
+                  return RANGE_UNAVAILABLE
 
               # A finding whose file vanished in a push too large to list every rename may live on under another
               # name; a missing file is then no evidence of a fix. It stays open without asking the verifier, on
@@ -1559,7 +1584,7 @@ jobs:
               for queue in (to_verify, elsewhere):
                   for f in list(queue):
                       if plan_result.get("renames_complete") is False or f.get("rename_unknown"):
-                          if github.file_at(repo, f["path"], head_sha) is None:
+                          if file_at(f["path"], head_sha) is None:
                               f["rename_unknown"] = True
                               f["check"] = {"verdict": "uncertain", "sha": head_sha,
                                             "reason": "the file is gone and the push was too large to see whether it was renamed"}
@@ -1568,13 +1593,20 @@ jobs:
                               f.pop("rename_unknown", None)
               usage = []
               ask = ask or (lambda prompt: call_model(verifier_model, verifier_effort, prompt, keys))
-              read_file = lambda path: github.file_at(repo, path, head_sha)  # noqa: E731
+              read_file = lambda path: file_at(path, head_sha)  # noqa: E731
               since_checkpoint = (checkpoint or {}).get("head_sha")
+
+              ranges = {}
 
               def changes_since(sha):
                   """Files changed from a commit to this head, falling back to the push when it is unknown. A
                   finding never checked against a commit (rebuilt from a withdrawn dismissal) sees the whole
                   pull request, from its merge base, so a fix saved while it was dismissed still counts."""
+                  if sha not in ranges:
+                      ranges[sha] = changes_from(sha)
+                  return ranges[sha]
+
+              def changes_from(sha):
                   if sha is None:
                       return (compare(merge_base, head_sha) or {}).get("files") or []
                   for base in (sha, since_checkpoint):
@@ -1593,7 +1625,7 @@ jobs:
                   names |= {f["filename"] for f in (compare(head_sha, base) or {}).get("files") or []}
                   files = []
                   for name in sorted(names)[:FORCE_PUSH_FILES]:
-                      old, new = github.file_at(repo, name, base), github.file_at(repo, name, head_sha)
+                      old, new = file_at(name, base), file_at(name, head_sha)
                       if old != new:
                           files.append({"filename": name, "patch": "".join(difflib.unified_diff(
                               (old or "").splitlines(keepends=True), (new or "").splitlines(keepends=True),

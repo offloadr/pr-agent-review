@@ -55,7 +55,7 @@ findings are kept with their evidence rather than deleted.
    gets the findings, the file at head and its diff since the finding was last checked, and must
    return `fixed`, `still_present` or `uncertain` per finding, with a reason. Only `fixed` closes a
    finding. A missing, malformed or `uncertain` verdict keeps it active, and keeps its range: the
-   next verification still sees every change since the last definite verdict. Active findings in files the push did
+   next verification still sees every change since the last definite verdict. If no comparison reaches the commit a finding was last checked on, the range since the last checkpoint stands in; if neither is reachable, the finding is marked `uncertain` without asking, rather than judged from the pull request's whole diff. Active findings in files the push did
    not change go to the verifier too, all in one call with the push's diff and a window of each
    finding's file, because a change elsewhere (a helper that stops returning None) can fix them.
    For a `fixed` verdict the verifier names the other files the fix relies on; a later push changing

@@ -1601,6 +1601,38 @@ class ReviewTests(unittest.TestCase):
         run_review(github, B, review(), prompts=prompts)
         self.assertTrue(any("+return ''" in p and "-return None" in p for p in prompts))
 
+    def test_unreachable_checked_commit_is_not_judged_from_the_whole_pull_request_diff(self):
+        github = FakeGitHub(A, ["x.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        race = github.state()["findings"][0]["id"]
+        github.heads = [B]  # A is gone (force-pushed and collected): no comparison reaches it.
+        prompts = []
+        run_review(github, B, review(), verdicts={race: "fixed"}, prompts=prompts)
+        self.assertFalse(any("@@ patch of x.py" in p for p in prompts))
+        finding = github.state()["findings"][0]
+        self.assertEqual((finding["state"], finding["check"]["verdict"]), ("ACTIVE", "uncertain"))
+
+    def test_force_push_ranges_and_file_versions_are_fetched_once(self):
+        github = FakeGitHub(A, ["x.py", "y.py", "z.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave."),
+                                     issue("y.py", "Leak", "The handle is never closed.")))
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "diverged", "files": [{"filename": "x.py"}, {"filename": "y.py"}]}
+        github.compares[(B, A)] = {"status": "diverged", "files": [{"filename": "z.py"}]}
+        for name in ("x.py", "y.py", "z.py"):
+            github.contents[(name, A)] = f"old {name}\n"
+        fetched = []
+        original = github.file_at
+
+        def counting(repo, path, ref):
+            fetched.append((path, ref))
+            return original(repo, path, ref)
+        github.file_at = counting
+        prompts = []
+        run_review(github, B, review(), prompts=prompts)
+        self.assertGreaterEqual(len([p for p in prompts if p.startswith("File:")]), 2)  # Two batches.
+        self.assertEqual(len(fetched), len(set(fetched)))
+
     def test_fix_dependencies_follow_renames(self):
         github, null = self.helper_fixed()
         github.files = [{"filename": "caller.py", "patch": "@@"}, {"filename": "utils.py", "patch": "@@"}]
