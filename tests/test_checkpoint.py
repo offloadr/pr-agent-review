@@ -76,6 +76,9 @@ class FakeGitHub:
             return {"status": "ahead", "files": [], "merge_base_commit": {"sha": self.merge_base}}
         return self.compares.get((base, head))
 
+    def is_binary(self, repo, path, ref):
+        return path in getattr(self, "binary", set())
+
     def file_at(self, repo, path, ref):
         return self.contents.get(path, f"contents of {path}")
 
@@ -475,7 +478,7 @@ class VerdictTests(unittest.TestCase):
             self.assertEqual(cp.parse_verdicts({"verdicts": [item]}, ["1"])["1"][0], "uncertain", item)
 
     def test_missing_unknown_and_malformed_verdicts_are_uncertain(self):
-        verdicts = cp.parse_verdicts({"verdicts": [{"id": "1", "verdict": "fixed", "reason": "r"},
+        verdicts = cp.parse_verdicts({"verdicts": [{"id": "1", "verdict": "fixed", "reason": "r", "relies_on": []},
                                                    {"id": "2", "verdict": "probably"}, "junk",
                                                    {"id": "x", "verdict": "fixed"}]}, ["1", "2", "3"])
         self.assertEqual(verdicts["1"][0], "fixed")
@@ -1060,11 +1063,22 @@ class ReviewTests(unittest.TestCase):
         github = FakeGitHub(A, ["x.py", "assets/image"])
         run_review(github, A, review())
         github.files = [{"filename": "x.py", "patch": "@@"}, {"filename": "assets/image"}]  # No text diff.
+        github.binary = {"assets/image"}
         github.heads = [B]
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "assets/image"}]}
         code, calls, _ = run_review(github, B, cp.NoReviewOutput("PR-Agent produced no review output."))
         self.assertEqual((code, calls[0]["files"]), (0, ["assets/image"]))
         self.assertEqual(github.state()["head_sha"], B)
+
+    def test_large_text_file_without_a_patch_is_not_nothing_to_review(self):
+        github = FakeGitHub(A, ["x.py", "big.py"])
+        run_review(github, A, review())
+        github.files = [{"filename": "x.py", "patch": "@@"}, {"filename": "big.py"}]  # Too large for a GitHub patch.
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "big.py"}]}
+        with self.assertRaises(cp.RunFailed):
+            run_review(github, B, cp.NoReviewOutput("PR-Agent produced no review output."))
+        self.assertEqual(github.state()["head_sha"], A)
 
     def test_no_review_output_for_a_text_change_still_fails(self):
         github = FakeGitHub(A, ["x.py"])
@@ -1225,6 +1239,23 @@ class ReviewTests(unittest.TestCase):
         run_review(github, "d" * 40, review(), verdicts={null: "still_present"}, prompts=prompts)
         self.assertTrue(any("fixed earlier" in p for p in prompts))
         self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
+    def test_capped_comparison_rechecks_tracked_fixes(self):
+        github, null = self.helper_fixed()
+        github.files = [{"filename": "caller.py", "patch": "@@"}] + [{"filename": f"f{i}.py"} for i in range(300)]
+        github.heads = [C]
+        # The helper revert falls beyond the 300 files GitHub lists.
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": f"f{i}.py"} for i in range(300)]}
+        prompts = []
+        run_review(github, C, review(), verdicts={null: "still_present"}, prompts=prompts)
+        self.assertTrue(any("fixed earlier" in p for p in prompts))
+        self.assertEqual(github.state()["findings"][0]["state"], "ACTIVE")
+
+    def test_fixed_verdict_without_relies_on_is_uncertain(self):
+        for item in ({"id": "1", "verdict": "fixed", "reason": "r"},
+                     {"id": "1", "verdict": "fixed", "reason": "r", "relies_on": "helper.py"},
+                     {"id": "1", "verdict": "fixed", "reason": "r", "relies_on": [7]}):
+            self.assertEqual(cp.parse_verdicts({"verdicts": [item]}, ["1"])["1"][0], "uncertain", item)
 
     def test_fix_dependencies_follow_renames(self):
         github, null = self.helper_fixed()

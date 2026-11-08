@@ -312,6 +312,17 @@ jobs:
                           return None
                       raise
 
+              def is_binary(self, repo, path, ref):
+                  """Whether the file's content at ref is binary (a NUL byte in its first 8 KB), as Git judges it."""
+                  url = f"{self.api_url}/repos/{repo}/contents/{urllib.parse.quote(path, safe='/')}?ref={ref}"
+                  try:
+                      raw, _ = self._request("GET", url, accept="application/vnd.github.raw")
+                  except urllib.error.HTTPError as error:
+                      if error.code == 404:
+                          return False  # Deleted: not evidence of binary content.
+                      raise
+                  return b"\0" in raw[:8000]
+
               def comments(self, repo, pr):
                   return self.rest_list(f"repos/{repo}/issues/{pr}/comments")
 
@@ -769,7 +780,9 @@ jobs:
                   elif f["state"] == "ACTIVE" and changed:
                       # A change elsewhere can fix it too, as when a helper stops returning None.
                       elsewhere.append(f)
-                  elif f["state"] == "FIXED" and set(f.get("fix_files") or []) & changed:
+                  elif f["state"] == "FIXED" and f.get("fix_files") and (
+                          set(f["fix_files"]) & changed or plan_result.get("renames_complete") is False):
+                      # With a capped comparison, a changed dependency may be missing from the list.
                       # A push touching the files that showed the fix may have undone it, even with nothing for
                       # PR-Agent to review (a helper reverted to its base version drops out of the diff).
                       recheck.append(f)
@@ -1052,6 +1065,9 @@ jobs:
                       continue
                   verdict, reason = item.get("verdict"), item.get("reason")
                   # A verdict without its reason is no evidence, least of all for "fixed".
+                  relies = item.get("relies_on")
+                  if verdict == "fixed" and not (isinstance(relies, list) and all(isinstance(p, str) for p in relies)):
+                      continue  # Without what it relies on, a fix cannot be rechecked later: uncertain.
                   if isinstance(verdict, str) and verdict in VERDICTS and isinstance(reason, str) and reason.strip():
                       verdicts[item["id"]] = (verdict, reason[:500])
               return verdicts
@@ -1278,7 +1294,9 @@ jobs:
               changed_now = set(plan_result.get("changed") or plan_result.get("files") or [])
               fixed_deps = []
               for dep in (checkpoint or {}).get("fixed_deps") or []:
-                  if set(dep.get("fix_files") or []) & changed_now and not any(f["id"] == dep["id"] for f in previous):
+                  capped = plan_result.get("renames_complete") is False
+                  if (set(dep.get("fix_files") or []) & changed_now or (capped and dep.get("fix_files"))) and \
+                          not any(f["id"] == dep["id"] for f in previous):
                       previous.append({"id": dep["id"], "path": dep["path"], "header": dep["header"], "content": dep["content"],
                                        "content_id": dep.get("content_id"), "threads": dep.get("threads") or [],
                                        "fix_files": dep["fix_files"], "state": "FIXED", "line": None,
@@ -1329,8 +1347,9 @@ jobs:
                       # to review; that is nothing to review, not a failed review. Large text files also lack a
                       # GitHub patch, but PR-Agent fetches those itself, so this applies only when it produced
                       # nothing at all.
-                      if plan_result["mode"] != "delta" or any(pr_patches.get(p) for p in plan_result["files"]):
-                          raise
+                      if plan_result["mode"] != "delta" or any(pr_patches.get(p) for p in plan_result["files"]) or \
+                              not all(github.is_binary(repo, p, head_sha) for p in plan_result["files"]):
+                          raise  # A large text file also lacks a GitHub patch; only binary content is nothing to review.
                       out("PR-Agent found nothing to review in the changed files (no text diff).")
                       review = {"key_issues_to_review": [], "security_concerns": "No", "no_text_diff": True}
                   validate_review(review)
