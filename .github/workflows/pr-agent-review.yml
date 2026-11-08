@@ -1509,7 +1509,11 @@ jobs:
               since_checkpoint = (checkpoint or {}).get("head_sha")
 
               def changes_since(sha):
-                  """Files changed from a commit to this head, falling back to the push when it is unknown."""
+                  """Files changed from a commit to this head, falling back to the push when it is unknown. A
+                  finding never checked against a commit (rebuilt from a withdrawn dismissal) sees the whole
+                  pull request, from its merge base, so a fix saved while it was dismissed still counts."""
+                  if sha is None:
+                      return (compare(merge_base, head_sha) or {}).get("files") or []
                   for base in (sha, since_checkpoint):
                       if base and base != head_sha:
                           comparison = compare(base, head_sha)
@@ -1662,10 +1666,17 @@ jobs:
                       and re.match(r"\s*/dismiss\b", thread.get("last_comment_body") or "", re.IGNORECASE) is not None)
 
 
-          def is_dismissed(finding, threads):
-              """Every thread posting the finding is resolved, and for a reintroduction, for this occurrence."""
+          def is_dismissed(finding, threads, others=()):
+              """Every thread posting the finding is resolved, and for a reintroduction, for this occurrence.
+
+              A thread that also posts another open or dismissed finding (a renamed finding and a new one at its
+              old path can share an identity) is ambiguous: resolving it dismisses neither."""
               matching = [t for t in threads if thread_posts(t, finding)]
               if not matching or any(not t["resolved"] for t in matching):
+                  return False
+              rivals = [g for g in others if g is not finding and g["state"] in ("ACTIVE", "DISMISSED")]
+              matching = [t for t in matching if not any(thread_posts(t, g) for g in rivals)]
+              if not matching:
                   return False
               return not finding.get("reopened_at") or any(dismisses_reintroduction(t, finding["reopened_at"])
                                                            for t in matching)
@@ -1692,7 +1703,7 @@ jobs:
               """Store dismissals in the checkpoint so dismissed findings can be pruned like fixed ones. A
               dismissed finding whose thread is unresolved again is open again."""
               for f in findings:
-                  if f["state"] == "ACTIVE" and is_dismissed(f, threads):
+                  if f["state"] == "ACTIVE" and is_dismissed(f, threads, findings):
                       f.update(state="DISMISSED", dismissed_sha=head_sha)
                   elif f["state"] == "DISMISSED" and any(thread_posts(t, f) and not t["resolved"] for t in threads):
                       f["state"] = "ACTIVE"
@@ -1708,7 +1719,7 @@ jobs:
                       continue
                   matching = [t for t in threads if thread_posts(t, f)]
                   unresolved = [t for t in matching if not t["resolved"]]
-                  if f["state"] == "ACTIVE" and is_dismissed(f, threads):
+                  if f["state"] == "ACTIVE" and is_dismissed(f, threads, state["findings"]):
                       continue  # Dismissed: every thread posting it was resolved.
                   location = f["path"] + (f":{f['line']}" if f.get("line") else "")
                   url = unresolved[0]["url"] if unresolved else summary_url

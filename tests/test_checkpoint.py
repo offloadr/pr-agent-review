@@ -2017,6 +2017,27 @@ class GateTests(unittest.TestCase):
         state["dismissed_threads"] = [identity]
         self.assertEqual(cp.fixed_thread_ids(state, [thread]), [])
 
+    def test_restored_dismissal_in_a_review_run_sees_the_whole_pr(self):
+        github = self.reviewed()
+        state = github.state()
+        record = {"id": "1", "path": "x.py", "content_id": "c", "threads": [{"path": "x.py", "fingerprint":
+                  cp.inline_fingerprint("x.py", "Race", "Two saves interleave.")}]}
+        state["dismissed_threads"] = cp.history_entries(record)
+        checkpoint_comment(github)["body"] = cp.render_comment(state)
+        github.threads = [posted("T1", "x.py", "Race", "Two saves interleave.", resolved=True)]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "helper.py", "patch": "+lock helper"}]}
+        run_review(github, B, review())  # The fix (in helper.py) is saved while the finding is still dismissed.
+        github.threads[0]["resolved"] = False  # Withdrawn later.
+        github.heads = [C]
+        github.compares[(B, C)] = {"status": "ahead", "files": [{"filename": "y.py", "patch": "+unrelated"}]}
+        github.compares[(github.merge_base, C)] = {"status": "ahead", "files": [
+            {"filename": "helper.py", "patch": "+lock helper"}, {"filename": "y.py", "patch": "+unrelated"}]}
+        prompts = []
+        run_review(github, C, review(), prompts=prompts)  # A review run: y.py changed.
+        race_prompt = next(p for p in prompts if "Two saves interleave." in p)
+        self.assertIn("+lock helper", race_prompt)
+
     def test_pruned_dismissal_withdrawn_after_the_fixing_push_is_verified_on_a_rerun(self):
         github = self.reviewed()
         state = github.state()
@@ -2249,6 +2270,17 @@ class GateTests(unittest.TestCase):
         code, output = self.gate(github)
         self.assertEqual(code, 1)
         self.assertIn("Design", output)
+
+    def test_a_thread_shared_by_two_findings_dismisses_neither(self):
+        identity = {"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", "Two saves interleave.")}
+        moved = {"id": "1", "path": "moved.py", "header": "Race", "content": "Two saves interleave.",
+                 "state": "ACTIVE", "threads": [identity], "line": None}
+        recreated = {"id": "2", "path": "x.py", "header": "Race", "content": "Two saves interleave.",
+                     "state": "ACTIVE", "threads": [identity], "line": 3}
+        state = {"findings": [moved, recreated]}
+        thread_for_new = current(posted("T_new", "x.py", "Race", "Two saves interleave.", resolved=True))
+        lines = cp.open_findings(state, [thread_for_new], "https://example/checkpoint")
+        self.assertEqual(len(lines), 2)
 
     def test_security_concern_blocks(self):
         code, output = self.gate(self.reviewed(security="Secrets in logs: the token is printed."))
