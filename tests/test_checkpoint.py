@@ -158,6 +158,14 @@ def finding_ids(state, path, header):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_self_review_passes_only_declared_inputs(self):
+        import re
+        declared = set(re.findall(r"^      ([a-z-]+):\n        description:", WORKFLOW.read_text(), re.MULTILINE))
+        caller = (WORKFLOW.parent / "review.yml").read_text().split("    with:\n", 1)[1]
+        passed = set(re.findall(r"^      ([a-z-]+):", caller, re.MULTILINE))
+        self.assertLessEqual(passed, declared)
+        self.assertIn("shadow-verifier-model", passed)
+
     def test_pr_agent_accepts_edited_events(self):
         line = next(l for l in WORKFLOW.read_text().split("\n") if "GITHUB_ACTION_CONFIG.PR_ACTIONS:" in l)
         self.assertIn('"edited"', line)
@@ -474,6 +482,77 @@ class VerifierEffortTests(unittest.TestCase):
     def test_rejected_effort_is_dropped_and_retried(self):
         bodies = self.capture("gpt-6.1-sol", "medium", reject_reasoning=True)
         self.assertEqual(["reasoning" in b for b in bodies], [True, False])
+
+
+class ShadowVerifierTests(unittest.TestCase):
+    def test_primary_answer_decides_and_shadow_answer_is_recorded(self):
+        records = []
+        ask = cp.shadowed(lambda p: ({"verdicts": [{"id": "1", "verdict": "fixed"}]}, {"total_tokens": 5}),
+                          lambda p: ({"verdicts": [{"id": "1", "verdict": "still_present"}]}, {"total_tokens": 1}),
+                          records)
+        answer, used = ask("prompt")
+        self.assertEqual((answer["verdicts"][0]["verdict"], used), ("fixed", {"total_tokens": 5}))
+        self.assertEqual(records[0]["shadow"]["answer"]["verdicts"][0]["verdict"], "still_present")
+        self.assertEqual(records[0]["prompt_sha"], cp.hashlib.sha256(b"prompt").hexdigest()[:12])
+
+    def test_shadow_failure_is_recorded_without_failing_the_run(self):
+        def broken(prompt):
+            raise cp.RunFailed("The verifier request kept failing.")
+        records = []
+        answer, _ = cp.shadowed(lambda p: ({"verdicts": []}, {}), broken, records)("prompt")
+        self.assertEqual(answer, {"verdicts": []})
+        self.assertIn("kept failing", records[0]["shadow"]["error"])
+
+    def test_slow_shadow_times_out_without_holding_up_the_run(self):
+        import threading
+        release = threading.Event()
+        saved, cp.SHADOW_TIMEOUT = cp.SHADOW_TIMEOUT, 0.05
+        records = []
+        try:
+            cp.shadowed(lambda p: ({"verdicts": []}, {}), lambda p: (release.wait(5), {}), records)("prompt")
+        finally:
+            cp.SHADOW_TIMEOUT = saved
+            release.set()
+        self.assertIn("no answer within", records[0]["shadow"]["error"])
+
+    def test_primary_failure_still_fails_the_run(self):
+        def broken(prompt):
+            raise cp.RunFailed("The verifier request kept failing.")
+        with self.assertRaises(cp.RunFailed):
+            cp.shadowed(broken, lambda p: ({"verdicts": []}, {}), [])("prompt")
+
+    def test_model_text_cannot_break_the_summary_table(self):
+        self.assertEqual(cp.table_cell("a|b\n`c` <img>"), "a\\|b 'c' &lt;img>")
+
+    def test_review_records_the_comparison_outside_the_checkpoint(self):
+        import os
+        import tempfile
+        github = FakeGitHub(A, ["x.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        race = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+
+        def answer(verdict):
+            return lambda prompt: ({"verdicts": [{"id": race, "verdict": verdict, "reason": f"{verdict} because",
+                                                  "relies_on": []}]}, {"total_tokens": 10})
+        summary = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
+        summary.close()
+        output = []
+        try:
+            cp.review_main(github, "o/r", "1", B, "gpt-6.1-sol", "gpt-6.1-terra", "medium", {"openai": "k"}, [],
+                           run_review=lambda *a: review(), ask=answer("fixed"), out=output.append,
+                           sleep=lambda _: None, shadow_model="gpt-6-luna", shadow_effort="high",
+                           shadow_ask=answer("still_present"), summary_path=summary.name)
+            report = open(summary.name).read()
+        finally:
+            os.unlink(summary.name)
+        self.assertEqual(github.state()["findings"][0]["state"], "FIXED")  # The primary decided.
+        self.assertIn(f"| `{race}` | fixed |  | still_present |  | **no** |", report)
+        self.assertIn("gpt-6-luna", report)
+        logged = [json.loads(line.split("shadow-verifier: ", 1)[1]) for line in output if line.startswith("shadow-verifier: ")]
+        self.assertEqual(logged[0]["shadow"]["verdicts"][race]["verdict"], "still_present")
+        self.assertNotIn("still_present because", checkpoint_comment(github)["body"])
 
 
 class VerifierFormatTests(unittest.TestCase):

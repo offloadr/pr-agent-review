@@ -93,6 +93,20 @@ security concern from the latest review blocks until a later review reports none
 findings are resolved with the workflow token, unless the thread also matches an active finding.
 Re-running only this job re-evaluates dismissals without paying for a review.
 
+## Comparing verifier models
+
+An optional shadow verifier (`shadow-verifier-model`) answers every verifier request too: the same
+prompt, built once and sent to both models at the same time, so both judge identical inputs. Only
+the primary's verdicts are applied. The shadow's verdicts are recorded in the job summary (a table
+per run, with agreement marked) and in the job log as one JSON line per request, with the prompt's
+hash, both models' verdicts, reasons and `relies_on` lists, token usage, timing and any error. They
+are not stored in the checkpoint. A shadow error, or no answer within 20 minutes, is recorded and
+the run goes on; a primary failure still fails it.
+
+Agreement is not correctness: the comparison is for judging both answers against the code, above
+all an incorrect `fixed` (a defect closed while still present) and an incomplete `relies_on` (a fix
+whose later undoing goes unnoticed).
+
 ## Known limits
 
 - PR-Agent's `review` output has no coverage data, so the files a review left out or clipped for its

@@ -41,6 +41,14 @@ on:
         description: Reasoning effort for the verifier (OpenAI models only).
         type: string
         default: medium
+      shadow-verifier-model:
+        description: Optional model that answers every verifier request too, for comparison only. Its verdicts go to the job summary and log and never change the checkpoint or the gate. Empty turns it off.
+        type: string
+        default: ""
+      shadow-verifier-reasoning-effort:
+        description: Reasoning effort for the shadow verifier (OpenAI models only).
+        type: string
+        default: medium
       instructions:
         description: What the repository is and what the review should focus on. The shared reporting rules are appended.
         type: string
@@ -107,6 +115,8 @@ jobs:
           MODEL: ${{ inputs.model }}
           VERIFIER_MODEL: ${{ inputs.verifier-model }}
           VERIFIER_REASONING_EFFORT: ${{ inputs.verifier-reasoning-effort }}
+          SHADOW_VERIFIER_MODEL: ${{ inputs.shadow-verifier-model }}
+          SHADOW_VERIFIER_REASONING_EFFORT: ${{ inputs.shadow-verifier-reasoning-effort }}
           USER_IGNORE_GLOB: ${{ inputs.ignore-glob }}
           SERVICE_TIER: ${{ inputs.service-tier }}
           ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_KEY }}
@@ -168,6 +178,7 @@ jobs:
           import subprocess
           import sys
           import tempfile
+          import threading
           import time
           import urllib.error
           import urllib.parse
@@ -1287,6 +1298,117 @@ jobs:
               return usage
 
 
+          # ---- Shadow verifier ---------------------------------------------------------------------------
+
+          # How long the run waits for a shadow answer, counted from when the request was sent: room for a Flex
+          # call with its backoff.
+          SHADOW_TIMEOUT = 1200
+
+
+          def shadowed(primary, shadow, records, clock=time.monotonic):
+              """An ask that sends each request to the primary verifier and, at the same time, to the shadow.
+
+              The primary's answer is returned as usual. The shadow's answer, or its error, is only recorded: a
+              shadow failure or timeout never fails the run, and a primary failure still does."""
+              def ask(prompt):
+                  shadow_result = {}
+
+                  def run_shadow():
+                      started = clock()
+                      try:
+                          shadow_result["answer"], shadow_result["usage"] = shadow(prompt)
+                      except Exception as error:  # noqa: BLE001
+                          shadow_result["error"] = f"{type(error).__name__}: {error}"[:300]
+                      shadow_result["seconds"] = round(clock() - started, 1)
+
+                  # A daemon thread, so a shadow call still waiting cannot keep the job from exiting.
+                  thread = threading.Thread(target=run_shadow, daemon=True)
+                  started = clock()
+                  thread.start()
+                  answer, used = primary(prompt)
+                  primary_seconds = round(clock() - started, 1)
+                  thread.join(max(0.0, SHADOW_TIMEOUT - (clock() - started)))
+                  result = dict(shadow_result) if not thread.is_alive() else {
+                      "error": f"no answer within {SHADOW_TIMEOUT} seconds", "seconds": round(clock() - started, 1)}
+                  records.append({"prompt_sha": hashlib.sha256(prompt.encode()).hexdigest()[:12],
+                                  "primary": {"answer": answer, "usage": used, "seconds": primary_seconds},
+                                  "shadow": result})
+                  return answer, used
+              return ask
+
+
+          def answer_entries(answer):
+              """A verifier answer's entries by finding id, as shown in the comparison: verdict (or 'invalid'),
+              relies_on and reason. Entries are only displayed, so a malformed one is shown, not trusted."""
+              items = answer.get("verdicts") if isinstance(answer, dict) else None
+              entries = {}
+              for item in items if isinstance(items, list) else []:
+                  if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                      continue
+                  relies = item.get("relies_on")
+                  entries[item["id"]] = {
+                      "verdict": item.get("verdict") if item.get("verdict") in VERDICTS else "invalid",
+                      "relies_on": [p for p in relies if isinstance(p, str)] if isinstance(relies, list) else [],
+                      "reason": item.get("reason") if isinstance(item.get("reason"), str) else ""}
+              return entries
+
+
+          def table_cell(text, limit=160):
+              """Model text made safe for one Markdown table cell."""
+              text = re.sub(r"\s+", " ", str(text)).replace("|", "\\|").replace("`", "'").replace("<", "&lt;")
+              return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+          def report_shadow(records, head_sha, primary_config, shadow_config, out=print, summary_path=None):
+              """Log each request's primary and shadow answers as JSON, and add a comparison to the job summary."""
+              rows, totals = [], {"primary": [0, 0, 0.0], "shadow": [0, 0, 0.0]}
+              errors = []
+              for record in records:
+                  primary = answer_entries(record["primary"]["answer"])
+                  shadow = answer_entries(record["shadow"].get("answer"))
+                  out("shadow-verifier: " + json.dumps({
+                      "head_sha": head_sha, "prompt_sha": record["prompt_sha"],
+                      "primary": {"model": primary_config[0], "effort": primary_config[1], "verdicts": primary,
+                                  "usage": record["primary"]["usage"], "seconds": record["primary"]["seconds"]},
+                      "shadow": {"model": shadow_config[0], "effort": shadow_config[1], "verdicts": shadow,
+                                 "usage": record["shadow"].get("usage"), "seconds": record["shadow"].get("seconds"),
+                                 "error": record["shadow"].get("error")}}, sort_keys=True))
+                  for name in ("primary", "shadow"):
+                      used = record[name].get("usage") or {}
+                      totals[name][0] += 1
+                      totals[name][1] += int(used.get("total_tokens") or
+                                             (used.get("input_tokens") or 0) + (used.get("output_tokens") or 0))
+                      totals[name][2] += record[name].get("seconds") or 0
+                  if record["shadow"].get("error"):
+                      errors.append(f"`{record['prompt_sha']}`: {table_cell(record['shadow']['error'], 200)}")
+                  for finding_id in sorted(set(primary) | set(shadow)):
+                      p, s = primary.get(finding_id, {}), shadow.get(finding_id, {})
+                      rows.append("| `{}` | {} | {} | {} | {} | {} |".format(
+                          table_cell(finding_id, 40), p.get("verdict", "—"), table_cell(", ".join(p.get("relies_on") or [])),
+                          s.get("verdict", "—"), table_cell(", ".join(s.get("relies_on") or [])),
+                          "yes" if p.get("verdict") == s.get("verdict") and p else "**no**"))
+              if not summary_path:
+                  return
+              lines = [f"### Shadow verifier on {head_sha[:7]}", "",
+                       f"Primary `{primary_config[0]}` ({primary_config[1] or 'default'}) decided; "
+                       f"shadow `{shadow_config[0]}` ({shadow_config[1] or 'default'}) answered the same "
+                       f"{len(records)} request(s) for comparison only. Check verdicts against the code: agreement "
+                       "is not correctness.", ""]
+              if rows:
+                  lines += ["| Finding | Primary | Primary relies on | Shadow | Shadow relies on | Agree |",
+                            "|---|---|---|---|---|---|"] + rows + [""]
+              for name in ("primary", "shadow"):
+                  calls, tokens, seconds = totals[name]
+                  lines.append(f"- {name.capitalize()}: {calls} call(s), {tokens:,} tokens, {seconds:.0f} s in all.")
+              lines += [f"- Shadow error {e}" for e in errors]
+              lines.append("- Reasons are in the job log, on the `shadow-verifier:` lines.")
+              try:
+                  with open(summary_path, "a", encoding="utf-8") as summary_file:
+                      summary_file.write("\n".join(lines) + "\n")
+              except OSError as error:
+                  out(f"::warning::Could not write the shadow verifier summary: {error}")
+
+
           # ---- Review mode -------------------------------------------------------------------------------
 
           CHUNK_CALLS_RE = re.compile(r"Number of PR chunk calls: (\d+)")
@@ -1383,7 +1505,8 @@ jobs:
 
 
           def review_main(github, repo, pr, event_head, model, verifier_model, verifier_effort, keys, user_globs,
-                          run_review=run_pr_agent, ask=None, out=print, sleep=time.sleep):
+                          run_review=run_pr_agent, ask=None, out=print, sleep=time.sleep, shadow_model="", shadow_effort="",
+                          shadow_ask=None, summary_path=None):
               pull = github.pull(repo, pr)
               head_sha, base_sha, base_ref = pull["head"]["sha"], pull["base"]["sha"], pull["base"]["ref"]
               if head_sha != event_head:
@@ -1656,6 +1779,11 @@ jobs:
                               f.pop("rename_unknown", None)
               usage = []
               ask = ask or (lambda prompt: call_model(verifier_model, verifier_effort, prompt, keys))
+              # A shadow verifier answers the same requests for comparison only; its answers never touch the state.
+              shadow_records = []
+              if shadow_model:
+                  shadow_ask = shadow_ask or (lambda prompt: call_model(shadow_model, shadow_effort, prompt, keys))
+                  ask = shadowed(ask, shadow_ask, shadow_records)
               read_file = lambda path: file_at(path, head_sha)  # noqa: E731
               since_checkpoint = (checkpoint or {}).get("head_sha")
 
@@ -1745,6 +1873,10 @@ jobs:
                       out(f"- reopened: {f['path']} {f['header']} ({f['check']['reason'][:120]})")
               for f in to_verify:
                   out(f"- {f['check']['verdict']}: {f['path']} {f['header']} ({f['check']['reason'][:120]})")
+
+              if shadow_model:
+                  report_shadow(shadow_records, head_sha, (verifier_model, verifier_effort), (shadow_model, shadow_effort),
+                                out, summary_path)
 
               # Save only if nothing moved while this run worked: not the head, not the base, and no other
               # run's checkpoint (each save bumps the revision this run planned from).
@@ -1991,6 +2123,7 @@ jobs:
                   sys.exit(gate_main(client, repo, pr, head, summary_path=os.environ.get("GITHUB_STEP_SUMMARY")))
               model = os.environ["MODEL"]
               verifier_model = os.environ.get("VERIFIER_MODEL") or model
+              shadow_model = os.environ.get("SHADOW_VERIFIER_MODEL", "")
               api_keys = {"anthropic": os.environ.get("ANTHROPIC_KEY", ""), "openai": os.environ.get("OPENAI_KEY", "")}
               try:
                   if not os.environ.get("GITHUB_TOKEN"):
@@ -1998,9 +2131,16 @@ jobs:
                   for needed in {provider_of(model), provider_of(verifier_model)}:
                       if not api_keys[needed]:
                           raise RunFailed(f"The {needed} key ({needed.upper()}_KEY secret) is not set.")
+                  if shadow_model and not api_keys[provider_of(shadow_model)]:
+                      # The shadow is for comparison only, so a missing key skips it rather than failing the review.
+                      print(f"::warning::No {provider_of(shadow_model)} key for the shadow verifier; it is skipped.")
+                      shadow_model = ""
                   sys.exit(review_main(client, repo, pr, head, model, verifier_model,
                                        os.environ.get("VERIFIER_REASONING_EFFORT", ""), api_keys,
-                                       json.loads(os.environ.get("USER_IGNORE_GLOB") or "[]")))
+                                       json.loads(os.environ.get("USER_IGNORE_GLOB") or "[]"),
+                                       shadow_model=shadow_model,
+                                       shadow_effort=os.environ.get("SHADOW_VERIFIER_REASONING_EFFORT", ""),
+                                       summary_path=os.environ.get("GITHUB_STEP_SUMMARY")))
               except RunFailed as failure:
                   print(f"::error::{failure}")
                   sys.exit(1)
