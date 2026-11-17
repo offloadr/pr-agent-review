@@ -1995,7 +1995,12 @@ class PrAgentProcessTests(unittest.TestCase):
                     "CONFIG.REASONING_EFFORT": "high", "CONFIG.MAX_MODEL_TOKENS": "200000"}
         try:
             with mock.patch.dict(os.environ, settings):
-                return cp.run_pr_agent(plan_result, pr_paths, ["**/package-lock.json"], model, keys)
+                # run_pr_agent gives PR-Agent its own copy of the environment and leaves this one alone; checked
+                # here, inside the patch, since leaving the patch restores the environment whatever happened.
+                before = dict(os.environ)
+                result = cp.run_pr_agent(plan_result, pr_paths, ["**/package-lock.json"], model, keys)
+                self.assertEqual(dict(os.environ), before, "run_pr_agent changed the environment")
+                return result
         finally:
             cp.PR_AGENT = saved
             os.unlink(probe.name)
@@ -2008,7 +2013,22 @@ class PrAgentProcessTests(unittest.TestCase):
             before = dict(os.environ)
             self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"}, {"mode": "full", "files": ["x.py"]},
                           {"x.py"})
-            self.assertEqual(dict(os.environ), before)
+            self.assertEqual(dict(os.environ), before)  # The helper's own settings are gone again.
+
+    def test_a_run_that_changed_the_environment_would_be_caught(self):
+        import os
+        from unittest import mock
+        real = cp.run_pr_agent
+
+        def mutating(*args):
+            result = real(*args)
+            os.environ["CONFIG.REASONING_EFFORT"] = "changed"
+            return result
+
+        with mock.patch.object(cp, "run_pr_agent", mutating), self.assertRaises(AssertionError) as failure:
+            self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"}, {"mode": "full", "files": ["x.py"]},
+                          {"x.py"})
+        self.assertIn("run_pr_agent changed the environment", str(failure.exception))
 
     def test_delta_run_ignores_other_files_and_gets_only_its_providers_key(self):
         result = self.run_with("anthropic/claude-opus-5-5", {"anthropic": "a-key", "openai": "o-key"},
