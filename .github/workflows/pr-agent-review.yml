@@ -169,6 +169,7 @@ jobs:
             Do not report missing tests as a standalone finding. When you report a concrete defect, describe the focused test that would expose it.
         # Standard library only; tests/test_checkpoint.py loads this script from this file.
         run: &checkpoint_script |
+          import base64
           import calendar
           import contextlib
           import difflib
@@ -176,6 +177,7 @@ jobs:
           import hashlib
           import http.client
           import http.server
+          import ipaddress
           import json
           import os
           import re
@@ -1489,32 +1491,96 @@ jobs:
                   def https_open(self, request):
                       return self.do_open(HTTPS, request, context=ssl.create_default_context())
 
-              return urllib.request.build_opener(urllib.request.ProxyHandler(upstream_proxies()), HTTPHandler,
-                                                 HTTPSHandler)
+              class Routing(urllib.request.BaseHandler):
+                  """Sends each call through the proxy httpx would choose for it, with Basic proxy credentials."""
+                  handler_order = 100  # Before the handlers that open the connection, as ProxyHandler.
+
+                  def route(self, request):
+                      proxy = httpx_proxy_for(request.full_url)
+                      if proxy is None:
+                          return None
+                      parts = urllib.parse.urlsplit(proxy)
+                      if parts.username is not None:
+                          credentials = f"{urllib.parse.unquote(parts.username)}:{urllib.parse.unquote(parts.password or '')}"
+                          request.add_header("Proxy-authorization",
+                                             "Basic " + base64.b64encode(credentials.encode()).decode())
+                      request.set_proxy(parts.netloc.rpartition("@")[2], parts.scheme)
+                      return None  # The connection handlers open it, tunnelling an HTTPS call.
+
+                  http_open = https_open = route
+
+              # The empty ProxyHandler replaces urllib's own, whose NO_PROXY matching differs from httpx's.
+              return urllib.request.build_opener(urllib.request.ProxyHandler({}), Routing, HTTPHandler, HTTPSHandler)
 
 
-          def upstream_proxies():
-              """The environment's proxies for the relay's upstream calls, read as httpx reads them.
+          def httpx_proxy_for(url):
+              """The proxy that httpx 0.28, which PR-Agent used to reach OpenAI directly, would use for `url`, or None
+              for a direct connection: its reading of HTTP(S)_PROXY, ALL_PROXY and NO_PROXY
+              (httpx._utils.get_environment_proxies and URLPattern), so moving the calls into the relay does not
+              change where they go."""
+              info = urllib.request.getproxies()
+              mounts = {}
+              for scheme in ("http", "https", "all"):
+                  if info.get(scheme):
+                      proxy = info[scheme]
+                      mounts[f"{scheme}://"] = proxy if "://" in proxy else f"http://{proxy}"
+              for host in (h.strip() for h in info.get("no", "").split(",")):
+                  if host == "*":
+                      return None
+                  if not host:
+                      continue
+                  if "://" in host:
+                      mounts[host] = None
+                  elif is_ip(host, ipaddress.IPv4Address):
+                      mounts[f"all://{host}"] = None
+                  elif is_ip(host, ipaddress.IPv6Address):
+                      mounts[f"all://[{host}]"] = None
+                  elif host.lower() == "localhost":
+                      mounts[f"all://{host}"] = None
+                  else:
+                      mounts[f"all://*{host}"] = None
+              target = urllib.parse.urlsplit(url)
+              target_port = default_port_dropped(target.scheme, target.port)
+              patterns = []
+              for order, (pattern, proxy) in enumerate(mounts.items()):
+                  parts = urllib.parse.urlsplit(pattern)
+                  scheme = "" if parts.scheme == "all" else parts.scheme
+                  host = "" if parts.hostname in (None, "*") else parts.hostname
+                  port = default_port_dropped(parts.scheme, parts.port)
+                  # httpx tries the most specific pattern first: with a port, then the longest host, then scheme.
+                  patterns.append(((0 if port is not None else 1, -len(host), -len(scheme), order),
+                                   scheme, host, port, proxy))
+              for _, scheme, host, port, proxy in sorted(patterns):
+                  if scheme and scheme != target.scheme:
+                      continue
+                  if host.startswith("*."):
+                      host_matches = re.match(rf"^.+\.{re.escape(host[2:])}$", target.hostname or "")
+                  elif host.startswith("*"):
+                      host_matches = re.match(rf"^(.+\.)?{re.escape(host[1:])}$", target.hostname or "")
+                  else:
+                      host_matches = not host or host == target.hostname
+                  if host_matches and (port is None or port == target_port):
+                      return proxy
+              return None
 
-              httpx, which PR-Agent used to reach OpenAI directly, also takes ALL_PROXY, and reads a proxy without a
-              scheme as an HTTP proxy; urllib does neither for HTTP and HTTPS, so both are applied here. NO_PROXY
-              still applies, through urllib's own bypass check."""
-              proxies = urllib.request.getproxies()
-              fallback = proxies.get("all", "")
-              if fallback and "://" not in fallback:
-                  fallback = "http://" + fallback
-              if urllib.parse.urlsplit(fallback).scheme in ("http", "https"):
-                  for scheme in ("http", "https"):
-                      proxies.setdefault(scheme, fallback)
-              return proxies
+
+          def is_ip(host, kind):
+              try:
+                  kind(host.split("/")[0])
+              except ValueError:
+                  return False
+              return True
 
 
-          def tls_proxy_for(url):
-              """Whether calls to `url` go through a proxy reached over TLS, which urllib cannot do: it would send
-              CONNECT, and any proxy credentials, in plain text."""
-              host = urllib.parse.urlsplit(url).hostname
-              proxy = upstream_proxies().get(urllib.parse.urlsplit(url).scheme, "")
-              return urllib.parse.urlsplit(proxy).scheme == "https" and not urllib.request.proxy_bypass(host)
+          def default_port_dropped(scheme, port):
+              return None if port == {"http": 80, "https": 443}.get(scheme) else port
+
+
+          def relay_cannot_reach(url):
+              """Whether the proxy for `url` is one urllib cannot use: over TLS, where it would send CONNECT and any
+              proxy credentials in plain text, or another kind than HTTP, such as SOCKS."""
+              proxy = httpx_proxy_for(url)
+              return proxy is not None and urllib.parse.urlsplit(proxy).scheme != "http"
 
 
           class FlexRelay:
@@ -1692,9 +1758,9 @@ jobs:
                       env["ANTHROPIC.KEY"] = keys["anthropic"]
                   else:
                       env["OPENAI_KEY"] = keys["openai"]
-                      if tier and tls_proxy_for(OPENAI_API):
-                          print(f"::notice::OpenAI is reached through a TLS proxy, which the Flex relay cannot use; "
-                                f"the review runs on the standard tier instead of {tier}.", flush=True)
+                      if tier and relay_cannot_reach(OPENAI_API):
+                          print(f"::notice::OpenAI is reached through a proxy the Flex relay cannot use (TLS or not "
+                                f"HTTP); the review runs on the standard tier instead of {tier}.", flush=True)
                       elif tier and (tier != "flex" or supports_flex(model)):
                           # The relay sets the tier on each call and moves a refused call to the standard tier.
                           # A minute under PR-Agent's call timeout, so the relay always answers first.

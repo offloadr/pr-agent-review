@@ -2082,15 +2082,15 @@ class PrAgentProcessTests(unittest.TestCase):
         saved = {k: os.environ.pop(k, None) for k in names}
         try:
             os.environ["HTTPS_PROXY"] = "https://user:pass@proxy.invalid:443"
-            self.assertTrue(cp.tls_proxy_for(cp.OPENAI_API))
+            self.assertTrue(cp.relay_cannot_reach(cp.OPENAI_API))
             seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
                                  {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
             self.assertIsNone(seen["OPENAI.API_BASE"])
             os.environ["NO_PROXY"] = "api.openai.com"
-            self.assertFalse(cp.tls_proxy_for(cp.OPENAI_API))
+            self.assertFalse(cp.relay_cannot_reach(cp.OPENAI_API))
             os.environ.pop("NO_PROXY")
             os.environ["HTTPS_PROXY"] = "http://proxy.invalid:3128"
-            self.assertFalse(cp.tls_proxy_for(cp.OPENAI_API))
+            self.assertFalse(cp.relay_cannot_reach(cp.OPENAI_API))
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None)
@@ -2358,6 +2358,75 @@ class FlexRelayTests(unittest.TestCase):
                     with self.relay("http://openai.invalid", [], []) as relay:
                         self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}), given)
                 self.assertEqual(proxy.calls[0][0], "http://openai.invalid/v1/chat/completions", given)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_a_scheme_qualified_exclusion_keeps_the_call_off_a_rejecting_proxy(self):
+        import os
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "no_proxy")
+        saved = {k: os.environ.pop(k, None) for k in names}
+        try:
+            with FakeOpenAI([(403, {"error": "blocked"})]) as proxy, FakeOpenAI([(200, {"ok": 1})]) as openai:
+                os.environ.update({"HTTP_PROXY": proxy.url, "NO_PROXY": openai.url})  # As http://127.0.0.1:port.
+                with self.relay(openai.url, [], []) as relay:
+                    self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertEqual((len(openai.calls), proxy.calls), (1, []))
+
+    def test_proxy_credentials_go_to_the_proxy(self):
+        import base64
+        import os
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "no_proxy")
+        saved = {k: os.environ.pop(k, None) for k in names}
+        try:
+            with FakeOpenAI([(200, {"ok": 1})]) as proxy:
+                os.environ["HTTP_PROXY"] = proxy.url.replace("http://", "http://us%40er:p%3Ass@")
+                with self.relay("http://openai.invalid", [], []) as relay:
+                    self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        header = proxy.calls[0][1].get("Proxy-Authorization") or proxy.calls[0][1].get("Proxy-authorization")
+        self.assertEqual(base64.b64decode(header.removeprefix("Basic ")), b"us@er:p:ss")
+
+    def test_proxy_choice_follows_httpx(self):
+        # Expected answers are what httpx 0.28.1, in the pinned PR-Agent image, chooses for the same settings.
+        import os
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "no_proxy")
+        url = "https://api.openai.com/v1/chat/completions"
+        cases = [
+            ({"HTTPS_PROXY": "http://p:1"}, "http://p:1"),
+            ({"HTTPS_PROXY": "p:1"}, "http://p:1"),
+            ({"ALL_PROXY": "p:1"}, "http://p:1"),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "https://api.openai.com"}, None),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "http://api.openai.com"}, "http://p:1"),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "openai.com"}, None),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": ".openai.com"}, None),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "i.openai.com"}, "http://p:1"),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "corp.example, *"}, None),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "https://api.openai.com:8443"}, "http://p:1"),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "https://api.openai.com:443"}, None),
+            ({"HTTP_PROXY": "http://p:1"}, None),
+        ]
+        saved = {k: os.environ.pop(k, None) for k in names}
+        try:
+            for settings, expected in cases:
+                for k in names:
+                    os.environ.pop(k, None)
+                os.environ.update(settings)
+                self.assertEqual(cp.httpx_proxy_for(url), expected, settings)
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None)
