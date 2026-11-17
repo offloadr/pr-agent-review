@@ -2400,6 +2400,33 @@ class FlexRelayTests(unittest.TestCase):
         header = proxy.calls[0][1].get("Proxy-Authorization") or proxy.calls[0][1].get("Proxy-authorization")
         self.assertEqual(base64.b64decode(header.removeprefix("Basic ")), b"us@er:p:ss")
 
+    def test_a_proxy_without_a_port_is_reached_on_its_schemes_default_port(self):
+        import os
+        import socket
+        from unittest import mock
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "no_proxy")
+        saved = {k: os.environ.pop(k, None) for k in names}
+        dialled, real = [], socket.create_connection
+
+        def record(address, *args, **kwargs):
+            if address[0].endswith(".invalid"):
+                dialled.append(address[:2])
+                raise ConnectionRefusedError("recorded")
+            return real(address, *args, **kwargs)
+
+        try:
+            os.environ["HTTPS_PROXY"] = "http://proxy.invalid"
+            with mock.patch("socket.create_connection", record), \
+                    self.relay("https://openai.invalid", [], []) as relay:
+                self.assertEqual(self.call(relay, {"model": "m", "messages": []})[0], 502)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertEqual(dialled, [("proxy.invalid", 80)])
+
     def test_proxy_choice_follows_httpx(self):
         # Expected answers are what httpx 0.28.1, in the pinned PR-Agent image, chooses for the same settings.
         import os

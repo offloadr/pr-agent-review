@@ -1504,7 +1504,10 @@ jobs:
                           credentials = f"{urllib.parse.unquote(parts.username)}:{urllib.parse.unquote(parts.password or '')}"
                           request.add_header("Proxy-authorization",
                                              "Basic " + base64.b64encode(credentials.encode()).decode())
-                      request.set_proxy(parts.netloc.rpartition("@")[2], parts.scheme)
+                      # The port is always given: without one, a tunnelled HTTPS call would reach the proxy on 443.
+                      host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+                      port = parts.port or {"http": 80, "https": 443}[parts.scheme]
+                      request.set_proxy(f"{host}:{port}", parts.scheme)
                       return None  # The connection handlers open it, tunnelling an HTTPS call.
 
                   http_open = https_open = route
