@@ -2056,6 +2056,24 @@ class PrAgentProcessTests(unittest.TestCase):
         self.assertTrue(seen["relay_bypasses_proxy"])
         self.assertTrue(seen["github_bypasses_proxy"])
 
+    def test_the_lowercase_exclusion_keeps_its_precedence(self):
+        # Python and httpx use no_proxy over NO_PROXY, so GitHub stays on the proxy here; only the relay leaves it.
+        import os
+        saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy")}
+        os.environ.update({"HTTP_PROXY": "http://proxy.invalid:3128", "HTTPS_PROXY": "http://proxy.invalid:3128",
+                           "NO_PROXY": "*", "no_proxy": "corp.example"})
+        try:
+            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertTrue(seen["relay_bypasses_proxy"])
+        self.assertFalse(seen["github_bypasses_proxy"])
+        self.assertEqual(seen["no_proxy"], "corp.example,127.0.0.1")
+
     def test_failure_or_missing_output_is_a_failed_run(self):
         with self.assertRaises(cp.RunFailed):
             self.run_with("gpt-6.1-sol", {"openai": "k"}, {"mode": "full", "files": []}, set(), exit_code=1)

@@ -1570,7 +1570,10 @@ jobs:
                       if kind == "late" and status:
                           # OpenAI may still run and bill a request it already received, however the connection
                           # ended, so a retry could pay for the chunk twice. As for any chunk that fails, the review
-                          # fails instead: neither the OpenAI client nor PR-Agent retries a 422 marked this way.
+                          # fails instead. The OpenAI client does not retry a 422 marked this way, and PR-Agent 0.49.0
+                          # does not retry its error either: LiteLLM raises it as BadRequestError, which
+                          # _should_retry_same_model in pr_agent/algo/ai_handlers/litellm_ai_handler.py excludes
+                          # (checked against the pinned image: one upstream call, then the error).
                           self.reply(handler, 422, {"Content-Type": "application/json", "x-should-retry": "false"},
                                      json.dumps({"error": {"message": "OpenAI did not answer within the relay's "
                                                            "deadline. The call is not retried, since OpenAI may "
@@ -1670,12 +1673,14 @@ jobs:
                           deadline = int(os.environ.get("CONFIG.AI_TIMEOUT") or 1200) - 60
                           env["OPENAI.API_BASE"] = stack.enter_context(FlexRelay(tier, deadline)).api_base
                           # A configured HTTP proxy would otherwise get the relay's calls, and the API key with
-                          # them. Both spellings carry the union, as Python and httpx read either.
-                          bypass = [h.strip() for name in ("NO_PROXY", "no_proxy")
-                                    for h in env.get(name, "").split(",") if h.strip()]
+                          # them. The loopback exclusion extends the setting in effect: Python and httpx use
+                          # no_proxy whenever it is set, even empty, and NO_PROXY only otherwise. Both spellings
+                          # then carry the result, so either reader sees the same exclusions as before plus the relay.
+                          bypass = env["no_proxy"] if "no_proxy" in env else env.get("NO_PROXY", "")
+                          hosts = [h.strip() for h in bypass.split(",") if h.strip()]
                           # Python honours "*" only as the whole value, so a wildcard stays on its own.
-                          env["NO_PROXY"] = env["no_proxy"] = "*" if "*" in bypass else ",".join(
-                              dict.fromkeys(bypass + ["127.0.0.1"]))
+                          env["NO_PROXY"] = env["no_proxy"] = "*" if bypass.strip() == "*" else ",".join(
+                              dict.fromkeys(hosts + ["127.0.0.1"]))
                   env.update({
                       "GITHUB_OUTPUT": output_path,
                       "GITHUB_ACTION_CONFIG.ENABLE_OUTPUT": "true",
