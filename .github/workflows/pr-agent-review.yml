@@ -179,6 +179,8 @@ jobs:
           import json
           import os
           import re
+          import socket
+          import ssl
           import subprocess
           import sys
           import tempfile
@@ -1438,6 +1440,30 @@ jobs:
 
           # ---- Review mode -------------------------------------------------------------------------------
 
+          def tracking_opener(sockets):
+              """A urllib opener, proxies included, that adds each connection's socket to `sockets` once connected."""
+              class Tracked:
+                  def connect(self):
+                      super().connect()
+                      sockets.append(self.sock)
+
+              class HTTP(Tracked, http.client.HTTPConnection):
+                  pass
+
+              class HTTPS(Tracked, http.client.HTTPSConnection):
+                  pass
+
+              class HTTPHandler(urllib.request.HTTPHandler):
+                  def http_open(self, request):
+                      return self.do_open(HTTP, request)
+
+              class HTTPSHandler(urllib.request.HTTPSHandler):
+                  def https_open(self, request):
+                      return self.do_open(HTTPS, request, context=ssl.create_default_context())
+
+              return urllib.request.build_opener(HTTPHandler, HTTPSHandler)
+
+
           class FlexRelay:
               """A local OpenAI endpoint for PR-Agent that puts each of its requests on the Flex tier.
 
@@ -1461,11 +1487,12 @@ jobs:
               ATTEMPT_SECONDS = 900
 
               def __init__(self, tier, deadline, upstream=None, sleep=time.sleep, clock=time.monotonic, out=None,
-                           urlopen=urllib.request.urlopen):
+                           open_upstream=None):
                   self.tier, self.deadline, self.sleep, self.clock = tier, deadline, sleep, clock
                   self.upstream = (upstream or OPENAI_API).rstrip("/")
                   self.out = out or (lambda message: print(message, flush=True))
-                  self.urlopen = urlopen
+                  self.open_upstream = open_upstream or (
+                      lambda request, timeout, sockets: tracking_opener(sockets).open(request, timeout=timeout))
                   self.server = None
 
               def __enter__(self):
@@ -1541,15 +1568,15 @@ jobs:
               def exchange(self, request, remaining):
                   """Send one upstream request and read its whole answer, or None when that takes past the deadline.
 
-                  The socket timeout bounds each read, not the whole answer, so the exchange runs on its own thread
-                  and the relay stops waiting for it at the deadline. Reading in full makes an answer cut off upstream
-                  a gateway error rather than a short 200."""
-                  outcome = []
+                  The socket timeout bounds each read, not the whole answer, so the exchange runs on its own thread.
+                  At the deadline the relay cuts its connection, so the call does not run on beside PR-Agent's retry
+                  of it. Reading in full makes an answer cut off upstream a gateway error rather than a short 200."""
+                  outcome, sockets = [], []
 
                   def run():
                       try:
                           try:
-                              with self.urlopen(request, timeout=min(self.ATTEMPT_SECONDS, remaining)) as response:
+                              with self.open_upstream(request, min(self.ATTEMPT_SECONDS, remaining), sockets) as response:
                                   outcome.append(("answer", response.status, response.headers, response.read()))
                           except urllib.error.HTTPError as error:
                               with error:  # Reading an error's body can fail too, as a transport failure.
@@ -1560,7 +1587,15 @@ jobs:
                   worker = threading.Thread(target=run, daemon=True)
                   worker.start()
                   worker.join(remaining)
-                  return outcome[0] if outcome else None
+                  if outcome:
+                      return outcome[0]
+                  for sock in list(sockets):
+                      try:
+                          sock.shutdown(socket.SHUT_RDWR)  # Wakes the worker's blocked read, which then closes it.
+                      except OSError:
+                          pass
+                  worker.join(5)
+                  return None
 
               def fail(self, handler, status, message):
                   self.reply(handler, status, {"Content-Type": "application/json"},
@@ -1602,7 +1637,9 @@ jobs:
                           # them. Both spellings carry the union, as Python and httpx read either.
                           bypass = [h.strip() for name in ("NO_PROXY", "no_proxy")
                                     for h in env.get(name, "").split(",") if h.strip()]
-                          env["NO_PROXY"] = env["no_proxy"] = ",".join(dict.fromkeys(bypass + ["127.0.0.1"]))
+                          # Python honours "*" only as the whole value, so a wildcard stays on its own.
+                          env["NO_PROXY"] = env["no_proxy"] = "*" if "*" in bypass else ",".join(
+                              dict.fromkeys(bypass + ["127.0.0.1"]))
                   env.update({
                       "GITHUB_OUTPUT": output_path,
                       "GITHUB_ACTION_CONFIG.ENABLE_OUTPUT": "true",

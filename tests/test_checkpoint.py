@@ -1965,6 +1965,7 @@ class PrAgentProcessTests(unittest.TestCase):
             seen["NO_PROXY"], seen["no_proxy"] = os.environ.get("NO_PROXY"), os.environ.get("no_proxy")
             seen["relay_bypasses_proxy"] = bool(os.environ.get("OPENAI.API_BASE")) and urllib.request.proxy_bypass_environment(
                 urllib.parse.urlsplit(os.environ["OPENAI.API_BASE"]).netloc)
+            seen["github_bypasses_proxy"] = urllib.request.proxy_bypass_environment("api.github.com")
             if {call_api!r}:
                 request = urllib.request.Request(os.environ["OPENAI.API_BASE"] + "/chat/completions", method="POST",
                                                  data=json.dumps({{"model": "m", "messages": []}}).encode(),
@@ -2037,6 +2038,23 @@ class PrAgentProcessTests(unittest.TestCase):
                     os.environ[k] = v
         self.assertTrue(seen["relay_bypasses_proxy"])
         self.assertEqual((seen["NO_PROXY"], seen["no_proxy"]), ("corp.example,127.0.0.1", "corp.example,127.0.0.1"))
+
+    def test_a_proxy_wildcard_exclusion_stays_a_wildcard(self):
+        import os
+        saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy")}
+        os.environ.update({"HTTP_PROXY": "http://proxy.invalid:3128", "HTTPS_PROXY": "http://proxy.invalid:3128",
+                           "no_proxy": "*"})
+        try:
+            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertEqual((seen["NO_PROXY"], seen["no_proxy"]), ("*", "*"))
+        self.assertTrue(seen["relay_bypasses_proxy"])
+        self.assertTrue(seen["github_bypasses_proxy"])
 
     def test_failure_or_missing_output_is_a_failed_run(self):
         with self.assertRaises(cp.RunFailed):
@@ -2156,7 +2174,7 @@ class FlexRelayTests(unittest.TestCase):
                 return BUSY
             return 200, {"ok": 1}
 
-        def urlopen(request, timeout):
+        def open_upstream(request, timeout, sockets):
             timeouts.append((now[0], timeout))
             return urllib.request.urlopen(request, timeout=10)
 
@@ -2168,7 +2186,7 @@ class FlexRelayTests(unittest.TestCase):
         try:
             with FakeOpenAI(answer) as openai, cp.FlexRelay("flex", 1140, upstream=openai.url, sleep=sleep,
                                                             clock=lambda: now[0], out=lambda m: None,
-                                                            urlopen=urlopen) as relay:
+                                                            open_upstream=open_upstream) as relay:
                 self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
         finally:
             cp.FLEX_BACKOFF = saved
@@ -2197,6 +2215,8 @@ class FlexRelayTests(unittest.TestCase):
         import threading
         import time
 
+        cut, finished = threading.Event(), threading.Event()
+
         class Dripping(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 self.rfile.read(int(self.headers["Content-Length"]))
@@ -2208,8 +2228,9 @@ class FlexRelayTests(unittest.TestCase):
                         self.wfile.write(b" ")
                         self.wfile.flush()
                         time.sleep(0.05)
+                    finished.set()
                 except OSError:
-                    pass
+                    cut.set()
 
             def log_message(self, *args):
                 pass
@@ -2227,6 +2248,9 @@ class FlexRelayTests(unittest.TestCase):
             server.server_close()
         self.assertEqual(status, 504)
         self.assertLess(elapsed, 1.5)  # The whole answer would take 2 s.
+        # The relay cut the call rather than leaving it to run on beside PR-Agent's retry.
+        self.assertTrue(cut.wait(1))
+        self.assertFalse(finished.is_set())
 
     def test_an_answer_cut_off_upstream_is_a_gateway_error_not_a_short_200(self):
         import http.server
