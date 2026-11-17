@@ -2218,7 +2218,8 @@ class PrAgentProcessTests(unittest.TestCase):
         # The workflow sets CONFIG.MODEL to the model input; PR-Agent gets it exactly as given.
         seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
                              {"mode": "full", "files": ["x.py"]}, {"x.py"},
-                             environ={"CONFIG.MODEL": "gpt-6.1-sol"})["seen"]
+                             environ={"CONFIG.MODEL": "gpt-6.1-sol", "CONFIG.CUSTOM_MODEL_MAX_TOKENS": None,
+                                      "CONFIG.TEMPERATURE": None})["seen"]  # Whatever the runner sets.
         self.assertEqual((seen["CONFIG.MODEL"], seen["CONFIG.CUSTOM_MODEL_MAX_TOKENS"], seen["CONFIG.TEMPERATURE"]),
                          ("gpt-6.1-sol", None, None))
 
