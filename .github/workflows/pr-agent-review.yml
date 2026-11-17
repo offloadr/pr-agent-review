@@ -146,8 +146,9 @@ jobs:
           CONFIG.MAX_OUTPUT_TOKENS: "64000"
           CONFIG.PATCH_EXTRA_LINES_BEFORE: "10"
           CONFIG.PATCH_EXTRA_LINES_AFTER: "5"
-          # Flex requests queue for capacity, so they get longer.
-          CONFIG.AI_TIMEOUT: ${{ inputs.service-tier == 'flex' && '900' || '600' }}
+          # Flex requests queue for capacity, so they get longer, plus the relay's waits for Flex capacity
+          # before it sends a call on the standard tier. The relay answers a minute before this.
+          CONFIG.AI_TIMEOUT: ${{ inputs.service-tier == 'flex' && '1200' || '600' }}
           CONFIG.PROPAGATE_TOOL_ERRORS: "true"
           CONFIG.RESTRICTED_MODE: "true"
           CONFIG.OUTPUT_RUN_DETAILS: "true"
@@ -168,13 +169,20 @@ jobs:
             Do not report missing tests as a standalone finding. When you report a concrete defect, describe the focused test that would expose it.
         # Standard library only; tests/test_checkpoint.py loads this script from this file.
         run: &checkpoint_script |
+          import base64
           import calendar
+          import contextlib
           import difflib
           import fnmatch
           import hashlib
+          import http.client
+          import http.server
+          import ipaddress
           import json
           import os
           import re
+          import socket
+          import ssl
           import subprocess
           import sys
           import tempfile
@@ -200,6 +208,7 @@ jobs:
           FORCE_PUSH_FILES = 60
           # Waits before retrying Flex when it has no capacity, before falling back to the standard tier.
           FLEX_BACKOFF = (30, 60, 120)
+          OPENAI_API = "https://api.openai.com"
           PR_AGENT = ["/app/.venv/bin/python", "/app/pr_agent/servers/github_action_runner.py"]
           VERDICTS = ("fixed", "still_present", "uncertain")
           FILE_CONTEXT_CHARS = 150_000
@@ -1433,33 +1442,328 @@ jobs:
 
           # ---- Review mode -------------------------------------------------------------------------------
 
-          CHUNK_CALLS_RE = re.compile(r"Number of PR chunk calls: (\d+)")
-          TIER_REJECTED_RE = re.compile(r"service_tier[^\n]{0,160}(not supported|unsupported|invalid)|"
-                                        r"(not supported|unsupported|invalid)[^\n]{0,160}service_tier", re.IGNORECASE)
+          class UpstreamCall:
+              """The connections of one relayed call, which the relay can cancel at its deadline.
+
+              A connection that finishes connecting after the cancel is closed before anything is sent on it."""
+
+              def __init__(self):
+                  self.lock, self.sockets, self.cancelled = threading.Lock(), [], False
+
+              def register(self, sock):
+                  with self.lock:
+                      if self.cancelled:
+                          sock.close()
+                          raise ConnectionAbortedError("The relay gave up on this call before it was sent.")
+                      self.sockets.append(sock)
+
+              def cancel(self):
+                  """Cut the call's connections; returns whether the request may have reached OpenAI."""
+                  with self.lock:
+                      self.cancelled = True
+                      sockets = list(self.sockets)
+                  for sock in sockets:
+                      try:
+                          sock.shutdown(socket.SHUT_RDWR)  # Wakes a blocked read, which then closes the socket.
+                      except OSError:
+                          pass
+                  return bool(sockets)
 
 
-          def run_streaming(command, env):
-              """Run a command, echoing its output as it arrives.
+          def tracking_opener(call):
+              """A urllib opener, proxies included, whose connections register with `call` once connected."""
+              class Tracked:
+                  def connect(self):
+                      super().connect()
+                      call.register(self.sock)
 
-              Returns (exit code, the output's tail, the most PR chunk calls PR-Agent announced). The chunk count
-              is read as lines pass, so a long log cannot push it out of the tail."""
-              tail, chunks = [], 0
-              with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, errors="replace") as process:
-                  for line in process.stdout:
-                      sys.stdout.write(line)
-                      match = CHUNK_CALLS_RE.search(line)
-                      if match:
-                          chunks = max(chunks, int(match.group(1)))
-                      tail.append(line)
-                      del tail[:-2000]
-              sys.stdout.flush()
-              return process.returncode, "".join(tail), chunks
+              class HTTP(Tracked, http.client.HTTPConnection):
+                  pass
+
+              class HTTPS(Tracked, http.client.HTTPSConnection):
+                  pass
+
+              class HTTPHandler(urllib.request.HTTPHandler):
+                  def http_open(self, request):
+                      return self.do_open(HTTP, request)
+
+              class HTTPSHandler(urllib.request.HTTPSHandler):
+                  def https_open(self, request):
+                      return self.do_open(HTTPS, request, context=ssl.create_default_context())
+
+              class Routing(urllib.request.BaseHandler):
+                  """Sends each call through the proxy httpx would choose for it, with Basic proxy credentials."""
+                  handler_order = 100  # Before the handlers that open the connection, as ProxyHandler.
+
+                  def route(self, request):
+                      proxy = httpx_proxy_for(request.full_url)
+                      if proxy is None:
+                          return None
+                      parts = urllib.parse.urlsplit(proxy)
+                      if parts.username is not None:
+                          credentials = f"{urllib.parse.unquote(parts.username)}:{urllib.parse.unquote(parts.password or '')}"
+                          request.add_header("Proxy-authorization",
+                                             "Basic " + base64.b64encode(credentials.encode()).decode())
+                      # The port is always given: without one, a tunnelled HTTPS call would reach the proxy on 443.
+                      host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+                      port = parts.port or {"http": 80, "https": 443}[parts.scheme]
+                      request.set_proxy(f"{host}:{port}", parts.scheme)
+                      return None  # The connection handlers open it, tunnelling an HTTPS call.
+
+                  http_open = https_open = route
+
+              # The empty ProxyHandler replaces urllib's own, whose NO_PROXY matching differs from httpx's.
+              return urllib.request.build_opener(urllib.request.ProxyHandler({}), Routing, HTTPHandler, HTTPSHandler)
 
 
-          def flex_refused(log):
-              """Flex had no capacity, or the model does not offer the tier."""
-              return FLEX_UNAVAILABLE in log or TIER_REJECTED_RE.search(log) is not None
+          def httpx_proxy_for(url):
+              """The proxy that httpx 0.28, which PR-Agent used to reach OpenAI directly, would use for `url`, or None
+              for a direct connection: its reading of HTTP(S)_PROXY, ALL_PROXY and NO_PROXY
+              (httpx._utils.get_environment_proxies and URLPattern), so moving the calls into the relay does not
+              change where they go."""
+              info = urllib.request.getproxies()
+              mounts = {}
+              for scheme in ("http", "https", "all"):
+                  if info.get(scheme):
+                      proxy = info[scheme]
+                      mounts[f"{scheme}://"] = proxy if "://" in proxy else f"http://{proxy}"
+              for host in (h.strip() for h in info.get("no", "").split(",")):
+                  if host == "*":
+                      return None
+                  if not host:
+                      continue
+                  if "://" in host:
+                      mounts[host] = None
+                  elif is_ip(host, ipaddress.IPv4Address):
+                      mounts[f"all://{host}"] = None
+                  elif is_ip(host, ipaddress.IPv6Address):
+                      mounts[f"all://[{host}]"] = None
+                  elif host.lower() == "localhost":
+                      mounts[f"all://{host}"] = None
+                  else:
+                      mounts[f"all://*{host}"] = None
+              target = urllib.parse.urlsplit(url)
+              target_port = default_port_dropped(target.scheme, target.port)
+              patterns = []
+              for order, (pattern, proxy) in enumerate(mounts.items()):
+                  parts = urllib.parse.urlsplit(pattern)
+                  scheme = "" if parts.scheme == "all" else parts.scheme
+                  host = "" if parts.hostname in (None, "*") else parts.hostname
+                  port = default_port_dropped(parts.scheme, parts.port)
+                  # httpx tries the most specific pattern first: with a port, then the longest host, then scheme.
+                  patterns.append(((0 if port is not None else 1, -len(host), -len(scheme), order),
+                                   scheme, host, port, proxy))
+              for _, scheme, host, port, proxy in sorted(patterns):
+                  if scheme and scheme != target.scheme:
+                      continue
+                  if host.startswith("*."):
+                      host_matches = re.match(rf"^.+\.{re.escape(host[2:])}$", target.hostname or "")
+                  elif host.startswith("*"):
+                      host_matches = re.match(rf"^(.+\.)?{re.escape(host[1:])}$", target.hostname or "")
+                  else:
+                      host_matches = not host or host == target.hostname
+                  if host_matches and (port is None or port == target_port):
+                      return proxy
+              return None
+
+
+          def is_ip(host, kind):
+              try:
+                  kind(host.split("/")[0])
+              except ValueError:
+                  return False
+              return True
+
+
+          def default_port_dropped(scheme, port):
+              return None if port == {"http": 80, "https": 443}.get(scheme) else port
+
+
+          def relay_cannot_reach(url):
+              """Whether the proxy for `url` is one urllib cannot use: over TLS, where it would send CONNECT and any
+              proxy credentials in plain text, or another kind than HTTP, such as SOCKS."""
+              proxy = httpx_proxy_for(url)
+              return proxy is not None and urllib.parse.urlsplit(proxy).scheme != "http"
+
+
+          class FlexRelay:
+              """A local OpenAI endpoint for PR-Agent that puts each of its requests on the Flex tier.
+
+              When Flex has no capacity for a request, the relay waits and retries Flex (FLEX_BACKOFF), then sends
+              that one request on the standard tier. A refused request produced no output and is not billed, so a
+              chunked review pays once for every chunk instead of failing partway, or starting over and paying
+              again for the chunks it already finished. A model that rejects the tier gets the standard tier too.
+              Other answers, errors included, reach PR-Agent unchanged.
+
+              Each request answers within `deadline` seconds, set below PR-Agent's own call timeout: otherwise
+              PR-Agent could give up and retry while the relay's call still runs, and pay for the chunk twice. A
+              Flex wait that would leave less than STANDARD_CALL_SECONDS for the standard-tier call is skipped. A
+              call that reached OpenAI but did not finish by the deadline fails without a retry."""
+
+              # Not forwarded: the relay sets its own length and connection handling, and asks for an uncompressed
+              # answer so it can read a refusal.
+              DROPPED_HEADERS = frozenset({"host", "content-length", "connection", "accept-encoding", "keep-alive",
+                                           "transfer-encoding", "proxy-connection", "te", "upgrade"})
+              # The standard tier's own call timeout (CONFIG.AI_TIMEOUT without Flex).
+              STANDARD_CALL_SECONDS = 600
+              # Longest wait for one upstream answer.
+              ATTEMPT_SECONDS = 900
+
+              def __init__(self, tier, deadline, upstream=None, sleep=None, clock=time.monotonic, out=None,
+                           open_upstream=None):
+                  # Closed when PR-Agent is done: nothing is sent after that, since no one would read the answer.
+                  self.closed = threading.Event()
+                  self.tier, self.deadline, self.clock = tier, deadline, clock
+                  self.sleep = sleep or self.closed.wait  # A Flex wait ends early when the relay closes.
+                  self.upstream = (upstream or OPENAI_API).rstrip("/")
+                  self.out = out or (lambda message: print(message, flush=True))
+                  self.open_upstream = open_upstream or (
+                      lambda request, timeout, call: tracking_opener(call).open(request, timeout=timeout))
+                  self.lock, self.active = threading.Lock(), set()
+                  self.server = None
+
+              def __enter__(self):
+                  relay = self
+
+                  class Handler(http.server.BaseHTTPRequestHandler):
+                      def do_POST(self):
+                          relay.forward(self)
+
+                      def log_message(self, *args):
+                          pass  # PR-Agent logs its own calls; the relay reports only tier changes.
+
+                  self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+                  self.server.daemon_threads = True
+                  threading.Thread(target=self.server.serve_forever, daemon=True).start()
+                  return self
+
+              def __exit__(self, *exc):
+                  with self.lock:
+                      self.closed.set()
+                      active = list(self.active)
+                  for call in active:
+                      call.cancel()  # A call still running belongs to a review that has ended.
+                  self.server.shutdown()
+                  self.server.server_close()
+
+              @property
+              def api_base(self):
+                  return f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+
+              def forward(self, handler):
+                  ends = self.clock() + self.deadline
+                  raw = handler.rfile.read(int(handler.headers.get("Content-Length") or 0))
+                  headers = {k: v for k, v in handler.headers.items() if k.lower() not in self.DROPPED_HEADERS}
+                  try:
+                      body = json.loads(raw)
+                  except ValueError:
+                      body = None
+                  if isinstance(body, dict) and "model" in body:
+                      body.setdefault("service_tier", self.tier)
+                  flex_waits = 0
+                  while True:
+                      if self.closed.is_set():
+                          self.fail(handler, 503, "The review ended; the relay sends no more calls.")
+                          return
+                      remaining = ends - self.clock()
+                      if remaining <= 0:
+                          self.fail(handler, 504, "The relay ran out of time before OpenAI answered.")
+                          return
+                      data = raw if body is None else json.dumps(body).encode()
+                      request = urllib.request.Request(self.upstream + handler.path, data=data, method="POST",
+                                                       headers=headers)
+                      kind, status, answer_headers, answer = self.exchange(request, remaining)
+                      if kind == "late" and status:
+                          # OpenAI may still run and bill a request it already received, however the connection
+                          # ended, so a retry could pay for the chunk twice. As for any chunk that fails, the review
+                          # fails instead. The OpenAI client does not retry a 422 marked this way, and PR-Agent 0.49.0
+                          # does not retry its error either: LiteLLM raises it as BadRequestError, which
+                          # _should_retry_same_model in pr_agent/algo/ai_handlers/litellm_ai_handler.py excludes
+                          # (checked against the pinned image: one upstream call, then the error).
+                          self.reply(handler, 422, {"Content-Type": "application/json", "x-should-retry": "false"},
+                                     json.dumps({"error": {"message": "OpenAI did not answer within the relay's "
+                                                           "deadline. The call is not retried, since OpenAI may "
+                                                           "still be running and billing it."}}).encode())
+                          return
+                      if kind == "late":
+                          # Nothing was sent, so PR-Agent may safely try again.
+                          self.fail(handler, 504, "OpenAI could not be reached within the relay's deadline.")
+                          return
+                      if kind == "failed":
+                          # PR-Agent sees a gateway error, which it retries like any other failed call.
+                          self.fail(handler, 502, f"Relay could not reach OpenAI: {answer!r}")
+                          return
+                      if kind == "error":
+                          error_code, detail = status, answer
+                          text = detail.decode(errors="replace")
+                          if body and "service_tier" in body and error_code == 429 and FLEX_UNAVAILABLE in text:
+                              wait = FLEX_BACKOFF[flex_waits] if flex_waits < len(FLEX_BACKOFF) else None
+                              if wait is not None and ends - self.clock() - wait >= self.STANDARD_CALL_SECONDS:
+                                  self.sleep(wait)  # Wait and try Flex again first.
+                                  flex_waits += 1
+                                  continue
+                              self.out("Flex has no capacity for one review call; sending that call on the standard tier.")
+                              body.pop("service_tier")
+                              continue
+                          if body and "service_tier" in body and error_code == 400 and "service_tier" in text:
+                              self.out("The model does not take this service tier; sending the call on the standard tier.")
+                              body.pop("service_tier")
+                              continue
+                      self.reply(handler, status, answer_headers, answer)
+                      return
+
+              def exchange(self, request, remaining):
+                  """Send one upstream request and read its whole answer. Past the deadline the outcome is "late",
+                  with whether the request may have reached OpenAI.
+
+                  The socket timeout bounds each read, not the whole answer, so the exchange runs on its own thread.
+                  At the deadline the relay cancels the call: an open connection is cut, and one still connecting
+                  sends nothing. Reading in full makes an answer cut off upstream a gateway error rather than a
+                  short 200."""
+                  outcome, call = [], UpstreamCall()
+                  with self.lock:
+                      if self.closed.is_set():
+                          return "failed", None, None, ConnectionAbortedError("The relay has closed.")
+                      self.active.add(call)
+
+                  def run():
+                      try:
+                          try:
+                              with self.open_upstream(request, min(self.ATTEMPT_SECONDS, remaining), call) as response:
+                                  outcome.append(("answer", response.status, response.headers, response.read()))
+                          except urllib.error.HTTPError as error:
+                              with error:  # Reading an error's body can fail too, as a transport failure.
+                                  outcome.append(("error", error.code, error.headers, error.read()))
+                      except (http.client.HTTPException, OSError) as error:
+                          outcome.append(("failed", None, None, error))
+
+                  worker = threading.Thread(target=run, daemon=True)
+                  worker.start()
+                  try:
+                      worker.join(remaining)
+                      if outcome:
+                          return outcome[0]
+                      sent = call.cancel()
+                      worker.join(5)
+                      return "late", sent, None, None
+                  finally:
+                      with self.lock:
+                          self.active.discard(call)
+
+              def fail(self, handler, status, message):
+                  self.reply(handler, status, {"Content-Type": "application/json"},
+                             json.dumps({"error": {"message": message}}).encode())
+
+              def reply(self, handler, status, headers, payload):
+                  handler.send_response(status)
+                  for key, value in headers.items():
+                      if key.lower() not in self.DROPPED_HEADERS:
+                          handler.send_header(key, value)
+                  handler.send_header("Content-Length", str(len(payload)))
+                  handler.send_header("Connection", "close")
+                  handler.end_headers()
+                  handler.wfile.write(payload)
+                  handler.close_connection = True
 
 
           def run_pr_agent(plan_result, pr_paths, user_globs, model, keys):
@@ -1467,7 +1771,8 @@ jobs:
               ignored = list(user_globs)
               if plan_result["mode"] == "delta":
                   ignored += [glob_escape(p) for p in sorted(pr_paths - set(plan_result["files"]))]
-              with tempfile.TemporaryDirectory() as scratch:
+              tier = os.environ.get("SERVICE_TIER", "")
+              with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
                   output_path = os.path.join(scratch, "output")
                   open(output_path, "w").close()
                   env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_KEY", "OPENAI_KEY")}
@@ -1476,10 +1781,23 @@ jobs:
                       env["ANTHROPIC.KEY"] = keys["anthropic"]
                   else:
                       env["OPENAI_KEY"] = keys["openai"]
-                      tier = os.environ.get("SERVICE_TIER", "")
-                      if tier and (tier != "flex" or supports_flex(model)):
-                          # PR-Agent forwards only allowlisted extra-body keys; service_tier is one.
-                          env["LITELLM.EXTRA_BODY"] = json.dumps({"service_tier": tier})
+                      if tier and relay_cannot_reach(OPENAI_API):
+                          print(f"::notice::OpenAI is reached through a proxy the Flex relay cannot use (TLS or not "
+                                f"HTTP); the review runs on the standard tier instead of {tier}.", flush=True)
+                      elif tier and (tier != "flex" or supports_flex(model)):
+                          # The relay sets the tier on each call and moves a refused call to the standard tier.
+                          # A minute under PR-Agent's call timeout, so the relay always answers first.
+                          deadline = int(os.environ.get("CONFIG.AI_TIMEOUT") or 1200) - 60
+                          env["OPENAI.API_BASE"] = stack.enter_context(FlexRelay(tier, deadline)).api_base
+                          # A configured HTTP proxy would otherwise get the relay's calls, and the API key with
+                          # them. The loopback exclusion extends the setting in effect: Python and httpx use
+                          # no_proxy whenever it is set, even empty, and NO_PROXY only otherwise. Both spellings
+                          # then carry the result, so either reader sees the same exclusions as before plus the relay.
+                          bypass = env["no_proxy"] if "no_proxy" in env else env.get("NO_PROXY", "")
+                          hosts = [h.strip() for h in bypass.split(",") if h.strip()]
+                          # Python honours "*" only as the whole value, so a wildcard stays on its own.
+                          env["NO_PROXY"] = env["no_proxy"] = "*" if bypass.strip() == "*" else ",".join(
+                              dict.fromkeys(hosts + ["127.0.0.1"]))
                   env.update({
                       "GITHUB_OUTPUT": output_path,
                       "GITHUB_ACTION_CONFIG.ENABLE_OUTPUT": "true",
@@ -1489,30 +1807,7 @@ jobs:
                       # A full review keeps one summary comment; each delta review posts its own.
                       "PR_REVIEWER.PERSISTENT_COMMENT": "true" if plan_result["mode"] == "full" else "false",
                   })
-                  code, log, chunks = run_streaming(PR_AGENT, env)
-                  if code != 0 and "LITELLM.EXTRA_BODY" in env and chunks > 1 and flex_refused(log):
-                      # Earlier chunks may already have been billed, so this run does not start over by itself.
-                      raise RunFailed("Flex ran out of capacity partway through a chunked review. Re-running the job "
-                                      "reviews again from the start, so its completed chunks are paid for again.")
-                  for wait in FLEX_BACKOFF:
-                      # Flex refused a single-call review before any model output, so waiting and retrying Flex
-                      # costs nothing; OpenAI suggests backing off for this error.
-                      if code == 0 or FLEX_UNAVAILABLE not in log or "LITELLM.EXTRA_BODY" not in env:
-                          break
-                      print(f"Flex has no capacity right now; retrying Flex in {wait} seconds.", flush=True)
-                      time.sleep(wait)
-                      open(output_path, "w").close()
-                      code, log, chunks = run_streaming(PR_AGENT, env)
-                      if code != 0 and chunks > 1 and flex_refused(log):
-                          raise RunFailed("Flex ran out of capacity partway through a chunked review. Re-running the job "
-                                          "reviews again from the start, so its completed chunks are paid for again.")
-                  if code != 0 and "LITELLM.EXTRA_BODY" in env and flex_refused(log):
-                      # A single-call review that Flex refused produced no model output, so the retry is not
-                      # billed twice.
-                      print("Flex has no capacity right now; retrying the review on the standard tier.", flush=True)
-                      del env["LITELLM.EXTRA_BODY"]
-                      open(output_path, "w").close()
-                      code, log, _ = run_streaming(PR_AGENT, env)
+                  code = subprocess.run(PR_AGENT, env=env).returncode
                   if code != 0:
                       raise RunFailed(f"PR-Agent exited with code {code}.")
                   review = None

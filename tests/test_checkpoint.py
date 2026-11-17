@@ -1953,26 +1953,33 @@ class ReviewTests(unittest.TestCase):
 class PrAgentProcessTests(unittest.TestCase):
     """Runs run_pr_agent against a stand-in PR-Agent that reports the environment it got."""
 
-    def run_with(self, model, keys, plan_result, pr_paths, exit_code=0, write_review=True, flex_busy=False,
-                 chunked=False):
+    def run_with(self, model, keys, plan_result, pr_paths, exit_code=0, write_review=True, call_api=False,
+                 call_timeout=10):
         import os
         import sys
         import tempfile
         probe = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
-        runs = probe.name + ".runs"
         probe.write(textwrap.dedent(f"""
-            import json, os
-            with open({runs!r}, "a") as count:
-                count.write("run\\n")
-            with open({runs!r}) as count:
-                run = len(count.read().split())
-            seen = {{k: os.environ.get(k) for k in ("OPENAI_KEY", "ANTHROPIC_KEY", "ANTHROPIC.KEY", "IGNORE.GLOB", "LITELLM.EXTRA_BODY",
+            import json, os, urllib.parse, urllib.request
+            seen = {{k: os.environ.get(k) for k in ("OPENAI_KEY", "ANTHROPIC_KEY", "ANTHROPIC.KEY", "IGNORE.GLOB", "OPENAI.API_BASE",
                                                      "PR_REVIEWER.PERSISTENT_FINDING_STATE", "PR_REVIEWER.PERSISTENT_COMMENT")}}
-            if {chunked!r}:
-                print("Number of PR chunk calls: 2")
-            if run <= {int(flex_busy) if flex_busy is not True else 99} and os.environ.get("LITELLM.EXTRA_BODY"):
-                print("RateLimitError: Flex does not have sufficient resources available")
-                raise SystemExit(1)
+            seen["NO_PROXY"], seen["no_proxy"] = os.environ.get("NO_PROXY"), os.environ.get("no_proxy")
+            seen["relay_bypasses_proxy"] = bool(os.environ.get("OPENAI.API_BASE")) and urllib.request.proxy_bypass_environment(
+                urllib.parse.urlsplit(os.environ["OPENAI.API_BASE"]).netloc)
+            seen["github_bypasses_proxy"] = urllib.request.proxy_bypass_environment("api.github.com")
+            if {call_api!r}:
+                request = urllib.request.Request(os.environ["OPENAI.API_BASE"] + "/chat/completions", method="POST",
+                                                 data=json.dumps({{"model": "m", "messages": []}}).encode(),
+                                                 headers={{"Authorization": "Bearer " + os.environ["OPENAI_KEY"],
+                                                          "Content-Type": "application/json"}})
+                import time, urllib.error
+                started = time.monotonic()
+                try:
+                    with urllib.request.urlopen(request, timeout={call_timeout!r}) as response:
+                        seen["answer"] = json.loads(response.read())
+                except urllib.error.HTTPError as error:
+                    seen["answer_status"] = error.code
+                seen["elapsed"] = time.monotonic() - started
             if {write_review!r}:
                 with open(os.environ["GITHUB_OUTPUT"], "a") as out:
                     out.write("other=1\\n")
@@ -1987,15 +1994,13 @@ class PrAgentProcessTests(unittest.TestCase):
         finally:
             cp.PR_AGENT = saved
             os.unlink(probe.name)
-            if os.path.exists(runs):
-                os.unlink(runs)
 
     def test_delta_run_ignores_other_files_and_gets_only_its_providers_key(self):
         result = self.run_with("anthropic/claude-opus-5-5", {"anthropic": "a-key", "openai": "o-key"},
                                {"mode": "delta", "files": ["x.py"]}, {"x.py", "y[1].py"})
         seen = result["seen"]
         self.assertEqual((seen["ANTHROPIC.KEY"], seen["OPENAI_KEY"], seen["ANTHROPIC_KEY"]), ("a-key", None, None))
-        self.assertIsNone(seen["LITELLM.EXTRA_BODY"])  # Flex is OpenAI-only.
+        self.assertIsNone(seen["OPENAI.API_BASE"])  # Flex is OpenAI-only.
         self.assertEqual(json.loads(seen["IGNORE.GLOB"]), ["**/package-lock.json", "y[[]1[]].py"])
         self.assertEqual((seen["PR_REVIEWER.PERSISTENT_FINDING_STATE"], seen["PR_REVIEWER.PERSISTENT_COMMENT"]),
                          ("false", "false"))
@@ -2004,56 +2009,595 @@ class PrAgentProcessTests(unittest.TestCase):
         for model in ("gpt-4o", "o3-mini"):
             seen = self.run_with(model, {"anthropic": "", "openai": "o-key"},
                                  {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
-            self.assertIsNone(seen["LITELLM.EXTRA_BODY"], model)
+            self.assertIsNone(seen["OPENAI.API_BASE"], model)
 
     def test_full_run_keeps_the_persistent_summary(self):
         seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
                              {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
         self.assertEqual((seen["OPENAI_KEY"], seen["ANTHROPIC.KEY"], seen["PR_REVIEWER.PERSISTENT_COMMENT"]),
                          ("o-key", None, "true"))
-        self.assertEqual(json.loads(seen["LITELLM.EXTRA_BODY"]), {"service_tier": "flex"})
 
-    def test_flex_without_capacity_retries_on_the_standard_tier(self):
-        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                             {"mode": "full", "files": ["x.py"]}, {"x.py"}, flex_busy=True)["seen"]
-        self.assertIsNone(seen["LITELLM.EXTRA_BODY"])
+    def test_pr_agent_reaches_openai_through_the_flex_relay(self):
+        with FakeOpenAI([(200, {"choices": []})]) as openai:
+            saved, cp.OPENAI_API = cp.OPENAI_API, openai.url
+            try:
+                seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                     {"mode": "full", "files": ["x.py"]}, {"x.py"}, call_api=True)["seen"]
+            finally:
+                cp.OPENAI_API = saved
+        self.assertTrue(seen["OPENAI.API_BASE"].startswith("http://127.0.0.1:"))
+        self.assertEqual(seen["answer"], {"choices": []})
+        path, headers, body = openai.calls[0]
+        self.assertEqual((path, headers["Authorization"], body["service_tier"]),
+                         ("/v1/chat/completions", "Bearer o-key", "flex"))
 
-    def test_flex_that_frees_up_on_a_retry_reviews_on_flex(self):
-        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                             {"mode": "full", "files": ["x.py"]}, {"x.py"}, flex_busy=2)["seen"]
-        self.assertEqual(json.loads(seen["LITELLM.EXTRA_BODY"]), {"service_tier": "flex"})
-
-    def test_chunked_review_is_not_rerun_after_flex_runs_out(self):
-        with self.assertRaises(cp.RunFailed) as failure:
-            self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                          {"mode": "full", "files": ["x.py"]}, {"x.py"}, flex_busy=True, chunked=True)
-        self.assertIn("partway through a chunked review", str(failure.exception))
-
-    def test_chunk_count_is_seen_even_when_the_log_is_long(self):
-        import sys
-        import tempfile
+    def test_relay_calls_bypass_a_configured_proxy_and_keep_its_exclusions(self):
         import os
-        probe = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
-        probe.write("print('Number of PR chunk calls: 3')\nfor i in range(5000):\n    print('line', i)\n"
-                    "print('Flex does not have sufficient resources available')\nraise SystemExit(1)\n")
-        probe.close()
+        saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "NO_PROXY", "no_proxy")}
+        os.environ.update({"HTTP_PROXY": "http://proxy.invalid:3128", "NO_PROXY": "corp.example"})
         try:
-            code, tail, chunks = cp.run_streaming([sys.executable, probe.name], dict(os.environ))
+            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
         finally:
-            os.unlink(probe.name)
-        self.assertEqual((code, chunks), (1, 3))
-        self.assertNotIn("Number of PR chunk calls", tail)  # Gone from the tail, still counted.
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertTrue(seen["relay_bypasses_proxy"])
+        self.assertEqual((seen["NO_PROXY"], seen["no_proxy"]), ("corp.example,127.0.0.1", "corp.example,127.0.0.1"))
 
-    def test_only_a_tier_rejection_counts_as_flex_refused(self):
-        self.assertTrue(cp.flex_refused("Invalid value for 'service_tier': flex is not supported"))
-        self.assertTrue(cp.flex_refused("Flex does not have sufficient resources available"))
-        self.assertFalse(cp.flex_refused("timeout while waiting; request had service_tier=flex"))
+    def test_a_proxy_wildcard_exclusion_stays_a_wildcard(self):
+        import os
+        saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy")}
+        os.environ.update({"HTTP_PROXY": "http://proxy.invalid:3128", "HTTPS_PROXY": "http://proxy.invalid:3128",
+                           "no_proxy": "*"})
+        try:
+            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertEqual((seen["NO_PROXY"], seen["no_proxy"]), ("*", "*"))
+        self.assertTrue(seen["relay_bypasses_proxy"])
+        self.assertTrue(seen["github_bypasses_proxy"])
+
+    def test_the_lowercase_exclusion_keeps_its_precedence(self):
+        # Python and httpx use no_proxy over NO_PROXY, so GitHub stays on the proxy here; only the relay leaves it.
+        import os
+        saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy")}
+        os.environ.update({"HTTP_PROXY": "http://proxy.invalid:3128", "HTTPS_PROXY": "http://proxy.invalid:3128",
+                           "NO_PROXY": "*", "no_proxy": "corp.example"})
+        try:
+            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertTrue(seen["relay_bypasses_proxy"])
+        self.assertFalse(seen["github_bypasses_proxy"])
+        self.assertEqual(seen["no_proxy"], "corp.example,127.0.0.1")
+
+    def test_a_tls_proxy_to_openai_runs_the_review_on_the_standard_tier_without_the_relay(self):
+        # urllib would send CONNECT and the proxy credentials in plain text to a proxy that expects TLS.
+        import os
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "no_proxy")
+        saved = {k: os.environ.pop(k, None) for k in names}
+        try:
+            os.environ["HTTPS_PROXY"] = "https://user:pass@proxy.invalid:443"
+            self.assertTrue(cp.relay_cannot_reach(cp.OPENAI_API))
+            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
+            self.assertIsNone(seen["OPENAI.API_BASE"])
+            os.environ["NO_PROXY"] = "api.openai.com"
+            self.assertFalse(cp.relay_cannot_reach(cp.OPENAI_API))
+            os.environ.pop("NO_PROXY")
+            os.environ["HTTPS_PROXY"] = "http://proxy.invalid:3128"
+            self.assertFalse(cp.relay_cannot_reach(cp.OPENAI_API))
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_the_relay_answers_before_pr_agents_own_call_timeout(self):
+        # PR-Agent gives each call CONFIG.AI_TIMEOUT seconds (config.ai_timeout in its LiteLLM handler); the
+        # relay's deadline is a minute less. Scaled down: a 61 s AI_TIMEOUT gives the relay 1 s, against a
+        # 2 s client timeout, and OpenAI takes 3 s. The relay must answer first, so PR-Agent never times out
+        # and retries while the relay's call still runs.
+        import os
+        import time
+
+        def slow(body):
+            time.sleep(3)
+            return 200, {"ok": 1}
+
+        with FakeOpenAI(slow) as openai:
+            saved_api, cp.OPENAI_API = cp.OPENAI_API, openai.url
+            saved_timeout = os.environ.get("CONFIG.AI_TIMEOUT")
+            os.environ["CONFIG.AI_TIMEOUT"] = "61"
+            try:
+                seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                     {"mode": "full", "files": ["x.py"]}, {"x.py"}, call_api=True,
+                                     call_timeout=2)["seen"]
+            finally:
+                cp.OPENAI_API = saved_api
+                if saved_timeout is None:
+                    os.environ.pop("CONFIG.AI_TIMEOUT")
+                else:
+                    os.environ["CONFIG.AI_TIMEOUT"] = saved_timeout
+        # The call reached OpenAI, so the answer is the 422 that neither the OpenAI client nor PR-Agent retries.
+        self.assertEqual(seen["answer_status"], 422)
+        self.assertLess(seen["elapsed"], 2)
+        self.assertEqual(len(openai.calls), 1)
+
+    def test_slow_refusals_then_a_slow_standard_call_still_answer_before_pr_agents_timeout(self):
+        # The sequence from the review, scaled to seconds: Flex takes 0.3 s to refuse each time, the relay waits
+        # between refusals, and the standard-tier call is slower than all that is left. PR-Agent gives the call
+        # 2 s; the relay's deadline is a minute less than CONFIG.AI_TIMEOUT, here 61 s, so 1 s.
+        import os
+        import time
+
+        def answer(body):
+            if "service_tier" in body:
+                time.sleep(0.3)
+                return BUSY
+            time.sleep(3)
+            return 200, {"ok": 1}
+
+        saved = (cp.OPENAI_API, cp.FLEX_BACKOFF, cp.FlexRelay.STANDARD_CALL_SECONDS, os.environ.get("CONFIG.AI_TIMEOUT"))
+        with FakeOpenAI(answer) as openai:
+            cp.OPENAI_API, cp.FLEX_BACKOFF, cp.FlexRelay.STANDARD_CALL_SECONDS = openai.url, (0.1, 0.1, 0.1), 0.3
+            os.environ["CONFIG.AI_TIMEOUT"] = "61"
+            try:
+                seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                     {"mode": "full", "files": ["x.py"]}, {"x.py"}, call_api=True,
+                                     call_timeout=2)["seen"]
+            finally:
+                cp.OPENAI_API, cp.FLEX_BACKOFF, cp.FlexRelay.STANDARD_CALL_SECONDS = saved[:3]
+                if saved[3] is None:
+                    os.environ.pop("CONFIG.AI_TIMEOUT")
+                else:
+                    os.environ["CONFIG.AI_TIMEOUT"] = saved[3]
+        tiers = [body.get("service_tier") for _, _, body in openai.calls]
+        self.assertEqual(tiers, ["flex", "flex", None])  # Two refusals; the third wait would leave too little.
+        self.assertEqual(seen["answer_status"], 422)  # The standard call reached OpenAI and was not finished.
+        self.assertLess(seen["elapsed"], 2)  # Before PR-Agent's own timeout, so it never retries a running call.
 
     def test_failure_or_missing_output_is_a_failed_run(self):
         with self.assertRaises(cp.RunFailed):
             self.run_with("gpt-6.1-sol", {"openai": "k"}, {"mode": "full", "files": []}, set(), exit_code=1)
         with self.assertRaises(cp.RunFailed):
             self.run_with("gpt-6.1-sol", {"openai": "k"}, {"mode": "full", "files": []}, set(), write_review=False)
+
+
+BUSY = (429, {"error": {"message": "Flex does not have sufficient resources available to fulfill your request."}})
+
+
+class FakeOpenAI:
+    """An OpenAI stand-in that records each call and answers from a list, or from a function of the call."""
+
+    def __init__(self, answers):
+        import http.server
+        import threading
+        self.answers, self.calls, self.lock = answers, [], threading.Lock()
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                with fake.lock:
+                    fake.calls.append((self.path, dict(self.headers), body))
+                    status, answer = fake.answers(body) if callable(fake.answers) else fake.answers.pop(0)
+                payload = json.dumps(answer).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class FlexRelayTests(unittest.TestCase):
+    def call(self, relay, body):
+        import urllib.error
+        import urllib.request
+        request = urllib.request.Request(relay.api_base + "/chat/completions", data=json.dumps(body).encode(),
+                                         method="POST", headers={"Authorization": "Bearer k",
+                                                                 "Content-Type": "application/json"})
+        # Proxy-free: some tests set proxies for the relay's upstream calls, which must not catch this one.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(request, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, json.loads(error.read())
+
+    def relay(self, upstream, waits, messages):
+        return cp.FlexRelay("flex", 1140, upstream=upstream, sleep=waits.append, out=messages.append)
+
+    def test_busy_flex_waits_then_sends_that_call_on_the_standard_tier(self):
+        waits, messages = [], []
+        with FakeOpenAI([BUSY] * 4 + [(200, {"ok": 1})]) as openai, self.relay(openai.url, waits, messages) as relay:
+            self.assertEqual(self.call(relay, {"model": "gpt-6.1-sol", "messages": []}), (200, {"ok": 1}))
+        self.assertEqual(["service_tier" in body for _, _, body in openai.calls], [True] * 4 + [False])
+        self.assertEqual(waits, list(cp.FLEX_BACKOFF))
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(openai.calls[-1][1]["Authorization"], "Bearer k")
+
+    def test_flex_that_frees_up_on_a_retry_stays_on_flex(self):
+        waits = []
+        with FakeOpenAI([BUSY, (200, {"ok": 1})]) as openai, self.relay(openai.url, waits, []) as relay:
+            self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
+        self.assertEqual([body.get("service_tier") for _, _, body in openai.calls], ["flex", "flex"])
+        self.assertEqual(len(waits), 1)
+
+    def test_only_the_refused_chunk_moves_to_the_standard_tier(self):
+        # Two chunks of one review in parallel; Flex never has room for the second.
+        def answer(body):
+            if body["messages"][0]["content"] == "chunk 2" and "service_tier" in body:
+                return BUSY
+            return 200, {"tier": body.get("service_tier", "default"), "chunk": body["messages"][0]["content"]}
+        import concurrent.futures
+        with FakeOpenAI(answer) as openai, self.relay(openai.url, [], []) as relay:
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                results = list(pool.map(lambda c: self.call(relay, {"model": "m", "messages": [{"content": c}]}),
+                                        ["chunk 1", "chunk 2"]))
+        self.assertEqual(results, [(200, {"tier": "flex", "chunk": "chunk 1"}),
+                                   (200, {"tier": "default", "chunk": "chunk 2"})])
+        self.assertEqual(sum(1 for _, _, body in openai.calls if body["messages"][0]["content"] == "chunk 1"), 1)
+
+    def test_a_model_that_rejects_the_tier_gets_the_standard_tier(self):
+        rejected = (400, {"error": {"message": "Invalid value for 'service_tier': flex is not supported."}})
+        with FakeOpenAI([rejected, (200, {"ok": 1})]) as openai, self.relay(openai.url, [], []) as relay:
+            self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
+        self.assertEqual(["service_tier" in body for _, _, body in openai.calls], [True, False])
+
+    def test_other_errors_reach_pr_agent_unchanged(self):
+        for answer in ((500, {"error": {"message": "boom"}}), (429, {"error": {"message": "Rate limit reached"}}),
+                       (400, {"error": {"message": "max_completion_tokens is too large"}})):
+            with FakeOpenAI([answer]) as openai, self.relay(openai.url, [], []) as relay:
+                self.assertEqual(self.call(relay, {"model": "m", "messages": []}), answer)
+            self.assertEqual(len(openai.calls), 1, answer)
+
+    def test_slow_refusals_still_leave_the_standard_call_inside_the_deadline(self):
+        # A fake clock: each refused Flex attempt takes 150 s, and the waits advance it too.
+        now, timeouts = [0.0], []
+
+        def answer(body):
+            if "service_tier" in body:
+                now[0] += 150
+                return BUSY
+            return 200, {"ok": 1}
+
+        def open_upstream(request, timeout, call):
+            timeouts.append((now[0], timeout))
+            return urllib.request.urlopen(request, timeout=10)
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        import urllib.request
+        saved, cp.FLEX_BACKOFF = cp.FLEX_BACKOFF, (30, 60, 120)
+        try:
+            with FakeOpenAI(answer) as openai, cp.FlexRelay("flex", 1140, upstream=openai.url, sleep=sleep,
+                                                            clock=lambda: now[0], out=lambda m: None,
+                                                            open_upstream=open_upstream) as relay:
+                self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
+        finally:
+            cp.FLEX_BACKOFF = saved
+        # The 2-minute wait would leave under STANDARD_CALL_SECONDS, so the relay went to the standard tier.
+        self.assertEqual(["service_tier" in body for _, _, body in openai.calls], [True, True, True, False])
+        started, timeout = timeouts[-1]
+        self.assertEqual(started, 3 * 150 + 30 + 60)
+        self.assertLessEqual(started + timeout, 1140)  # Answers before PR-Agent's own timeout.
+
+    def test_a_relay_out_of_time_answers_504(self):
+        now = [0.0]
+
+        def answer(body):
+            now[0] += 350  # Flex takes longer than the whole deadline to refuse.
+            return BUSY
+
+        with FakeOpenAI(answer) as openai, cp.FlexRelay("flex", 300, upstream=openai.url, sleep=lambda s: None,
+                                                        clock=lambda: now[0], out=lambda m: None) as relay:
+            status, answer = self.call(relay, {"model": "m", "messages": []})
+        self.assertEqual(status, 504)
+        self.assertEqual(len(openai.calls), 1)  # No standard-tier call PR-Agent could no longer wait for.
+
+    def test_an_answer_that_drips_past_the_deadline_is_cut_off_at_it(self):
+        # Each byte arrives well inside the socket timeout, but the whole answer takes longer than the deadline.
+        import http.server
+        import threading
+        import time
+
+        cut, finished = threading.Event(), threading.Event()
+
+        class Dripping(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Length", "40")
+                self.end_headers()
+                try:
+                    for _ in range(40):
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(0.05)
+                    finished.set()
+                except OSError:
+                    cut.set()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Dripping)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with cp.FlexRelay("flex", 0.5, upstream=f"http://127.0.0.1:{server.server_address[1]}",
+                              out=lambda m: None) as relay:
+                started = time.monotonic()
+                status, answer = self.call(relay, {"model": "m", "messages": []})
+                elapsed = time.monotonic() - started
+        finally:
+            server.shutdown()
+            server.server_close()
+        # The call reached OpenAI, so it fails without a retry rather than risk paying for it twice.
+        self.assertEqual(status, 422)
+        self.assertIn("not retried", answer["error"]["message"])
+        self.assertLess(elapsed, 1.5)  # The whole answer would take 2 s.
+        # The relay cut the call rather than leaving it to run on.
+        self.assertTrue(cut.wait(1))
+        self.assertFalse(finished.is_set())
+
+    def test_a_call_still_connecting_at_the_deadline_is_never_sent(self):
+        # Name resolution or connecting outlasts the deadline, then recovers after the relay answered 504.
+        import socket
+        import threading
+        import time
+        from unittest import mock
+        real, released = socket.create_connection, threading.Event()
+        with FakeOpenAI([(200, {"ok": 1})]) as openai:
+            upstream_port = int(openai.url.rsplit(":", 1)[1])
+
+            def slow_connection(address, *args, **kwargs):
+                if address[1] == upstream_port:
+                    released.wait(5)
+                return real(address, *args, **kwargs)
+
+            with mock.patch("socket.create_connection", slow_connection), \
+                    cp.FlexRelay("flex", 0.3, upstream=openai.url, out=lambda m: None) as relay:
+                status, _ = self.call(relay, {"model": "m", "messages": []})
+                released.set()
+                time.sleep(0.5)
+        self.assertEqual(status, 504)  # Nothing was sent, so PR-Agent may retry.
+        self.assertEqual(openai.calls, [])  # The late connection sent nothing.
+
+    def test_an_answer_cut_off_upstream_is_a_gateway_error_not_a_short_200(self):
+        import http.server
+        import threading
+
+        class Truncating(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "1000")
+                self.end_headers()
+                self.wfile.write(b'{"choices": [')  # Then the connection closes.
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Truncating)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with self.relay(f"http://127.0.0.1:{server.server_address[1]}", [], []) as relay:
+                status, answer = self.call(relay, {"model": "m", "messages": []})
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(status, 502)
+        self.assertIn("IncompleteRead", answer["error"]["message"])
+
+    def test_a_proxy_given_only_as_all_proxy_carries_the_upstream_call(self):
+        import os
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "no_proxy")
+        saved = {k: os.environ.pop(k, None) for k in names}
+        try:
+            for given in ("{url}", "{bare}"):  # With its scheme, and without one, which httpx reads as HTTP.
+                with FakeOpenAI([(200, {"ok": 1})]) as proxy:
+                    os.environ["ALL_PROXY"] = given.format(url=proxy.url, bare=proxy.url.removeprefix("http://"))
+                    # Without the proxy this host cannot be reached at all.
+                    with self.relay("http://openai.invalid", [], []) as relay:
+                        self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}), given)
+                self.assertEqual(proxy.calls[0][0], "http://openai.invalid/v1/chat/completions", given)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_a_scheme_qualified_exclusion_keeps_the_call_off_a_rejecting_proxy(self):
+        import os
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "no_proxy")
+        saved = {k: os.environ.pop(k, None) for k in names}
+        try:
+            with FakeOpenAI([(403, {"error": "blocked"})]) as proxy, FakeOpenAI([(200, {"ok": 1})]) as openai:
+                os.environ.update({"HTTP_PROXY": proxy.url, "NO_PROXY": openai.url})  # As http://127.0.0.1:port.
+                with self.relay(openai.url, [], []) as relay:
+                    self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertEqual((len(openai.calls), proxy.calls), (1, []))
+
+    def test_proxy_credentials_go_to_the_proxy(self):
+        import base64
+        import os
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "no_proxy")
+        saved = {k: os.environ.pop(k, None) for k in names}
+        try:
+            with FakeOpenAI([(200, {"ok": 1})]) as proxy:
+                os.environ["HTTP_PROXY"] = proxy.url.replace("http://", "http://us%40er:p%3Ass@")
+                with self.relay("http://openai.invalid", [], []) as relay:
+                    self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        header = proxy.calls[0][1].get("Proxy-Authorization") or proxy.calls[0][1].get("Proxy-authorization")
+        self.assertEqual(base64.b64decode(header.removeprefix("Basic ")), b"us@er:p:ss")
+
+    def test_a_proxy_without_a_port_is_reached_on_its_schemes_default_port(self):
+        import os
+        import socket
+        from unittest import mock
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "no_proxy")
+        saved = {k: os.environ.pop(k, None) for k in names}
+        dialled, real = [], socket.create_connection
+
+        def record(address, *args, **kwargs):
+            if address[0].endswith(".invalid"):
+                dialled.append(address[:2])
+                raise ConnectionRefusedError("recorded")
+            return real(address, *args, **kwargs)
+
+        try:
+            os.environ["HTTPS_PROXY"] = "http://proxy.invalid"
+            with mock.patch("socket.create_connection", record), \
+                    self.relay("https://openai.invalid", [], []) as relay:
+                self.assertEqual(self.call(relay, {"model": "m", "messages": []})[0], 502)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertEqual(dialled, [("proxy.invalid", 80)])
+
+    def test_proxy_choice_follows_httpx(self):
+        # Expected answers are what httpx 0.28.1, in the pinned PR-Agent image, chooses for the same settings.
+        import os
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "no_proxy")
+        url = "https://api.openai.com/v1/chat/completions"
+        cases = [
+            ({"HTTPS_PROXY": "http://p:1"}, "http://p:1"),
+            ({"HTTPS_PROXY": "p:1"}, "http://p:1"),
+            ({"ALL_PROXY": "p:1"}, "http://p:1"),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "https://api.openai.com"}, None),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "http://api.openai.com"}, "http://p:1"),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "openai.com"}, None),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": ".openai.com"}, None),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "i.openai.com"}, "http://p:1"),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "corp.example, *"}, None),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "https://api.openai.com:8443"}, "http://p:1"),
+            ({"HTTPS_PROXY": "http://p:1", "NO_PROXY": "https://api.openai.com:443"}, None),
+            ({"HTTP_PROXY": "http://p:1"}, None),
+        ]
+        saved = {k: os.environ.pop(k, None) for k in names}
+        try:
+            for settings, expected in cases:
+                for k in names:
+                    os.environ.pop(k, None)
+                os.environ.update(settings)
+                self.assertEqual(cp.httpx_proxy_for(url), expected, settings)
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_a_call_waiting_for_flex_sends_nothing_once_the_review_ended(self):
+        import threading
+        waiting, release, results = threading.Event(), threading.Event(), []
+
+        def sleep(seconds):
+            waiting.set()
+            release.wait(5)
+
+        with FakeOpenAI([BUSY, (200, {"ok": 1})]) as openai:
+            relay = cp.FlexRelay("flex", 1140, upstream=openai.url, sleep=sleep, out=lambda m: None).__enter__()
+            client = threading.Thread(target=lambda: results.append(self.call(relay, {"model": "m", "messages": []})))
+            client.start()
+            self.assertTrue(waiting.wait(5))
+            relay.__exit__(None, None, None)  # PR-Agent exited while the call waited for Flex.
+            release.set()
+            client.join(5)
+        self.assertEqual(len(openai.calls), 1)  # Only the refused Flex attempt.
+        self.assertEqual(results[0][0], 503)
+
+    def test_a_call_running_when_the_review_ends_is_cut(self):
+        import http.server
+        import threading
+        import time
+        cut, started = threading.Event(), threading.Event()
+
+        class Slow(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                started.set()
+                self.send_response(200)
+                self.send_header("Content-Length", "40")
+                self.end_headers()
+                try:
+                    for _ in range(40):
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(0.05)
+                except OSError:
+                    cut.set()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            relay = cp.FlexRelay("flex", 1140, upstream=f"http://127.0.0.1:{server.server_address[1]}",
+                                 out=lambda m: None).__enter__()
+            client = threading.Thread(target=lambda: self.call(relay, {"model": "m", "messages": []}))
+            client.start()
+            self.assertTrue(started.wait(5))
+            relay.__exit__(None, None, None)
+            self.assertTrue(cut.wait(2))
+            client.join(5)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_an_unreachable_openai_is_a_gateway_error(self):
+        with FakeOpenAI([]) as openai:
+            url = openai.url
+        with self.relay(url, [], []) as relay:
+            status, answer = self.call(relay, {"model": "m", "messages": []})
+        self.assertEqual(status, 502)
+        self.assertIn("could not reach OpenAI", answer["error"]["message"])
 
 
 class GateTests(unittest.TestCase):
