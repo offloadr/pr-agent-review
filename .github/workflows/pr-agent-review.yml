@@ -1510,15 +1510,19 @@ jobs:
                       data = raw if body is None else json.dumps(body).encode()
                       request = urllib.request.Request(self.upstream + handler.path, data=data, method="POST",
                                                        headers=headers)
-                      try:
-                          with self.urlopen(request, timeout=min(self.ATTEMPT_SECONDS, remaining)) as response:
-                              # Read in full, so an answer cut off upstream is a gateway error rather than a short 200.
-                              status, answer_headers, answer = response.status, response.headers, response.read()
-                      except urllib.error.HTTPError as error:
-                          with error:
-                              detail = error.read()
+                      outcome = self.exchange(request, remaining)
+                      if outcome is None:
+                          self.fail(handler, 504, "OpenAI did not answer within the relay's deadline.")
+                          return
+                      kind, status, answer_headers, answer = outcome
+                      if kind == "failed":
+                          # PR-Agent sees a gateway error, which it retries like any other failed call.
+                          self.fail(handler, 502, f"Relay could not reach OpenAI: {answer!r}")
+                          return
+                      if kind == "error":
+                          error_code, detail = status, answer
                           text = detail.decode(errors="replace")
-                          if body and "service_tier" in body and error.code == 429 and FLEX_UNAVAILABLE in text:
+                          if body and "service_tier" in body and error_code == 429 and FLEX_UNAVAILABLE in text:
                               wait = FLEX_BACKOFF[flex_waits] if flex_waits < len(FLEX_BACKOFF) else None
                               if wait is not None and ends - self.clock() - wait >= self.STANDARD_CALL_SECONDS:
                                   self.sleep(wait)  # Wait and try Flex again first.
@@ -1527,18 +1531,36 @@ jobs:
                               self.out("Flex has no capacity for one review call; sending that call on the standard tier.")
                               body.pop("service_tier")
                               continue
-                          if body and "service_tier" in body and error.code == 400 and "service_tier" in text:
+                          if body and "service_tier" in body and error_code == 400 and "service_tier" in text:
                               self.out("The model does not take this service tier; sending the call on the standard tier.")
                               body.pop("service_tier")
                               continue
-                          self.reply(handler, error.code, error.headers, detail)
-                          return
-                      except (http.client.HTTPException, OSError) as error:
-                          # PR-Agent sees a gateway error, which it retries like any other failed call.
-                          self.fail(handler, 502, f"Relay could not reach OpenAI: {error!r}")
-                          return
                       self.reply(handler, status, answer_headers, answer)
                       return
+
+              def exchange(self, request, remaining):
+                  """Send one upstream request and read its whole answer, or None when that takes past the deadline.
+
+                  The socket timeout bounds each read, not the whole answer, so the exchange runs on its own thread
+                  and the relay stops waiting for it at the deadline. Reading in full makes an answer cut off upstream
+                  a gateway error rather than a short 200."""
+                  outcome = []
+
+                  def run():
+                      try:
+                          try:
+                              with self.urlopen(request, timeout=min(self.ATTEMPT_SECONDS, remaining)) as response:
+                                  outcome.append(("answer", response.status, response.headers, response.read()))
+                          except urllib.error.HTTPError as error:
+                              with error:  # Reading an error's body can fail too, as a transport failure.
+                                  outcome.append(("error", error.code, error.headers, error.read()))
+                      except (http.client.HTTPException, OSError) as error:
+                          outcome.append(("failed", None, None, error))
+
+                  worker = threading.Thread(target=run, daemon=True)
+                  worker.start()
+                  worker.join(remaining)
+                  return outcome[0] if outcome else None
 
               def fail(self, handler, status, message):
                   self.reply(handler, status, {"Content-Type": "application/json"},

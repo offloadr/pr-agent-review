@@ -2191,6 +2191,43 @@ class FlexRelayTests(unittest.TestCase):
         self.assertEqual(status, 504)
         self.assertEqual(len(openai.calls), 1)  # No standard-tier call PR-Agent could no longer wait for.
 
+    def test_an_answer_that_drips_past_the_deadline_is_cut_off_at_it(self):
+        # Each byte arrives well inside the socket timeout, but the whole answer takes longer than the deadline.
+        import http.server
+        import threading
+        import time
+
+        class Dripping(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Length", "40")
+                self.end_headers()
+                try:
+                    for _ in range(40):
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(0.05)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Dripping)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with cp.FlexRelay("flex", 0.5, upstream=f"http://127.0.0.1:{server.server_address[1]}",
+                              out=lambda m: None) as relay:
+                started = time.monotonic()
+                status, answer = self.call(relay, {"model": "m", "messages": []})
+                elapsed = time.monotonic() - started
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(status, 504)
+        self.assertLess(elapsed, 1.5)  # The whole answer would take 2 s.
+
     def test_an_answer_cut_off_upstream_is_a_gateway_error_not_a_short_200(self):
         import http.server
         import threading
