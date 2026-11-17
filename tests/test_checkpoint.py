@@ -1953,26 +1953,22 @@ class ReviewTests(unittest.TestCase):
 class PrAgentProcessTests(unittest.TestCase):
     """Runs run_pr_agent against a stand-in PR-Agent that reports the environment it got."""
 
-    def run_with(self, model, keys, plan_result, pr_paths, exit_code=0, write_review=True, flex_busy=False,
-                 chunked=False):
+    def run_with(self, model, keys, plan_result, pr_paths, exit_code=0, write_review=True, call_api=False):
         import os
         import sys
         import tempfile
         probe = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
-        runs = probe.name + ".runs"
         probe.write(textwrap.dedent(f"""
-            import json, os
-            with open({runs!r}, "a") as count:
-                count.write("run\\n")
-            with open({runs!r}) as count:
-                run = len(count.read().split())
-            seen = {{k: os.environ.get(k) for k in ("OPENAI_KEY", "ANTHROPIC_KEY", "ANTHROPIC.KEY", "IGNORE.GLOB", "LITELLM.EXTRA_BODY",
+            import json, os, urllib.request
+            seen = {{k: os.environ.get(k) for k in ("OPENAI_KEY", "ANTHROPIC_KEY", "ANTHROPIC.KEY", "IGNORE.GLOB", "OPENAI.API_BASE",
                                                      "PR_REVIEWER.PERSISTENT_FINDING_STATE", "PR_REVIEWER.PERSISTENT_COMMENT")}}
-            if {chunked!r}:
-                print("Number of PR chunk calls: 2")
-            if run <= {int(flex_busy) if flex_busy is not True else 99} and os.environ.get("LITELLM.EXTRA_BODY"):
-                print("RateLimitError: Flex does not have sufficient resources available")
-                raise SystemExit(1)
+            if {call_api!r}:
+                request = urllib.request.Request(os.environ["OPENAI.API_BASE"] + "/chat/completions", method="POST",
+                                                 data=json.dumps({{"model": "m", "messages": []}}).encode(),
+                                                 headers={{"Authorization": "Bearer " + os.environ["OPENAI_KEY"],
+                                                          "Content-Type": "application/json"}})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    seen["answer"] = json.loads(response.read())
             if {write_review!r}:
                 with open(os.environ["GITHUB_OUTPUT"], "a") as out:
                     out.write("other=1\\n")
@@ -1987,15 +1983,13 @@ class PrAgentProcessTests(unittest.TestCase):
         finally:
             cp.PR_AGENT = saved
             os.unlink(probe.name)
-            if os.path.exists(runs):
-                os.unlink(runs)
 
     def test_delta_run_ignores_other_files_and_gets_only_its_providers_key(self):
         result = self.run_with("anthropic/claude-opus-5-5", {"anthropic": "a-key", "openai": "o-key"},
                                {"mode": "delta", "files": ["x.py"]}, {"x.py", "y[1].py"})
         seen = result["seen"]
         self.assertEqual((seen["ANTHROPIC.KEY"], seen["OPENAI_KEY"], seen["ANTHROPIC_KEY"]), ("a-key", None, None))
-        self.assertIsNone(seen["LITELLM.EXTRA_BODY"])  # Flex is OpenAI-only.
+        self.assertIsNone(seen["OPENAI.API_BASE"])  # Flex is OpenAI-only.
         self.assertEqual(json.loads(seen["IGNORE.GLOB"]), ["**/package-lock.json", "y[[]1[]].py"])
         self.assertEqual((seen["PR_REVIEWER.PERSISTENT_FINDING_STATE"], seen["PR_REVIEWER.PERSISTENT_COMMENT"]),
                          ("false", "false"))
@@ -2004,56 +1998,143 @@ class PrAgentProcessTests(unittest.TestCase):
         for model in ("gpt-4o", "o3-mini"):
             seen = self.run_with(model, {"anthropic": "", "openai": "o-key"},
                                  {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
-            self.assertIsNone(seen["LITELLM.EXTRA_BODY"], model)
+            self.assertIsNone(seen["OPENAI.API_BASE"], model)
 
     def test_full_run_keeps_the_persistent_summary(self):
         seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
                              {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
         self.assertEqual((seen["OPENAI_KEY"], seen["ANTHROPIC.KEY"], seen["PR_REVIEWER.PERSISTENT_COMMENT"]),
                          ("o-key", None, "true"))
-        self.assertEqual(json.loads(seen["LITELLM.EXTRA_BODY"]), {"service_tier": "flex"})
 
-    def test_flex_without_capacity_retries_on_the_standard_tier(self):
-        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                             {"mode": "full", "files": ["x.py"]}, {"x.py"}, flex_busy=True)["seen"]
-        self.assertIsNone(seen["LITELLM.EXTRA_BODY"])
-
-    def test_flex_that_frees_up_on_a_retry_reviews_on_flex(self):
-        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                             {"mode": "full", "files": ["x.py"]}, {"x.py"}, flex_busy=2)["seen"]
-        self.assertEqual(json.loads(seen["LITELLM.EXTRA_BODY"]), {"service_tier": "flex"})
-
-    def test_chunked_review_is_not_rerun_after_flex_runs_out(self):
-        with self.assertRaises(cp.RunFailed) as failure:
-            self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                          {"mode": "full", "files": ["x.py"]}, {"x.py"}, flex_busy=True, chunked=True)
-        self.assertIn("partway through a chunked review", str(failure.exception))
-
-    def test_chunk_count_is_seen_even_when_the_log_is_long(self):
-        import sys
-        import tempfile
-        import os
-        probe = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
-        probe.write("print('Number of PR chunk calls: 3')\nfor i in range(5000):\n    print('line', i)\n"
-                    "print('Flex does not have sufficient resources available')\nraise SystemExit(1)\n")
-        probe.close()
-        try:
-            code, tail, chunks = cp.run_streaming([sys.executable, probe.name], dict(os.environ))
-        finally:
-            os.unlink(probe.name)
-        self.assertEqual((code, chunks), (1, 3))
-        self.assertNotIn("Number of PR chunk calls", tail)  # Gone from the tail, still counted.
-
-    def test_only_a_tier_rejection_counts_as_flex_refused(self):
-        self.assertTrue(cp.flex_refused("Invalid value for 'service_tier': flex is not supported"))
-        self.assertTrue(cp.flex_refused("Flex does not have sufficient resources available"))
-        self.assertFalse(cp.flex_refused("timeout while waiting; request had service_tier=flex"))
+    def test_pr_agent_reaches_openai_through_the_flex_relay(self):
+        with FakeOpenAI([(200, {"choices": []})]) as openai:
+            saved, cp.OPENAI_API = cp.OPENAI_API, openai.url
+            try:
+                seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                     {"mode": "full", "files": ["x.py"]}, {"x.py"}, call_api=True)["seen"]
+            finally:
+                cp.OPENAI_API = saved
+        self.assertTrue(seen["OPENAI.API_BASE"].startswith("http://127.0.0.1:"))
+        self.assertEqual(seen["answer"], {"choices": []})
+        path, headers, body = openai.calls[0]
+        self.assertEqual((path, headers["Authorization"], body["service_tier"]),
+                         ("/v1/chat/completions", "Bearer o-key", "flex"))
 
     def test_failure_or_missing_output_is_a_failed_run(self):
         with self.assertRaises(cp.RunFailed):
             self.run_with("gpt-6.1-sol", {"openai": "k"}, {"mode": "full", "files": []}, set(), exit_code=1)
         with self.assertRaises(cp.RunFailed):
             self.run_with("gpt-6.1-sol", {"openai": "k"}, {"mode": "full", "files": []}, set(), write_review=False)
+
+
+BUSY = (429, {"error": {"message": "Flex does not have sufficient resources available to fulfill your request."}})
+
+
+class FakeOpenAI:
+    """An OpenAI stand-in that records each call and answers from a list, or from a function of the call."""
+
+    def __init__(self, answers):
+        import http.server
+        import threading
+        self.answers, self.calls, self.lock = answers, [], threading.Lock()
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                with fake.lock:
+                    fake.calls.append((self.path, dict(self.headers), body))
+                    status, answer = fake.answers(body) if callable(fake.answers) else fake.answers.pop(0)
+                payload = json.dumps(answer).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class FlexRelayTests(unittest.TestCase):
+    def call(self, relay, body):
+        import urllib.error
+        import urllib.request
+        request = urllib.request.Request(relay.api_base + "/chat/completions", data=json.dumps(body).encode(),
+                                         method="POST", headers={"Authorization": "Bearer k",
+                                                                 "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, json.loads(error.read())
+
+    def relay(self, upstream, waits, messages):
+        return cp.FlexRelay("flex", upstream=upstream, sleep=waits.append, out=messages.append)
+
+    def test_busy_flex_waits_then_sends_that_call_on_the_standard_tier(self):
+        waits, messages = [], []
+        with FakeOpenAI([BUSY] * 4 + [(200, {"ok": 1})]) as openai, self.relay(openai.url, waits, messages) as relay:
+            self.assertEqual(self.call(relay, {"model": "gpt-6.1-sol", "messages": []}), (200, {"ok": 1}))
+        self.assertEqual(["service_tier" in body for _, _, body in openai.calls], [True] * 4 + [False])
+        self.assertEqual(waits, list(cp.FLEX_BACKOFF))
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(openai.calls[-1][1]["Authorization"], "Bearer k")
+
+    def test_flex_that_frees_up_on_a_retry_stays_on_flex(self):
+        waits = []
+        with FakeOpenAI([BUSY, (200, {"ok": 1})]) as openai, self.relay(openai.url, waits, []) as relay:
+            self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
+        self.assertEqual([body.get("service_tier") for _, _, body in openai.calls], ["flex", "flex"])
+        self.assertEqual(len(waits), 1)
+
+    def test_only_the_refused_chunk_moves_to_the_standard_tier(self):
+        # Two chunks of one review in parallel; Flex never has room for the second.
+        def answer(body):
+            if body["messages"][0]["content"] == "chunk 2" and "service_tier" in body:
+                return BUSY
+            return 200, {"tier": body.get("service_tier", "default"), "chunk": body["messages"][0]["content"]}
+        import concurrent.futures
+        with FakeOpenAI(answer) as openai, self.relay(openai.url, [], []) as relay:
+            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                results = list(pool.map(lambda c: self.call(relay, {"model": "m", "messages": [{"content": c}]}),
+                                        ["chunk 1", "chunk 2"]))
+        self.assertEqual(results, [(200, {"tier": "flex", "chunk": "chunk 1"}),
+                                   (200, {"tier": "default", "chunk": "chunk 2"})])
+        self.assertEqual(sum(1 for _, _, body in openai.calls if body["messages"][0]["content"] == "chunk 1"), 1)
+
+    def test_a_model_that_rejects_the_tier_gets_the_standard_tier(self):
+        rejected = (400, {"error": {"message": "Invalid value for 'service_tier': flex is not supported."}})
+        with FakeOpenAI([rejected, (200, {"ok": 1})]) as openai, self.relay(openai.url, [], []) as relay:
+            self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
+        self.assertEqual(["service_tier" in body for _, _, body in openai.calls], [True, False])
+
+    def test_other_errors_reach_pr_agent_unchanged(self):
+        for answer in ((500, {"error": {"message": "boom"}}), (429, {"error": {"message": "Rate limit reached"}}),
+                       (400, {"error": {"message": "max_completion_tokens is too large"}})):
+            with FakeOpenAI([answer]) as openai, self.relay(openai.url, [], []) as relay:
+                self.assertEqual(self.call(relay, {"model": "m", "messages": []}), answer)
+            self.assertEqual(len(openai.calls), 1, answer)
+
+    def test_an_unreachable_openai_is_a_gateway_error(self):
+        with FakeOpenAI([]) as openai:
+            url = openai.url
+        with self.relay(url, [], []) as relay:
+            status, answer = self.call(relay, {"model": "m", "messages": []})
+        self.assertEqual(status, 502)
+        self.assertIn("could not reach OpenAI", answer["error"]["message"])
 
 
 class GateTests(unittest.TestCase):

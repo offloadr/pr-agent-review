@@ -146,8 +146,9 @@ jobs:
           CONFIG.MAX_OUTPUT_TOKENS: "64000"
           CONFIG.PATCH_EXTRA_LINES_BEFORE: "10"
           CONFIG.PATCH_EXTRA_LINES_AFTER: "5"
-          # Flex requests queue for capacity, so they get longer.
-          CONFIG.AI_TIMEOUT: ${{ inputs.service-tier == 'flex' && '900' || '600' }}
+          # Flex requests queue for capacity, so they get longer, plus the 3.5 minutes the relay waits
+          # for Flex capacity before it sends a call on the standard tier.
+          CONFIG.AI_TIMEOUT: ${{ inputs.service-tier == 'flex' && '1200' || '600' }}
           CONFIG.PROPAGATE_TOOL_ERRORS: "true"
           CONFIG.RESTRICTED_MODE: "true"
           CONFIG.OUTPUT_RUN_DETAILS: "true"
@@ -169,9 +170,11 @@ jobs:
         # Standard library only; tests/test_checkpoint.py loads this script from this file.
         run: &checkpoint_script |
           import calendar
+          import contextlib
           import difflib
           import fnmatch
           import hashlib
+          import http.server
           import json
           import os
           import re
@@ -200,6 +203,7 @@ jobs:
           FORCE_PUSH_FILES = 60
           # Waits before retrying Flex when it has no capacity, before falling back to the standard tier.
           FLEX_BACKOFF = (30, 60, 120)
+          OPENAI_API = "https://api.openai.com"
           PR_AGENT = ["/app/.venv/bin/python", "/app/pr_agent/servers/github_action_runner.py"]
           VERDICTS = ("fixed", "still_present", "uncertain")
           FILE_CONTEXT_CHARS = 150_000
@@ -1433,33 +1437,103 @@ jobs:
 
           # ---- Review mode -------------------------------------------------------------------------------
 
-          CHUNK_CALLS_RE = re.compile(r"Number of PR chunk calls: (\d+)")
-          TIER_REJECTED_RE = re.compile(r"service_tier[^\n]{0,160}(not supported|unsupported|invalid)|"
-                                        r"(not supported|unsupported|invalid)[^\n]{0,160}service_tier", re.IGNORECASE)
+          class FlexRelay:
+              """A local OpenAI endpoint for PR-Agent that puts each of its requests on the Flex tier.
 
+              When Flex has no capacity for a request, the relay waits and retries Flex (FLEX_BACKOFF), then sends
+              that one request on the standard tier. A refused request produced no output and is not billed, so a
+              chunked review pays once for every chunk instead of failing partway, or starting over and paying
+              again for the chunks it already finished. A model that rejects the tier gets the standard tier too.
+              Other answers, errors included, reach PR-Agent unchanged."""
 
-          def run_streaming(command, env):
-              """Run a command, echoing its output as it arrives.
+              # Not forwarded: the relay sets its own length and connection handling, and asks for an uncompressed
+              # answer so it can read a refusal.
+              DROPPED_HEADERS = frozenset({"host", "content-length", "connection", "accept-encoding", "keep-alive",
+                                           "transfer-encoding", "proxy-connection", "te", "upgrade"})
 
-              Returns (exit code, the output's tail, the most PR chunk calls PR-Agent announced). The chunk count
-              is read as lines pass, so a long log cannot push it out of the tail."""
-              tail, chunks = [], 0
-              with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, errors="replace") as process:
-                  for line in process.stdout:
-                      sys.stdout.write(line)
-                      match = CHUNK_CALLS_RE.search(line)
-                      if match:
-                          chunks = max(chunks, int(match.group(1)))
-                      tail.append(line)
-                      del tail[:-2000]
-              sys.stdout.flush()
-              return process.returncode, "".join(tail), chunks
+              def __init__(self, tier, upstream=None, sleep=time.sleep, out=None):
+                  self.tier, self.upstream, self.sleep = tier, (upstream or OPENAI_API).rstrip("/"), sleep
+                  self.out = out or (lambda message: print(message, flush=True))
+                  self.server = None
 
+              def __enter__(self):
+                  relay = self
 
-          def flex_refused(log):
-              """Flex had no capacity, or the model does not offer the tier."""
-              return FLEX_UNAVAILABLE in log or TIER_REJECTED_RE.search(log) is not None
+                  class Handler(http.server.BaseHTTPRequestHandler):
+                      def do_POST(self):
+                          relay.forward(self)
+
+                      def log_message(self, *args):
+                          pass  # PR-Agent logs its own calls; the relay reports only tier changes.
+
+                  self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+                  self.server.daemon_threads = True
+                  threading.Thread(target=self.server.serve_forever, daemon=True).start()
+                  return self
+
+              def __exit__(self, *exc):
+                  self.server.shutdown()
+                  self.server.server_close()
+
+              @property
+              def api_base(self):
+                  return f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+
+              def forward(self, handler):
+                  raw = handler.rfile.read(int(handler.headers.get("Content-Length") or 0))
+                  headers = {k: v for k, v in handler.headers.items() if k.lower() not in self.DROPPED_HEADERS}
+                  try:
+                      body = json.loads(raw)
+                  except ValueError:
+                      body = None
+                  if isinstance(body, dict) and "model" in body:
+                      body.setdefault("service_tier", self.tier)
+                  flex_waits = 0
+                  while True:
+                      data = raw if body is None else json.dumps(body).encode()
+                      request = urllib.request.Request(self.upstream + handler.path, data=data, method="POST",
+                                                       headers=headers)
+                      try:
+                          response = urllib.request.urlopen(request, timeout=900)
+                      except urllib.error.HTTPError as error:
+                          detail = error.read()
+                          error.close()
+                          text = detail.decode(errors="replace")
+                          if body and "service_tier" in body and error.code == 429 and FLEX_UNAVAILABLE in text:
+                              if flex_waits < len(FLEX_BACKOFF):
+                                  self.sleep(FLEX_BACKOFF[flex_waits])  # Wait and try Flex again first.
+                                  flex_waits += 1
+                                  continue
+                              self.out("Flex has no capacity for one review call; sending that call on the standard tier.")
+                              body.pop("service_tier")
+                              continue
+                          if body and "service_tier" in body and error.code == 400 and "service_tier" in text:
+                              self.out("The model does not take this service tier; sending the call on the standard tier.")
+                              body.pop("service_tier")
+                              continue
+                          self.reply(handler, error.code, error.headers, [detail])
+                          return
+                      except (urllib.error.URLError, OSError) as error:
+                          # PR-Agent sees a gateway error, which it treats like any other failed call.
+                          message = json.dumps({"error": {"message": f"Relay could not reach OpenAI: {error}"}}).encode()
+                          self.reply(handler, 502, {"Content-Type": "application/json"}, [message])
+                          return
+                      with response:
+                          self.reply(handler, response.status, response.headers, iter(lambda: response.read(65536), b""))
+                      return
+
+              def reply(self, handler, status, headers, chunks):
+                  """Pass an answer through. The connection closes after it, which ends a body of unknown length."""
+                  handler.send_response(status)
+                  for key, value in headers.items():
+                      if key.lower() not in self.DROPPED_HEADERS:
+                          handler.send_header(key, value)
+                  handler.send_header("Connection", "close")
+                  handler.end_headers()
+                  for chunk in chunks:
+                      handler.wfile.write(chunk)
+                      handler.wfile.flush()
+                  handler.close_connection = True
 
 
           def run_pr_agent(plan_result, pr_paths, user_globs, model, keys):
@@ -1467,7 +1541,8 @@ jobs:
               ignored = list(user_globs)
               if plan_result["mode"] == "delta":
                   ignored += [glob_escape(p) for p in sorted(pr_paths - set(plan_result["files"]))]
-              with tempfile.TemporaryDirectory() as scratch:
+              tier = os.environ.get("SERVICE_TIER", "")
+              with tempfile.TemporaryDirectory() as scratch, contextlib.ExitStack() as stack:
                   output_path = os.path.join(scratch, "output")
                   open(output_path, "w").close()
                   env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_KEY", "OPENAI_KEY")}
@@ -1476,10 +1551,9 @@ jobs:
                       env["ANTHROPIC.KEY"] = keys["anthropic"]
                   else:
                       env["OPENAI_KEY"] = keys["openai"]
-                      tier = os.environ.get("SERVICE_TIER", "")
                       if tier and (tier != "flex" or supports_flex(model)):
-                          # PR-Agent forwards only allowlisted extra-body keys; service_tier is one.
-                          env["LITELLM.EXTRA_BODY"] = json.dumps({"service_tier": tier})
+                          # The relay sets the tier on each call and moves a refused call to the standard tier.
+                          env["OPENAI.API_BASE"] = stack.enter_context(FlexRelay(tier)).api_base
                   env.update({
                       "GITHUB_OUTPUT": output_path,
                       "GITHUB_ACTION_CONFIG.ENABLE_OUTPUT": "true",
@@ -1489,30 +1563,7 @@ jobs:
                       # A full review keeps one summary comment; each delta review posts its own.
                       "PR_REVIEWER.PERSISTENT_COMMENT": "true" if plan_result["mode"] == "full" else "false",
                   })
-                  code, log, chunks = run_streaming(PR_AGENT, env)
-                  if code != 0 and "LITELLM.EXTRA_BODY" in env and chunks > 1 and flex_refused(log):
-                      # Earlier chunks may already have been billed, so this run does not start over by itself.
-                      raise RunFailed("Flex ran out of capacity partway through a chunked review. Re-running the job "
-                                      "reviews again from the start, so its completed chunks are paid for again.")
-                  for wait in FLEX_BACKOFF:
-                      # Flex refused a single-call review before any model output, so waiting and retrying Flex
-                      # costs nothing; OpenAI suggests backing off for this error.
-                      if code == 0 or FLEX_UNAVAILABLE not in log or "LITELLM.EXTRA_BODY" not in env:
-                          break
-                      print(f"Flex has no capacity right now; retrying Flex in {wait} seconds.", flush=True)
-                      time.sleep(wait)
-                      open(output_path, "w").close()
-                      code, log, chunks = run_streaming(PR_AGENT, env)
-                      if code != 0 and chunks > 1 and flex_refused(log):
-                          raise RunFailed("Flex ran out of capacity partway through a chunked review. Re-running the job "
-                                          "reviews again from the start, so its completed chunks are paid for again.")
-                  if code != 0 and "LITELLM.EXTRA_BODY" in env and flex_refused(log):
-                      # A single-call review that Flex refused produced no model output, so the retry is not
-                      # billed twice.
-                      print("Flex has no capacity right now; retrying the review on the standard tier.", flush=True)
-                      del env["LITELLM.EXTRA_BODY"]
-                      open(output_path, "w").close()
-                      code, log, _ = run_streaming(PR_AGENT, env)
+                  code = subprocess.run(PR_AGENT, env=env).returncode
                   if code != 0:
                       raise RunFailed(f"PR-Agent exited with code {code}.")
                   review = None
