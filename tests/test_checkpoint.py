@@ -1954,7 +1954,8 @@ class PrAgentProcessTests(unittest.TestCase):
     """Runs run_pr_agent against a stand-in PR-Agent that reports the environment it got."""
 
     def run_with(self, model, keys, plan_result, pr_paths, exit_code=0, write_review=True, call_api=False,
-                 call_timeout=10, tier="flex"):
+                 call_timeout=10, tier="flex", environ=None):
+        """`environ` replaces the run's default settings; a None value leaves that variable unset."""
         import os
         import sys
         import tempfile
@@ -1992,9 +1993,11 @@ class PrAgentProcessTests(unittest.TestCase):
         from unittest import mock
         # Scoped to this run, so no later test inherits these settings.
         settings = {"OPENAI_KEY": "o-key", "ANTHROPIC_KEY": "a-key", "SERVICE_TIER": tier,
-                    "CONFIG.REASONING_EFFORT": "high", "CONFIG.MAX_MODEL_TOKENS": "200000"}
+                    "CONFIG.REASONING_EFFORT": "high", "CONFIG.MAX_MODEL_TOKENS": "200000", **(environ or {})}
         try:
-            with mock.patch.dict(os.environ, settings):
+            with mock.patch.dict(os.environ, {k: v for k, v in settings.items() if v is not None}):
+                for name in [k for k, v in settings.items() if v is None]:
+                    os.environ.pop(name, None)  # Restored with the rest when the patch ends.
                 # run_pr_agent gives PR-Agent its own copy of the environment and leaves this one alone; checked
                 # here, inside the patch, since leaving the patch restores the environment whatever happened.
                 before = dict(os.environ)
@@ -2005,30 +2008,38 @@ class PrAgentProcessTests(unittest.TestCase):
             cp.PR_AGENT = saved
             os.unlink(probe.name)
 
+    # A newer model with no MAX_MODEL_TOKENS: the case where a fallback value could leak into the environment.
+    UNSET_LIMIT = {"CONFIG.MAX_MODEL_TOKENS": None, "CONFIG.REASONING_EFFORT": "low", "SERVICE_TIER": ""}
+
     def test_a_run_leaves_the_environment_as_it_found_it(self):
+        # run_with checks the environment right around run_pr_agent, inside its patch.
         import os
-        from unittest import mock
-        with mock.patch.dict(os.environ, {"CONFIG.REASONING_EFFORT": "low", "SERVICE_TIER": ""}):
-            os.environ.pop("CONFIG.MAX_MODEL_TOKENS", None)
-            before = dict(os.environ)
-            self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"}, {"mode": "full", "files": ["x.py"]},
-                          {"x.py"})
-            self.assertEqual(dict(os.environ), before)  # The helper's own settings are gone again.
+        before = dict(os.environ)
+        seen = self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"}, {"mode": "full", "files": ["x.py"]},
+                             {"x.py"}, environ=self.UNSET_LIMIT)["seen"]
+        self.assertEqual(seen["CONFIG.CUSTOM_MODEL_MAX_TOKENS"], "200000")  # PR-Agent's copy got the fallback.
+        self.assertEqual(dict(os.environ), before)  # And the helper's own settings are gone again.
 
     def test_a_run_that_changed_the_environment_would_be_caught(self):
         import os
         from unittest import mock
         real = cp.run_pr_agent
 
-        def mutating(*args):
+        def changes_effort(*args):
             result = real(*args)
             os.environ["CONFIG.REASONING_EFFORT"] = "changed"
             return result
 
-        with mock.patch.object(cp, "run_pr_agent", mutating), self.assertRaises(AssertionError) as failure:
-            self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"}, {"mode": "full", "files": ["x.py"]},
-                          {"x.py"})
-        self.assertIn("run_pr_agent changed the environment", str(failure.exception))
+        def fills_a_missing_limit(*args):
+            result = real(*args)
+            os.environ.setdefault("CONFIG.MAX_MODEL_TOKENS", "200000")
+            return result
+
+        for stub in (changes_effort, fills_a_missing_limit):
+            with mock.patch.object(cp, "run_pr_agent", stub), self.assertRaises(AssertionError) as failure:
+                self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"}, {"mode": "full", "files": ["x.py"]},
+                              {"x.py"}, environ=self.UNSET_LIMIT)
+            self.assertIn("run_pr_agent changed the environment", str(failure.exception), stub.__name__)
 
     def test_delta_run_ignores_other_files_and_gets_only_its_providers_key(self):
         result = self.run_with("anthropic/claude-opus-5-5", {"anthropic": "a-key", "openai": "o-key"},
