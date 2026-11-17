@@ -146,8 +146,8 @@ jobs:
           CONFIG.MAX_OUTPUT_TOKENS: "64000"
           CONFIG.PATCH_EXTRA_LINES_BEFORE: "10"
           CONFIG.PATCH_EXTRA_LINES_AFTER: "5"
-          # Flex requests queue for capacity, so they get longer, plus the 3.5 minutes the relay waits
-          # for Flex capacity before it sends a call on the standard tier.
+          # Flex requests queue for capacity, so they get longer, plus the relay's waits for Flex capacity
+          # before it sends a call on the standard tier. The relay answers a minute before this.
           CONFIG.AI_TIMEOUT: ${{ inputs.service-tier == 'flex' && '1200' || '600' }}
           CONFIG.PROPAGATE_TOOL_ERRORS: "true"
           CONFIG.RESTRICTED_MODE: "true"
@@ -174,6 +174,7 @@ jobs:
           import difflib
           import fnmatch
           import hashlib
+          import http.client
           import http.server
           import json
           import os
@@ -1444,16 +1445,27 @@ jobs:
               that one request on the standard tier. A refused request produced no output and is not billed, so a
               chunked review pays once for every chunk instead of failing partway, or starting over and paying
               again for the chunks it already finished. A model that rejects the tier gets the standard tier too.
-              Other answers, errors included, reach PR-Agent unchanged."""
+              Other answers, errors included, reach PR-Agent unchanged.
+
+              Each request answers within `deadline` seconds, set below PR-Agent's own call timeout: otherwise
+              PR-Agent could give up and retry while the relay's call still runs, and pay for the chunk twice. A
+              Flex wait that would leave less than STANDARD_CALL_SECONDS for the standard-tier call is skipped."""
 
               # Not forwarded: the relay sets its own length and connection handling, and asks for an uncompressed
               # answer so it can read a refusal.
               DROPPED_HEADERS = frozenset({"host", "content-length", "connection", "accept-encoding", "keep-alive",
                                            "transfer-encoding", "proxy-connection", "te", "upgrade"})
+              # The standard tier's own call timeout (CONFIG.AI_TIMEOUT without Flex).
+              STANDARD_CALL_SECONDS = 600
+              # Longest wait for one upstream answer.
+              ATTEMPT_SECONDS = 900
 
-              def __init__(self, tier, upstream=None, sleep=time.sleep, out=None):
-                  self.tier, self.upstream, self.sleep = tier, (upstream or OPENAI_API).rstrip("/"), sleep
+              def __init__(self, tier, deadline, upstream=None, sleep=time.sleep, clock=time.monotonic, out=None,
+                           urlopen=urllib.request.urlopen):
+                  self.tier, self.deadline, self.sleep, self.clock = tier, deadline, sleep, clock
+                  self.upstream = (upstream or OPENAI_API).rstrip("/")
                   self.out = out or (lambda message: print(message, flush=True))
+                  self.urlopen = urlopen
                   self.server = None
 
               def __enter__(self):
@@ -1480,6 +1492,7 @@ jobs:
                   return f"http://127.0.0.1:{self.server.server_address[1]}/v1"
 
               def forward(self, handler):
+                  ends = self.clock() + self.deadline
                   raw = handler.rfile.read(int(handler.headers.get("Content-Length") or 0))
                   headers = {k: v for k, v in handler.headers.items() if k.lower() not in self.DROPPED_HEADERS}
                   try:
@@ -1490,18 +1503,25 @@ jobs:
                       body.setdefault("service_tier", self.tier)
                   flex_waits = 0
                   while True:
+                      remaining = ends - self.clock()
+                      if remaining <= 0:
+                          self.fail(handler, 504, "The relay ran out of time before OpenAI answered.")
+                          return
                       data = raw if body is None else json.dumps(body).encode()
                       request = urllib.request.Request(self.upstream + handler.path, data=data, method="POST",
                                                        headers=headers)
                       try:
-                          response = urllib.request.urlopen(request, timeout=900)
+                          with self.urlopen(request, timeout=min(self.ATTEMPT_SECONDS, remaining)) as response:
+                              # Read in full, so an answer cut off upstream is a gateway error rather than a short 200.
+                              status, answer_headers, answer = response.status, response.headers, response.read()
                       except urllib.error.HTTPError as error:
-                          detail = error.read()
-                          error.close()
+                          with error:
+                              detail = error.read()
                           text = detail.decode(errors="replace")
                           if body and "service_tier" in body and error.code == 429 and FLEX_UNAVAILABLE in text:
-                              if flex_waits < len(FLEX_BACKOFF):
-                                  self.sleep(FLEX_BACKOFF[flex_waits])  # Wait and try Flex again first.
+                              wait = FLEX_BACKOFF[flex_waits] if flex_waits < len(FLEX_BACKOFF) else None
+                              if wait is not None and ends - self.clock() - wait >= self.STANDARD_CALL_SECONDS:
+                                  self.sleep(wait)  # Wait and try Flex again first.
                                   flex_waits += 1
                                   continue
                               self.out("Flex has no capacity for one review call; sending that call on the standard tier.")
@@ -1511,28 +1531,28 @@ jobs:
                               self.out("The model does not take this service tier; sending the call on the standard tier.")
                               body.pop("service_tier")
                               continue
-                          self.reply(handler, error.code, error.headers, [detail])
+                          self.reply(handler, error.code, error.headers, detail)
                           return
-                      except (urllib.error.URLError, OSError) as error:
-                          # PR-Agent sees a gateway error, which it treats like any other failed call.
-                          message = json.dumps({"error": {"message": f"Relay could not reach OpenAI: {error}"}}).encode()
-                          self.reply(handler, 502, {"Content-Type": "application/json"}, [message])
+                      except (http.client.HTTPException, OSError) as error:
+                          # PR-Agent sees a gateway error, which it retries like any other failed call.
+                          self.fail(handler, 502, f"Relay could not reach OpenAI: {error!r}")
                           return
-                      with response:
-                          self.reply(handler, response.status, response.headers, iter(lambda: response.read(65536), b""))
+                      self.reply(handler, status, answer_headers, answer)
                       return
 
-              def reply(self, handler, status, headers, chunks):
-                  """Pass an answer through. The connection closes after it, which ends a body of unknown length."""
+              def fail(self, handler, status, message):
+                  self.reply(handler, status, {"Content-Type": "application/json"},
+                             json.dumps({"error": {"message": message}}).encode())
+
+              def reply(self, handler, status, headers, payload):
                   handler.send_response(status)
                   for key, value in headers.items():
                       if key.lower() not in self.DROPPED_HEADERS:
                           handler.send_header(key, value)
+                  handler.send_header("Content-Length", str(len(payload)))
                   handler.send_header("Connection", "close")
                   handler.end_headers()
-                  for chunk in chunks:
-                      handler.wfile.write(chunk)
-                      handler.wfile.flush()
+                  handler.wfile.write(payload)
                   handler.close_connection = True
 
 
@@ -1553,7 +1573,9 @@ jobs:
                       env["OPENAI_KEY"] = keys["openai"]
                       if tier and (tier != "flex" or supports_flex(model)):
                           # The relay sets the tier on each call and moves a refused call to the standard tier.
-                          env["OPENAI.API_BASE"] = stack.enter_context(FlexRelay(tier)).api_base
+                          # A minute under PR-Agent's call timeout, so the relay always answers first.
+                          deadline = int(os.environ.get("CONFIG.AI_TIMEOUT") or 1200) - 60
+                          env["OPENAI.API_BASE"] = stack.enter_context(FlexRelay(tier, deadline)).api_base
                           # A configured HTTP proxy would otherwise get the relay's calls, and the API key with
                           # them. Both spellings carry the union, as Python and httpx read either.
                           bypass = [h.strip() for name in ("NO_PROXY", "no_proxy")

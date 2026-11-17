@@ -2100,7 +2100,7 @@ class FlexRelayTests(unittest.TestCase):
                 return error.code, json.loads(error.read())
 
     def relay(self, upstream, waits, messages):
-        return cp.FlexRelay("flex", upstream=upstream, sleep=waits.append, out=messages.append)
+        return cp.FlexRelay("flex", 1140, upstream=upstream, sleep=waits.append, out=messages.append)
 
     def test_busy_flex_waits_then_sends_that_call_on_the_standard_tier(self):
         waits, messages = [], []
@@ -2145,6 +2145,78 @@ class FlexRelayTests(unittest.TestCase):
             with FakeOpenAI([answer]) as openai, self.relay(openai.url, [], []) as relay:
                 self.assertEqual(self.call(relay, {"model": "m", "messages": []}), answer)
             self.assertEqual(len(openai.calls), 1, answer)
+
+    def test_slow_refusals_still_leave_the_standard_call_inside_the_deadline(self):
+        # A fake clock: each refused Flex attempt takes 150 s, and the waits advance it too.
+        now, timeouts = [0.0], []
+
+        def answer(body):
+            if "service_tier" in body:
+                now[0] += 150
+                return BUSY
+            return 200, {"ok": 1}
+
+        def urlopen(request, timeout):
+            timeouts.append((now[0], timeout))
+            return urllib.request.urlopen(request, timeout=10)
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        import urllib.request
+        saved, cp.FLEX_BACKOFF = cp.FLEX_BACKOFF, (30, 60, 120)
+        try:
+            with FakeOpenAI(answer) as openai, cp.FlexRelay("flex", 1140, upstream=openai.url, sleep=sleep,
+                                                            clock=lambda: now[0], out=lambda m: None,
+                                                            urlopen=urlopen) as relay:
+                self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
+        finally:
+            cp.FLEX_BACKOFF = saved
+        # The 2-minute wait would leave under STANDARD_CALL_SECONDS, so the relay went to the standard tier.
+        self.assertEqual(["service_tier" in body for _, _, body in openai.calls], [True, True, True, False])
+        started, timeout = timeouts[-1]
+        self.assertEqual(started, 3 * 150 + 30 + 60)
+        self.assertLessEqual(started + timeout, 1140)  # Answers before PR-Agent's own timeout.
+
+    def test_a_relay_out_of_time_answers_504(self):
+        now = [0.0]
+
+        def answer(body):
+            now[0] += 350  # Flex takes longer than the whole deadline to refuse.
+            return BUSY
+
+        with FakeOpenAI(answer) as openai, cp.FlexRelay("flex", 300, upstream=openai.url, sleep=lambda s: None,
+                                                        clock=lambda: now[0], out=lambda m: None) as relay:
+            status, answer = self.call(relay, {"model": "m", "messages": []})
+        self.assertEqual(status, 504)
+        self.assertEqual(len(openai.calls), 1)  # No standard-tier call PR-Agent could no longer wait for.
+
+    def test_an_answer_cut_off_upstream_is_a_gateway_error_not_a_short_200(self):
+        import http.server
+        import threading
+
+        class Truncating(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "1000")
+                self.end_headers()
+                self.wfile.write(b'{"choices": [')  # Then the connection closes.
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Truncating)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with self.relay(f"http://127.0.0.1:{server.server_address[1]}", [], []) as relay:
+                status, answer = self.call(relay, {"model": "m", "messages": []})
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(status, 502)
+        self.assertIn("IncompleteRead", answer["error"]["message"])
 
     def test_an_unreachable_openai_is_a_gateway_error(self):
         with FakeOpenAI([]) as openai:
