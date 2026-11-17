@@ -1950,6 +1950,10 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(github.state()["security"]["concern"].startswith("SQL injection"))
 
 
+PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                   "no_proxy")
+
+
 class PrAgentProcessTests(unittest.TestCase):
     """Runs run_pr_agent against a stand-in PR-Agent that reports the environment it got."""
 
@@ -1992,8 +1996,10 @@ class PrAgentProcessTests(unittest.TestCase):
         saved, cp.PR_AGENT = cp.PR_AGENT, [sys.executable, probe.name]
         from unittest import mock
         # Scoped to this run, so no later test inherits these settings.
-        settings = {"OPENAI_KEY": "o-key", "ANTHROPIC_KEY": "a-key", "SERVICE_TIER": tier,
-                    "CONFIG.REASONING_EFFORT": "high", "CONFIG.MAX_MODEL_TOKENS": "200000", **(environ or {})}
+        # No proxy unless the test gives one, whatever the runner sets.
+        settings = {**dict.fromkeys(PROXY_VARIABLES), "OPENAI_KEY": "o-key", "ANTHROPIC_KEY": "a-key",
+                    "SERVICE_TIER": tier, "CONFIG.REASONING_EFFORT": "high", "CONFIG.MAX_MODEL_TOKENS": "200000",
+                    **(environ or {})}
         try:
             with mock.patch.dict(os.environ, {k: v for k, v in settings.items() if v is not None}):
                 for name in [k for k, v in settings.items() if v is None]:
@@ -2078,51 +2084,28 @@ class PrAgentProcessTests(unittest.TestCase):
                          ("/v1/chat/completions", "Bearer o-key", "flex"))
 
     def test_relay_calls_bypass_a_configured_proxy_and_keep_its_exclusions(self):
-        import os
-        saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "NO_PROXY", "no_proxy")}
-        os.environ.update({"HTTP_PROXY": "http://proxy.invalid:3128", "NO_PROXY": "corp.example"})
-        try:
-            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
-        finally:
-            for k, v in saved.items():
-                os.environ.pop(k, None)
-                if v is not None:
-                    os.environ[k] = v
+        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                             {"mode": "full", "files": ["x.py"]}, {"x.py"},
+                             environ={"HTTP_PROXY": "http://proxy.invalid:3128", "NO_PROXY": "corp.example"})["seen"]
         self.assertTrue(seen["relay_bypasses_proxy"])
         self.assertEqual((seen["NO_PROXY"], seen["no_proxy"]), ("corp.example,127.0.0.1", "corp.example,127.0.0.1"))
 
     def test_a_proxy_wildcard_exclusion_stays_a_wildcard(self):
-        import os
-        saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy")}
-        os.environ.update({"HTTP_PROXY": "http://proxy.invalid:3128", "HTTPS_PROXY": "http://proxy.invalid:3128",
-                           "no_proxy": "*"})
-        try:
-            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
-        finally:
-            for k, v in saved.items():
-                os.environ.pop(k, None)
-                if v is not None:
-                    os.environ[k] = v
+        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                             {"mode": "full", "files": ["x.py"]}, {"x.py"},
+                             environ={"HTTP_PROXY": "http://proxy.invalid:3128",
+                                      "HTTPS_PROXY": "http://proxy.invalid:3128", "no_proxy": "*"})["seen"]
         self.assertEqual((seen["NO_PROXY"], seen["no_proxy"]), ("*", "*"))
         self.assertTrue(seen["relay_bypasses_proxy"])
         self.assertTrue(seen["github_bypasses_proxy"])
 
     def test_the_lowercase_exclusion_keeps_its_precedence(self):
         # Python and httpx use no_proxy over NO_PROXY, so GitHub stays on the proxy here; only the relay leaves it.
-        import os
-        saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy")}
-        os.environ.update({"HTTP_PROXY": "http://proxy.invalid:3128", "HTTPS_PROXY": "http://proxy.invalid:3128",
-                           "NO_PROXY": "*", "no_proxy": "corp.example"})
-        try:
-            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
-        finally:
-            for k, v in saved.items():
-                os.environ.pop(k, None)
-                if v is not None:
-                    os.environ[k] = v
+        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                             {"mode": "full", "files": ["x.py"]}, {"x.py"},
+                             environ={"HTTP_PROXY": "http://proxy.invalid:3128",
+                                      "HTTPS_PROXY": "http://proxy.invalid:3128", "NO_PROXY": "*",
+                                      "no_proxy": "corp.example"})["seen"]
         self.assertTrue(seen["relay_bypasses_proxy"])
         self.assertFalse(seen["github_bypasses_proxy"])
         self.assertEqual(seen["no_proxy"], "corp.example,127.0.0.1")
@@ -2137,7 +2120,8 @@ class PrAgentProcessTests(unittest.TestCase):
             os.environ["HTTPS_PROXY"] = "https://user:pass@proxy.invalid:443"
             self.assertTrue(cp.relay_cannot_reach(cp.OPENAI_API))
             seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
+                                 {"mode": "full", "files": ["x.py"]}, {"x.py"},
+                                 environ={"HTTPS_PROXY": "https://user:pass@proxy.invalid:443"})["seen"]
             self.assertIsNone(seen["OPENAI.API_BASE"])
             os.environ["NO_PROXY"] = "api.openai.com"
             self.assertFalse(cp.relay_cannot_reach(cp.OPENAI_API))
@@ -2239,22 +2223,12 @@ class PrAgentProcessTests(unittest.TestCase):
             self.assertEqual((body["reasoning_effort"], body.get("service_tier")), ("high", tier or None), tier)
 
     def test_a_newer_model_behind_a_proxy_the_relay_cannot_use_fails_rather_than_lose_its_effort(self):
-        import os
-        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
-                 "no_proxy")
-        saved = {k: os.environ.pop(k, None) for k in names}
-        try:
-            os.environ["HTTPS_PROXY"] = "https://proxy.invalid:443"
-            for tier in ("flex", ""):  # The standard tier has no fallback either: the effort needs the relay.
-                with self.assertRaises(cp.RunFailed) as failure:
-                    self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"},
-                                  {"mode": "full", "files": ["x.py"]}, {"x.py"}, tier=tier)
-                self.assertIn("reasoning effort", str(failure.exception), tier)
-        finally:
-            for k, v in saved.items():
-                os.environ.pop(k, None)
-                if v is not None:
-                    os.environ[k] = v
+        for tier in ("flex", ""):  # The standard tier has no fallback either: the effort needs the relay.
+            with self.assertRaises(cp.RunFailed) as failure:
+                self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"},
+                              {"mode": "full", "files": ["x.py"]}, {"x.py"}, tier=tier,
+                              environ={"HTTPS_PROXY": "https://proxy.invalid:443"})
+            self.assertIn("reasoning effort", str(failure.exception), tier)
 
     def test_which_models_pr_agent_does_not_know(self):
         for model in ("gpt-6.2-sol", "gpt-6.2-astra", "openai/gpt-6.2-sol", "gpt-7"):
@@ -2311,6 +2285,16 @@ class FakeOpenAI:
 
 
 class FlexRelayTests(unittest.TestCase):
+    def setUp(self):
+        # No proxy unless the test sets one, whatever the runner sets; restored after each test.
+        import os
+        from unittest import mock
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in PROXY_VARIABLES:
+            os.environ.pop(name, None)
+
     def call(self, relay, body):
         import urllib.error
         import urllib.request
