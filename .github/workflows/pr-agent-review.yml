@@ -1489,7 +1489,14 @@ jobs:
                   def https_open(self, request):
                       return self.do_open(HTTPS, request, context=ssl.create_default_context())
 
-              return urllib.request.build_opener(HTTPHandler, HTTPSHandler)
+              # httpx, which PR-Agent used to reach OpenAI directly, also takes ALL_PROXY; urllib ignores it for
+              # HTTP and HTTPS, so an HTTP proxy given only that way is applied here. NO_PROXY still applies.
+              proxies = urllib.request.getproxies()
+              fallback = proxies.get("all", "")
+              if urllib.parse.urlsplit(fallback).scheme in ("http", "https"):
+                  for scheme in ("http", "https"):
+                      proxies.setdefault(scheme, fallback)
+              return urllib.request.build_opener(urllib.request.ProxyHandler(proxies), HTTPHandler, HTTPSHandler)
 
 
           class FlexRelay:

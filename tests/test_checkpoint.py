@@ -2322,6 +2322,24 @@ class FlexRelayTests(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertIn("IncompleteRead", answer["error"]["message"])
 
+    def test_a_proxy_given_only_as_all_proxy_carries_the_upstream_call(self):
+        import os
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "no_proxy")
+        saved = {k: os.environ.pop(k, None) for k in names}
+        try:
+            with FakeOpenAI([(200, {"ok": 1})]) as proxy:
+                os.environ["ALL_PROXY"] = proxy.url
+                # Without the proxy this host cannot be reached at all.
+                with self.relay("http://openai.invalid", [], []) as relay:
+                    self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertEqual(proxy.calls[0][0], "http://openai.invalid/v1/chat/completions")
+
     def test_an_unreachable_openai_is_a_gateway_error(self):
         with FakeOpenAI([]) as openai:
             url = openai.url
