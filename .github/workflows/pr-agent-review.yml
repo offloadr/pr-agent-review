@@ -1027,6 +1027,19 @@ jobs:
               return re.match(r"(o[0-9]|gpt-[5-9])", name) is not None and "-chat" not in name
 
 
+          # The GPT-6 models PR-Agent 0.49.0 knows by name (GPT6_MODELS in pr_agent/algo/__init__.py); it knows
+          # GPT-5 by prefix.
+          PR_AGENT_GPT6_MODELS = ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol")
+
+
+          def unknown_to_pr_agent(model):
+              """An OpenAI reasoning model newer than PR-Agent 0.49.0 knows, such as gpt-6.2-sol."""
+              name = model.removeprefix("openai/")
+              match = re.match(r"gpt-(\d+)", name)
+              return (supports_reasoning_effort(model) and match is not None and int(match.group(1)) >= 6
+                      and name not in PR_AGENT_GPT6_MODELS)
+
+
           def supports_flex(model):
               """OpenAI offers Flex for o3, o4-mini and the GPT-5 and later families, but not o3-mini or older models."""
               name = model.removeprefix("openai/")
@@ -1595,6 +1608,8 @@ jobs:
               again for the chunks it already finished. A model that rejects the tier gets the standard tier too.
               Other answers, errors included, reach PR-Agent unchanged.
 
+              With `effort`, each request also carries that reasoning effort unless PR-Agent set one.
+
               Each request answers within `deadline` seconds, set below PR-Agent's own call timeout: otherwise
               PR-Agent could give up and retry while the relay's call still runs, and pay for the chunk twice. A
               Flex wait that would leave less than STANDARD_CALL_SECONDS for the standard-tier call is skipped. A
@@ -1610,10 +1625,10 @@ jobs:
               ATTEMPT_SECONDS = 900
 
               def __init__(self, tier, deadline, upstream=None, sleep=None, clock=time.monotonic, out=None,
-                           open_upstream=None):
+                           open_upstream=None, effort=""):
                   # Closed when PR-Agent is done: nothing is sent after that, since no one would read the answer.
                   self.closed = threading.Event()
-                  self.tier, self.deadline, self.clock = tier, deadline, clock
+                  self.tier, self.deadline, self.clock, self.effort = tier, deadline, clock, effort
                   self.sleep = sleep or self.closed.wait  # A Flex wait ends early when the relay closes.
                   self.upstream = (upstream or OPENAI_API).rstrip("/")
                   self.out = out or (lambda message: print(message, flush=True))
@@ -1659,7 +1674,13 @@ jobs:
                   except ValueError:
                       body = None
                   if isinstance(body, dict) and "model" in body:
-                      body.setdefault("service_tier", self.tier)
+                      if self.tier:
+                          body.setdefault("service_tier", self.tier)
+                      if self.effort:
+                          # For a model PR-Agent does not know as a reasoning model, it sends no effort. A
+                          # rejection of it reaches PR-Agent unchanged, so the review fails visibly instead
+                          # of quietly reviewing at the model's default effort.
+                          body.setdefault("reasoning_effort", self.effort)
                   flex_waits = 0
                   while True:
                       if self.closed.is_set():
@@ -1781,14 +1802,28 @@ jobs:
                       env["ANTHROPIC.KEY"] = keys["anthropic"]
                   else:
                       env["OPENAI_KEY"] = keys["openai"]
-                      if tier and relay_cannot_reach(OPENAI_API):
+                      effort = ""
+                      if unknown_to_pr_agent(model):
+                          # PR-Agent 0.49.0 can call a newer reasoning model only as openai/<id>, with its input
+                          # limit given and the only temperature reasoning allows. It sends no reasoning effort
+                          # for it, so the relay adds the configured one.
+                          env["CONFIG.MODEL"] = "openai/" + model.removeprefix("openai/")
+                          env["CONFIG.CUSTOM_MODEL_MAX_TOKENS"] = env.get("CONFIG.MAX_MODEL_TOKENS") or "200000"
+                          env["CONFIG.TEMPERATURE"] = "1"
+                          effort = env.get("CONFIG.REASONING_EFFORT", "")
+                      relay_tier = tier if tier and (tier != "flex" or supports_flex(model)) else ""
+                      if (relay_tier or effort) and relay_cannot_reach(OPENAI_API):
+                          if effort:
+                              raise RunFailed(f"OpenAI is reached through a proxy the relay cannot use (TLS or not "
+                                              f"HTTP), so {model} cannot get its reasoning effort.")
                           print(f"::notice::OpenAI is reached through a proxy the Flex relay cannot use (TLS or not "
                                 f"HTTP); the review runs on the standard tier instead of {tier}.", flush=True)
-                      elif tier and (tier != "flex" or supports_flex(model)):
+                      elif relay_tier or effort:
                           # The relay sets the tier on each call and moves a refused call to the standard tier.
                           # A minute under PR-Agent's call timeout, so the relay always answers first.
                           deadline = int(os.environ.get("CONFIG.AI_TIMEOUT") or 1200) - 60
-                          env["OPENAI.API_BASE"] = stack.enter_context(FlexRelay(tier, deadline)).api_base
+                          env["OPENAI.API_BASE"] = stack.enter_context(
+                              FlexRelay(relay_tier, deadline, effort=effort)).api_base
                           # A configured HTTP proxy would otherwise get the relay's calls, and the API key with
                           # them. The loopback exclusion extends the setting in effect: Python and httpx use
                           # no_proxy whenever it is set, even empty, and NO_PROXY only otherwise. Both spellings
