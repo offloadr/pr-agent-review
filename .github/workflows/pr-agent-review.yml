@@ -1440,12 +1440,38 @@ jobs:
 
           # ---- Review mode -------------------------------------------------------------------------------
 
-          def tracking_opener(sockets):
-              """A urllib opener, proxies included, that adds each connection's socket to `sockets` once connected."""
+          class UpstreamCall:
+              """The connections of one relayed call, which the relay can cancel at its deadline.
+
+              A connection that finishes connecting after the cancel is closed before anything is sent on it."""
+
+              def __init__(self):
+                  self.lock, self.sockets, self.cancelled = threading.Lock(), [], False
+
+              def register(self, sock):
+                  with self.lock:
+                      if self.cancelled:
+                          sock.close()
+                          raise ConnectionAbortedError("The relay gave up on this call before it was sent.")
+                      self.sockets.append(sock)
+
+              def cancel(self):
+                  with self.lock:
+                      self.cancelled = True
+                      sockets = list(self.sockets)
+                  for sock in sockets:
+                      try:
+                          sock.shutdown(socket.SHUT_RDWR)  # Wakes a blocked read, which then closes the socket.
+                      except OSError:
+                          pass
+
+
+          def tracking_opener(call):
+              """A urllib opener, proxies included, whose connections register with `call` once connected."""
               class Tracked:
                   def connect(self):
                       super().connect()
-                      sockets.append(self.sock)
+                      call.register(self.sock)
 
               class HTTP(Tracked, http.client.HTTPConnection):
                   pass
@@ -1492,7 +1518,7 @@ jobs:
                   self.upstream = (upstream or OPENAI_API).rstrip("/")
                   self.out = out or (lambda message: print(message, flush=True))
                   self.open_upstream = open_upstream or (
-                      lambda request, timeout, sockets: tracking_opener(sockets).open(request, timeout=timeout))
+                      lambda request, timeout, call: tracking_opener(call).open(request, timeout=timeout))
                   self.server = None
 
               def __enter__(self):
@@ -1569,14 +1595,15 @@ jobs:
                   """Send one upstream request and read its whole answer, or None when that takes past the deadline.
 
                   The socket timeout bounds each read, not the whole answer, so the exchange runs on its own thread.
-                  At the deadline the relay cuts its connection, so the call does not run on beside PR-Agent's retry
-                  of it. Reading in full makes an answer cut off upstream a gateway error rather than a short 200."""
-                  outcome, sockets = [], []
+                  At the deadline the relay cancels the call: an open connection is cut, and one still connecting
+                  sends nothing, so the call does not run on beside PR-Agent's retry of it. Reading in full makes an
+                  answer cut off upstream a gateway error rather than a short 200."""
+                  outcome, call = [], UpstreamCall()
 
                   def run():
                       try:
                           try:
-                              with self.open_upstream(request, min(self.ATTEMPT_SECONDS, remaining), sockets) as response:
+                              with self.open_upstream(request, min(self.ATTEMPT_SECONDS, remaining), call) as response:
                                   outcome.append(("answer", response.status, response.headers, response.read()))
                           except urllib.error.HTTPError as error:
                               with error:  # Reading an error's body can fail too, as a transport failure.
@@ -1589,11 +1616,7 @@ jobs:
                   worker.join(remaining)
                   if outcome:
                       return outcome[0]
-                  for sock in list(sockets):
-                      try:
-                          sock.shutdown(socket.SHUT_RDWR)  # Wakes the worker's blocked read, which then closes it.
-                      except OSError:
-                          pass
+                  call.cancel()
                   worker.join(5)
                   return None
 

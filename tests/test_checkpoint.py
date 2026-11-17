@@ -2174,7 +2174,7 @@ class FlexRelayTests(unittest.TestCase):
                 return BUSY
             return 200, {"ok": 1}
 
-        def open_upstream(request, timeout, sockets):
+        def open_upstream(request, timeout, call):
             timeouts.append((now[0], timeout))
             return urllib.request.urlopen(request, timeout=10)
 
@@ -2251,6 +2251,29 @@ class FlexRelayTests(unittest.TestCase):
         # The relay cut the call rather than leaving it to run on beside PR-Agent's retry.
         self.assertTrue(cut.wait(1))
         self.assertFalse(finished.is_set())
+
+    def test_a_call_still_connecting_at_the_deadline_is_never_sent(self):
+        # Name resolution or connecting outlasts the deadline, then recovers after the relay answered 504.
+        import socket
+        import threading
+        import time
+        from unittest import mock
+        real, released = socket.create_connection, threading.Event()
+        with FakeOpenAI([(200, {"ok": 1})]) as openai:
+            upstream_port = int(openai.url.rsplit(":", 1)[1])
+
+            def slow_connection(address, *args, **kwargs):
+                if address[1] == upstream_port:
+                    released.wait(5)
+                return real(address, *args, **kwargs)
+
+            with mock.patch("socket.create_connection", slow_connection), \
+                    cp.FlexRelay("flex", 0.3, upstream=openai.url, out=lambda m: None) as relay:
+                status, _ = self.call(relay, {"model": "m", "messages": []})
+                released.set()
+                time.sleep(0.5)
+        self.assertEqual(status, 504)
+        self.assertEqual(openai.calls, [])  # The late connection sent nothing.
 
     def test_an_answer_cut_off_upstream_is_a_gateway_error_not_a_short_200(self):
         import http.server
