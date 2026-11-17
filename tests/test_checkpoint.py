@@ -2074,6 +2074,29 @@ class PrAgentProcessTests(unittest.TestCase):
         self.assertFalse(seen["github_bypasses_proxy"])
         self.assertEqual(seen["no_proxy"], "corp.example,127.0.0.1")
 
+    def test_a_tls_proxy_to_openai_runs_the_review_on_the_standard_tier_without_the_relay(self):
+        # urllib would send CONNECT and the proxy credentials in plain text to a proxy that expects TLS.
+        import os
+        names = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                 "no_proxy")
+        saved = {k: os.environ.pop(k, None) for k in names}
+        try:
+            os.environ["HTTPS_PROXY"] = "https://user:pass@proxy.invalid:443"
+            self.assertTrue(cp.tls_proxy_for(cp.OPENAI_API))
+            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
+            self.assertIsNone(seen["OPENAI.API_BASE"])
+            os.environ["NO_PROXY"] = "api.openai.com"
+            self.assertFalse(cp.tls_proxy_for(cp.OPENAI_API))
+            os.environ.pop("NO_PROXY")
+            os.environ["HTTPS_PROXY"] = "http://proxy.invalid:3128"
+            self.assertFalse(cp.tls_proxy_for(cp.OPENAI_API))
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
     def test_failure_or_missing_output_is_a_failed_run(self):
         with self.assertRaises(cp.RunFailed):
             self.run_with("gpt-6.1-sol", {"openai": "k"}, {"mode": "full", "files": []}, set(), exit_code=1)
@@ -2328,17 +2351,18 @@ class FlexRelayTests(unittest.TestCase):
                  "no_proxy")
         saved = {k: os.environ.pop(k, None) for k in names}
         try:
-            with FakeOpenAI([(200, {"ok": 1})]) as proxy:
-                os.environ["ALL_PROXY"] = proxy.url
-                # Without the proxy this host cannot be reached at all.
-                with self.relay("http://openai.invalid", [], []) as relay:
-                    self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}))
+            for given in ("{url}", "{bare}"):  # With its scheme, and without one, which httpx reads as HTTP.
+                with FakeOpenAI([(200, {"ok": 1})]) as proxy:
+                    os.environ["ALL_PROXY"] = given.format(url=proxy.url, bare=proxy.url.removeprefix("http://"))
+                    # Without the proxy this host cannot be reached at all.
+                    with self.relay("http://openai.invalid", [], []) as relay:
+                        self.assertEqual(self.call(relay, {"model": "m", "messages": []}), (200, {"ok": 1}), given)
+                self.assertEqual(proxy.calls[0][0], "http://openai.invalid/v1/chat/completions", given)
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None)
                 if v is not None:
                     os.environ[k] = v
-        self.assertEqual(proxy.calls[0][0], "http://openai.invalid/v1/chat/completions")
 
     def test_an_unreachable_openai_is_a_gateway_error(self):
         with FakeOpenAI([]) as openai:

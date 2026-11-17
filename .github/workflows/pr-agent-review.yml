@@ -1489,14 +1489,32 @@ jobs:
                   def https_open(self, request):
                       return self.do_open(HTTPS, request, context=ssl.create_default_context())
 
-              # httpx, which PR-Agent used to reach OpenAI directly, also takes ALL_PROXY; urllib ignores it for
-              # HTTP and HTTPS, so an HTTP proxy given only that way is applied here. NO_PROXY still applies.
+              return urllib.request.build_opener(urllib.request.ProxyHandler(upstream_proxies()), HTTPHandler,
+                                                 HTTPSHandler)
+
+
+          def upstream_proxies():
+              """The environment's proxies for the relay's upstream calls, read as httpx reads them.
+
+              httpx, which PR-Agent used to reach OpenAI directly, also takes ALL_PROXY, and reads a proxy without a
+              scheme as an HTTP proxy; urllib does neither for HTTP and HTTPS, so both are applied here. NO_PROXY
+              still applies, through urllib's own bypass check."""
               proxies = urllib.request.getproxies()
               fallback = proxies.get("all", "")
+              if fallback and "://" not in fallback:
+                  fallback = "http://" + fallback
               if urllib.parse.urlsplit(fallback).scheme in ("http", "https"):
                   for scheme in ("http", "https"):
                       proxies.setdefault(scheme, fallback)
-              return urllib.request.build_opener(urllib.request.ProxyHandler(proxies), HTTPHandler, HTTPSHandler)
+              return proxies
+
+
+          def tls_proxy_for(url):
+              """Whether calls to `url` go through a proxy reached over TLS, which urllib cannot do: it would send
+              CONNECT, and any proxy credentials, in plain text."""
+              host = urllib.parse.urlsplit(url).hostname
+              proxy = upstream_proxies().get(urllib.parse.urlsplit(url).scheme, "")
+              return urllib.parse.urlsplit(proxy).scheme == "https" and not urllib.request.proxy_bypass(host)
 
 
           class FlexRelay:
@@ -1674,7 +1692,10 @@ jobs:
                       env["ANTHROPIC.KEY"] = keys["anthropic"]
                   else:
                       env["OPENAI_KEY"] = keys["openai"]
-                      if tier and (tier != "flex" or supports_flex(model)):
+                      if tier and tls_proxy_for(OPENAI_API):
+                          print(f"::notice::OpenAI is reached through a TLS proxy, which the Flex relay cannot use; "
+                                f"the review runs on the standard tier instead of {tier}.", flush=True)
+                      elif tier and (tier != "flex" or supports_flex(model)):
                           # The relay sets the tier on each call and moves a refused call to the standard tier.
                           # A minute under PR-Agent's call timeout, so the relay always answers first.
                           deadline = int(os.environ.get("CONFIG.AI_TIMEOUT") or 1200) - 60
