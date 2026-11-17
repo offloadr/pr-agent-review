@@ -2215,10 +2215,12 @@ class PrAgentProcessTests(unittest.TestCase):
         self.assertLess(seen["elapsed"], 2)  # Before PR-Agent's own timeout, so it never retries a running call.
 
     def test_a_model_pr_agent_knows_gets_no_extra_settings(self):
+        # The workflow sets CONFIG.MODEL to the model input; PR-Agent gets it exactly as given.
         seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                             {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
-        self.assertEqual((seen["CONFIG.CUSTOM_MODEL_MAX_TOKENS"], seen["CONFIG.TEMPERATURE"]), (None, None))
-        self.assertNotEqual(seen["CONFIG.MODEL"], "openai/gpt-6.1-sol")
+                             {"mode": "full", "files": ["x.py"]}, {"x.py"},
+                             environ={"CONFIG.MODEL": "gpt-6.1-sol"})["seen"]
+        self.assertEqual((seen["CONFIG.MODEL"], seen["CONFIG.CUSTOM_MODEL_MAX_TOKENS"], seen["CONFIG.TEMPERATURE"]),
+                         ("gpt-6.1-sol", None, None))
 
     def test_a_newer_reasoning_model_gets_the_settings_pr_agent_needs_and_its_effort(self):
         for tier in ("flex", ""):  # The relay adds the effort on the standard tier too.
