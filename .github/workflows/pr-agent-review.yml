@@ -1456,6 +1456,7 @@ jobs:
                       self.sockets.append(sock)
 
               def cancel(self):
+                  """Cut the call's connections; returns whether the request may have reached OpenAI."""
                   with self.lock:
                       self.cancelled = True
                       sockets = list(self.sockets)
@@ -1464,6 +1465,7 @@ jobs:
                           sock.shutdown(socket.SHUT_RDWR)  # Wakes a blocked read, which then closes the socket.
                       except OSError:
                           pass
+                  return bool(sockets)
 
 
           def tracking_opener(call):
@@ -1501,7 +1503,8 @@ jobs:
 
               Each request answers within `deadline` seconds, set below PR-Agent's own call timeout: otherwise
               PR-Agent could give up and retry while the relay's call still runs, and pay for the chunk twice. A
-              Flex wait that would leave less than STANDARD_CALL_SECONDS for the standard-tier call is skipped."""
+              Flex wait that would leave less than STANDARD_CALL_SECONDS for the standard-tier call is skipped. A
+              call that reached OpenAI but did not finish by the deadline fails without a retry."""
 
               # Not forwarded: the relay sets its own length and connection handling, and asks for an uncompressed
               # answer so it can read a refusal.
@@ -1563,11 +1566,20 @@ jobs:
                       data = raw if body is None else json.dumps(body).encode()
                       request = urllib.request.Request(self.upstream + handler.path, data=data, method="POST",
                                                        headers=headers)
-                      outcome = self.exchange(request, remaining)
-                      if outcome is None:
-                          self.fail(handler, 504, "OpenAI did not answer within the relay's deadline.")
+                      kind, status, answer_headers, answer = self.exchange(request, remaining)
+                      if kind == "late" and status:
+                          # OpenAI may still run and bill a request it already received, however the connection
+                          # ended, so a retry could pay for the chunk twice. As for any chunk that fails, the review
+                          # fails instead: neither the OpenAI client nor PR-Agent retries a 422 marked this way.
+                          self.reply(handler, 422, {"Content-Type": "application/json", "x-should-retry": "false"},
+                                     json.dumps({"error": {"message": "OpenAI did not answer within the relay's "
+                                                           "deadline. The call is not retried, since OpenAI may "
+                                                           "still be running and billing it."}}).encode())
                           return
-                      kind, status, answer_headers, answer = outcome
+                      if kind == "late":
+                          # Nothing was sent, so PR-Agent may safely try again.
+                          self.fail(handler, 504, "OpenAI could not be reached within the relay's deadline.")
+                          return
                       if kind == "failed":
                           # PR-Agent sees a gateway error, which it retries like any other failed call.
                           self.fail(handler, 502, f"Relay could not reach OpenAI: {answer!r}")
@@ -1592,12 +1604,13 @@ jobs:
                       return
 
               def exchange(self, request, remaining):
-                  """Send one upstream request and read its whole answer, or None when that takes past the deadline.
+                  """Send one upstream request and read its whole answer. Past the deadline the outcome is "late",
+                  with whether the request may have reached OpenAI.
 
                   The socket timeout bounds each read, not the whole answer, so the exchange runs on its own thread.
                   At the deadline the relay cancels the call: an open connection is cut, and one still connecting
-                  sends nothing, so the call does not run on beside PR-Agent's retry of it. Reading in full makes an
-                  answer cut off upstream a gateway error rather than a short 200."""
+                  sends nothing. Reading in full makes an answer cut off upstream a gateway error rather than a
+                  short 200."""
                   outcome, call = [], UpstreamCall()
 
                   def run():
@@ -1616,9 +1629,9 @@ jobs:
                   worker.join(remaining)
                   if outcome:
                       return outcome[0]
-                  call.cancel()
+                  sent = call.cancel()
                   worker.join(5)
-                  return None
+                  return "late", sent, None, None
 
               def fail(self, handler, status, message):
                   self.reply(handler, status, {"Content-Type": "application/json"},

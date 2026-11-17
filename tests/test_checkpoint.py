@@ -2246,9 +2246,11 @@ class FlexRelayTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
-        self.assertEqual(status, 504)
+        # The call reached OpenAI, so it fails without a retry rather than risk paying for it twice.
+        self.assertEqual(status, 422)
+        self.assertIn("not retried", answer["error"]["message"])
         self.assertLess(elapsed, 1.5)  # The whole answer would take 2 s.
-        # The relay cut the call rather than leaving it to run on beside PR-Agent's retry.
+        # The relay cut the call rather than leaving it to run on.
         self.assertTrue(cut.wait(1))
         self.assertFalse(finished.is_set())
 
@@ -2272,7 +2274,7 @@ class FlexRelayTests(unittest.TestCase):
                 status, _ = self.call(relay, {"model": "m", "messages": []})
                 released.set()
                 time.sleep(0.5)
-        self.assertEqual(status, 504)
+        self.assertEqual(status, 504)  # Nothing was sent, so PR-Agent may retry.
         self.assertEqual(openai.calls, [])  # The late connection sent nothing.
 
     def test_an_answer_cut_off_upstream_is_a_gateway_error_not_a_short_200(self):
