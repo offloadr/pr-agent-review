@@ -1953,7 +1953,8 @@ class ReviewTests(unittest.TestCase):
 class PrAgentProcessTests(unittest.TestCase):
     """Runs run_pr_agent against a stand-in PR-Agent that reports the environment it got."""
 
-    def run_with(self, model, keys, plan_result, pr_paths, exit_code=0, write_review=True, call_api=False):
+    def run_with(self, model, keys, plan_result, pr_paths, exit_code=0, write_review=True, call_api=False,
+                 call_timeout=10):
         import os
         import sys
         import tempfile
@@ -1971,8 +1972,14 @@ class PrAgentProcessTests(unittest.TestCase):
                                                  data=json.dumps({{"model": "m", "messages": []}}).encode(),
                                                  headers={{"Authorization": "Bearer " + os.environ["OPENAI_KEY"],
                                                           "Content-Type": "application/json"}})
-                with urllib.request.urlopen(request, timeout=10) as response:
-                    seen["answer"] = json.loads(response.read())
+                import time, urllib.error
+                started = time.monotonic()
+                try:
+                    with urllib.request.urlopen(request, timeout={call_timeout!r}) as response:
+                        seen["answer"] = json.loads(response.read())
+                except urllib.error.HTTPError as error:
+                    seen["answer_status"] = error.code
+                seen["elapsed"] = time.monotonic() - started
             if {write_review!r}:
                 with open(os.environ["GITHUB_OUTPUT"], "a") as out:
                     out.write("other=1\\n")
@@ -2096,6 +2103,37 @@ class PrAgentProcessTests(unittest.TestCase):
                 os.environ.pop(k, None)
                 if v is not None:
                     os.environ[k] = v
+
+    def test_the_relay_answers_before_pr_agents_own_call_timeout(self):
+        # PR-Agent gives each call CONFIG.AI_TIMEOUT seconds (config.ai_timeout in its LiteLLM handler); the
+        # relay's deadline is a minute less. Scaled down: a 61 s AI_TIMEOUT gives the relay 1 s, against a
+        # 2 s client timeout, and OpenAI takes 3 s. The relay must answer first, so PR-Agent never times out
+        # and retries while the relay's call still runs.
+        import os
+        import time
+
+        def slow(body):
+            time.sleep(3)
+            return 200, {"ok": 1}
+
+        with FakeOpenAI(slow) as openai:
+            saved_api, cp.OPENAI_API = cp.OPENAI_API, openai.url
+            saved_timeout = os.environ.get("CONFIG.AI_TIMEOUT")
+            os.environ["CONFIG.AI_TIMEOUT"] = "61"
+            try:
+                seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                     {"mode": "full", "files": ["x.py"]}, {"x.py"}, call_api=True,
+                                     call_timeout=2)["seen"]
+            finally:
+                cp.OPENAI_API = saved_api
+                if saved_timeout is None:
+                    os.environ.pop("CONFIG.AI_TIMEOUT")
+                else:
+                    os.environ["CONFIG.AI_TIMEOUT"] = saved_timeout
+        # The call reached OpenAI, so the answer is the 422 that neither the OpenAI client nor PR-Agent retries.
+        self.assertEqual(seen["answer_status"], 422)
+        self.assertLess(seen["elapsed"], 2)
+        self.assertEqual(len(openai.calls), 1)
 
     def test_failure_or_missing_output_is_a_failed_run(self):
         with self.assertRaises(cp.RunFailed):
