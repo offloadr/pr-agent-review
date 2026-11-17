@@ -1989,13 +1989,26 @@ class PrAgentProcessTests(unittest.TestCase):
         """))
         probe.close()
         saved, cp.PR_AGENT = cp.PR_AGENT, [sys.executable, probe.name]
-        os.environ.update({"OPENAI_KEY": "o-key", "ANTHROPIC_KEY": "a-key", "SERVICE_TIER": tier,
-                           "CONFIG.REASONING_EFFORT": "high", "CONFIG.MAX_MODEL_TOKENS": "200000"})
+        from unittest import mock
+        # Scoped to this run, so no later test inherits these settings.
+        settings = {"OPENAI_KEY": "o-key", "ANTHROPIC_KEY": "a-key", "SERVICE_TIER": tier,
+                    "CONFIG.REASONING_EFFORT": "high", "CONFIG.MAX_MODEL_TOKENS": "200000"}
         try:
-            return cp.run_pr_agent(plan_result, pr_paths, ["**/package-lock.json"], model, keys)
+            with mock.patch.dict(os.environ, settings):
+                return cp.run_pr_agent(plan_result, pr_paths, ["**/package-lock.json"], model, keys)
         finally:
             cp.PR_AGENT = saved
             os.unlink(probe.name)
+
+    def test_a_run_leaves_the_environment_as_it_found_it(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"CONFIG.REASONING_EFFORT": "low", "SERVICE_TIER": ""}):
+            os.environ.pop("CONFIG.MAX_MODEL_TOKENS", None)
+            before = dict(os.environ)
+            self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"}, {"mode": "full", "files": ["x.py"]},
+                          {"x.py"})
+            self.assertEqual(dict(os.environ), before)
 
     def test_delta_run_ignores_other_files_and_gets_only_its_providers_key(self):
         result = self.run_with("anthropic/claude-opus-5-5", {"anthropic": "a-key", "openai": "o-key"},
@@ -2198,15 +2211,16 @@ class PrAgentProcessTests(unittest.TestCase):
         saved = {k: os.environ.pop(k, None) for k in names}
         try:
             os.environ["HTTPS_PROXY"] = "https://proxy.invalid:443"
-            with self.assertRaises(cp.RunFailed) as failure:
-                self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"},
-                              {"mode": "full", "files": ["x.py"]}, {"x.py"})
+            for tier in ("flex", ""):  # The standard tier has no fallback either: the effort needs the relay.
+                with self.assertRaises(cp.RunFailed) as failure:
+                    self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"},
+                                  {"mode": "full", "files": ["x.py"]}, {"x.py"}, tier=tier)
+                self.assertIn("reasoning effort", str(failure.exception), tier)
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None)
                 if v is not None:
                     os.environ[k] = v
-        self.assertIn("reasoning effort", str(failure.exception))
 
     def test_which_models_pr_agent_does_not_know(self):
         for model in ("gpt-6.2-sol", "gpt-6.2-astra", "openai/gpt-6.2-sol", "gpt-7"):
