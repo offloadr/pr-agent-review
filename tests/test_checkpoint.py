@@ -1959,9 +1959,12 @@ class PrAgentProcessTests(unittest.TestCase):
         import tempfile
         probe = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
         probe.write(textwrap.dedent(f"""
-            import json, os, urllib.request
+            import json, os, urllib.parse, urllib.request
             seen = {{k: os.environ.get(k) for k in ("OPENAI_KEY", "ANTHROPIC_KEY", "ANTHROPIC.KEY", "IGNORE.GLOB", "OPENAI.API_BASE",
                                                      "PR_REVIEWER.PERSISTENT_FINDING_STATE", "PR_REVIEWER.PERSISTENT_COMMENT")}}
+            seen["NO_PROXY"], seen["no_proxy"] = os.environ.get("NO_PROXY"), os.environ.get("no_proxy")
+            seen["relay_bypasses_proxy"] = bool(os.environ.get("OPENAI.API_BASE")) and urllib.request.proxy_bypass_environment(
+                urllib.parse.urlsplit(os.environ["OPENAI.API_BASE"]).netloc)
             if {call_api!r}:
                 request = urllib.request.Request(os.environ["OPENAI.API_BASE"] + "/chat/completions", method="POST",
                                                  data=json.dumps({{"model": "m", "messages": []}}).encode(),
@@ -2019,6 +2022,21 @@ class PrAgentProcessTests(unittest.TestCase):
         path, headers, body = openai.calls[0]
         self.assertEqual((path, headers["Authorization"], body["service_tier"]),
                          ("/v1/chat/completions", "Bearer o-key", "flex"))
+
+    def test_relay_calls_bypass_a_configured_proxy_and_keep_its_exclusions(self):
+        import os
+        saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "NO_PROXY", "no_proxy")}
+        os.environ.update({"HTTP_PROXY": "http://proxy.invalid:3128", "NO_PROXY": "corp.example"})
+        try:
+            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+        self.assertTrue(seen["relay_bypasses_proxy"])
+        self.assertEqual((seen["NO_PROXY"], seen["no_proxy"]), ("corp.example,127.0.0.1", "corp.example,127.0.0.1"))
 
     def test_failure_or_missing_output_is_a_failed_run(self):
         with self.assertRaises(cp.RunFailed):

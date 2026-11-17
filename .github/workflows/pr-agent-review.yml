@@ -1554,6 +1554,11 @@ jobs:
                       if tier and (tier != "flex" or supports_flex(model)):
                           # The relay sets the tier on each call and moves a refused call to the standard tier.
                           env["OPENAI.API_BASE"] = stack.enter_context(FlexRelay(tier)).api_base
+                          # A configured HTTP proxy would otherwise get the relay's calls, and the API key with
+                          # them. Both spellings carry the union, as Python and httpx read either.
+                          bypass = [h.strip() for name in ("NO_PROXY", "no_proxy")
+                                    for h in env.get(name, "").split(",") if h.strip()]
+                          env["NO_PROXY"] = env["no_proxy"] = ",".join(dict.fromkeys(bypass + ["127.0.0.1"]))
                   env.update({
                       "GITHUB_OUTPUT": output_path,
                       "GITHUB_ACTION_CONFIG.ENABLE_OUTPUT": "true",
