@@ -1609,13 +1609,17 @@ jobs:
               # Longest wait for one upstream answer.
               ATTEMPT_SECONDS = 900
 
-              def __init__(self, tier, deadline, upstream=None, sleep=time.sleep, clock=time.monotonic, out=None,
+              def __init__(self, tier, deadline, upstream=None, sleep=None, clock=time.monotonic, out=None,
                            open_upstream=None):
-                  self.tier, self.deadline, self.sleep, self.clock = tier, deadline, sleep, clock
+                  # Closed when PR-Agent is done: nothing is sent after that, since no one would read the answer.
+                  self.closed = threading.Event()
+                  self.tier, self.deadline, self.clock = tier, deadline, clock
+                  self.sleep = sleep or self.closed.wait  # A Flex wait ends early when the relay closes.
                   self.upstream = (upstream or OPENAI_API).rstrip("/")
                   self.out = out or (lambda message: print(message, flush=True))
                   self.open_upstream = open_upstream or (
                       lambda request, timeout, call: tracking_opener(call).open(request, timeout=timeout))
+                  self.lock, self.active = threading.Lock(), set()
                   self.server = None
 
               def __enter__(self):
@@ -1634,6 +1638,11 @@ jobs:
                   return self
 
               def __exit__(self, *exc):
+                  with self.lock:
+                      self.closed.set()
+                      active = list(self.active)
+                  for call in active:
+                      call.cancel()  # A call still running belongs to a review that has ended.
                   self.server.shutdown()
                   self.server.server_close()
 
@@ -1653,6 +1662,9 @@ jobs:
                       body.setdefault("service_tier", self.tier)
                   flex_waits = 0
                   while True:
+                      if self.closed.is_set():
+                          self.fail(handler, 503, "The review ended; the relay sends no more calls.")
+                          return
                       remaining = ends - self.clock()
                       if remaining <= 0:
                           self.fail(handler, 504, "The relay ran out of time before OpenAI answered.")
@@ -1709,6 +1721,10 @@ jobs:
                   sends nothing. Reading in full makes an answer cut off upstream a gateway error rather than a
                   short 200."""
                   outcome, call = [], UpstreamCall()
+                  with self.lock:
+                      if self.closed.is_set():
+                          return "failed", None, None, ConnectionAbortedError("The relay has closed.")
+                      self.active.add(call)
 
                   def run():
                       try:
@@ -1723,12 +1739,16 @@ jobs:
 
                   worker = threading.Thread(target=run, daemon=True)
                   worker.start()
-                  worker.join(remaining)
-                  if outcome:
-                      return outcome[0]
-                  sent = call.cancel()
-                  worker.join(5)
-                  return "late", sent, None, None
+                  try:
+                      worker.join(remaining)
+                      if outcome:
+                          return outcome[0]
+                      sent = call.cancel()
+                      worker.join(5)
+                      return "late", sent, None, None
+                  finally:
+                      with self.lock:
+                          self.active.discard(call)
 
               def fail(self, handler, status, message):
                   self.reply(handler, status, {"Content-Type": "application/json"},

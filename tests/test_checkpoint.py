@@ -2460,6 +2460,64 @@ class FlexRelayTests(unittest.TestCase):
                 if v is not None:
                     os.environ[k] = v
 
+    def test_a_call_waiting_for_flex_sends_nothing_once_the_review_ended(self):
+        import threading
+        waiting, release, results = threading.Event(), threading.Event(), []
+
+        def sleep(seconds):
+            waiting.set()
+            release.wait(5)
+
+        with FakeOpenAI([BUSY, (200, {"ok": 1})]) as openai:
+            relay = cp.FlexRelay("flex", 1140, upstream=openai.url, sleep=sleep, out=lambda m: None).__enter__()
+            client = threading.Thread(target=lambda: results.append(self.call(relay, {"model": "m", "messages": []})))
+            client.start()
+            self.assertTrue(waiting.wait(5))
+            relay.__exit__(None, None, None)  # PR-Agent exited while the call waited for Flex.
+            release.set()
+            client.join(5)
+        self.assertEqual(len(openai.calls), 1)  # Only the refused Flex attempt.
+        self.assertEqual(results[0][0], 503)
+
+    def test_a_call_running_when_the_review_ends_is_cut(self):
+        import http.server
+        import threading
+        import time
+        cut, started = threading.Event(), threading.Event()
+
+        class Slow(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                started.set()
+                self.send_response(200)
+                self.send_header("Content-Length", "40")
+                self.end_headers()
+                try:
+                    for _ in range(40):
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(0.05)
+                except OSError:
+                    cut.set()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            relay = cp.FlexRelay("flex", 1140, upstream=f"http://127.0.0.1:{server.server_address[1]}",
+                                 out=lambda m: None).__enter__()
+            client = threading.Thread(target=lambda: self.call(relay, {"model": "m", "messages": []}))
+            client.start()
+            self.assertTrue(started.wait(5))
+            relay.__exit__(None, None, None)
+            self.assertTrue(cut.wait(2))
+            client.join(5)
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_an_unreachable_openai_is_a_gateway_error(self):
         with FakeOpenAI([]) as openai:
             url = openai.url
