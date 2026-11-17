@@ -1950,11 +1950,16 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(github.state()["security"]["concern"].startswith("SQL injection"))
 
 
+PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy",
+                   "no_proxy")
+
+
 class PrAgentProcessTests(unittest.TestCase):
     """Runs run_pr_agent against a stand-in PR-Agent that reports the environment it got."""
 
     def run_with(self, model, keys, plan_result, pr_paths, exit_code=0, write_review=True, call_api=False,
-                 call_timeout=10):
+                 call_timeout=10, tier="flex", environ=None):
+        """`environ` replaces the run's default settings; a None value leaves that variable unset."""
         import os
         import sys
         import tempfile
@@ -1962,14 +1967,15 @@ class PrAgentProcessTests(unittest.TestCase):
         probe.write(textwrap.dedent(f"""
             import json, os, urllib.parse, urllib.request
             seen = {{k: os.environ.get(k) for k in ("OPENAI_KEY", "ANTHROPIC_KEY", "ANTHROPIC.KEY", "IGNORE.GLOB", "OPENAI.API_BASE",
-                                                     "PR_REVIEWER.PERSISTENT_FINDING_STATE", "PR_REVIEWER.PERSISTENT_COMMENT")}}
+                                                     "PR_REVIEWER.PERSISTENT_FINDING_STATE", "PR_REVIEWER.PERSISTENT_COMMENT",
+                                                     "CONFIG.MODEL", "CONFIG.CUSTOM_MODEL_MAX_TOKENS", "CONFIG.TEMPERATURE")}}
             seen["NO_PROXY"], seen["no_proxy"] = os.environ.get("NO_PROXY"), os.environ.get("no_proxy")
             seen["relay_bypasses_proxy"] = bool(os.environ.get("OPENAI.API_BASE")) and urllib.request.proxy_bypass_environment(
                 urllib.parse.urlsplit(os.environ["OPENAI.API_BASE"]).netloc)
             seen["github_bypasses_proxy"] = urllib.request.proxy_bypass_environment("api.github.com")
             if {call_api!r}:
                 request = urllib.request.Request(os.environ["OPENAI.API_BASE"] + "/chat/completions", method="POST",
-                                                 data=json.dumps({{"model": "m", "messages": []}}).encode(),
+                                                 data=json.dumps({{"model": "m", "messages": [], "temperature": 1}}).encode(),
                                                  headers={{"Authorization": "Bearer " + os.environ["OPENAI_KEY"],
                                                           "Content-Type": "application/json"}})
                 import time, urllib.error
@@ -1988,12 +1994,58 @@ class PrAgentProcessTests(unittest.TestCase):
         """))
         probe.close()
         saved, cp.PR_AGENT = cp.PR_AGENT, [sys.executable, probe.name]
-        os.environ.update({"OPENAI_KEY": "o-key", "ANTHROPIC_KEY": "a-key", "SERVICE_TIER": "flex"})
+        from unittest import mock
+        # Scoped to this run, so no later test inherits these settings.
+        # No proxy unless the test gives one, whatever the runner sets.
+        settings = {**dict.fromkeys(PROXY_VARIABLES), "OPENAI_KEY": "o-key", "ANTHROPIC_KEY": "a-key",
+                    "SERVICE_TIER": tier, "CONFIG.REASONING_EFFORT": "high", "CONFIG.MAX_MODEL_TOKENS": "200000",
+                    **(environ or {})}
         try:
-            return cp.run_pr_agent(plan_result, pr_paths, ["**/package-lock.json"], model, keys)
+            with mock.patch.dict(os.environ, {k: v for k, v in settings.items() if v is not None}):
+                for name in [k for k, v in settings.items() if v is None]:
+                    os.environ.pop(name, None)  # Restored with the rest when the patch ends.
+                # run_pr_agent gives PR-Agent its own copy of the environment and leaves this one alone; checked
+                # here, inside the patch, since leaving the patch restores the environment whatever happened.
+                before = dict(os.environ)
+                result = cp.run_pr_agent(plan_result, pr_paths, ["**/package-lock.json"], model, keys)
+                self.assertEqual(dict(os.environ), before, "run_pr_agent changed the environment")
+                return result
         finally:
             cp.PR_AGENT = saved
             os.unlink(probe.name)
+
+    # A newer model with no MAX_MODEL_TOKENS: the case where a fallback value could leak into the environment.
+    UNSET_LIMIT = {"CONFIG.MAX_MODEL_TOKENS": None, "CONFIG.REASONING_EFFORT": "low", "SERVICE_TIER": ""}
+
+    def test_a_run_leaves_the_environment_as_it_found_it(self):
+        # run_with checks the environment right around run_pr_agent, inside its patch.
+        import os
+        before = dict(os.environ)
+        seen = self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"}, {"mode": "full", "files": ["x.py"]},
+                             {"x.py"}, environ=self.UNSET_LIMIT)["seen"]
+        self.assertEqual(seen["CONFIG.CUSTOM_MODEL_MAX_TOKENS"], "200000")  # PR-Agent's copy got the fallback.
+        self.assertEqual(dict(os.environ), before)  # And the helper's own settings are gone again.
+
+    def test_a_run_that_changed_the_environment_would_be_caught(self):
+        import os
+        from unittest import mock
+        real = cp.run_pr_agent
+
+        def changes_effort(*args):
+            result = real(*args)
+            os.environ["CONFIG.REASONING_EFFORT"] = "changed"
+            return result
+
+        def fills_a_missing_limit(*args):
+            result = real(*args)
+            os.environ.setdefault("CONFIG.MAX_MODEL_TOKENS", "200000")
+            return result
+
+        for stub in (changes_effort, fills_a_missing_limit):
+            with mock.patch.object(cp, "run_pr_agent", stub), self.assertRaises(AssertionError) as failure:
+                self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"}, {"mode": "full", "files": ["x.py"]},
+                              {"x.py"}, environ=self.UNSET_LIMIT)
+            self.assertIn("run_pr_agent changed the environment", str(failure.exception), stub.__name__)
 
     def test_delta_run_ignores_other_files_and_gets_only_its_providers_key(self):
         result = self.run_with("anthropic/claude-opus-5-5", {"anthropic": "a-key", "openai": "o-key"},
@@ -2032,51 +2084,28 @@ class PrAgentProcessTests(unittest.TestCase):
                          ("/v1/chat/completions", "Bearer o-key", "flex"))
 
     def test_relay_calls_bypass_a_configured_proxy_and_keep_its_exclusions(self):
-        import os
-        saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "NO_PROXY", "no_proxy")}
-        os.environ.update({"HTTP_PROXY": "http://proxy.invalid:3128", "NO_PROXY": "corp.example"})
-        try:
-            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
-        finally:
-            for k, v in saved.items():
-                os.environ.pop(k, None)
-                if v is not None:
-                    os.environ[k] = v
+        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                             {"mode": "full", "files": ["x.py"]}, {"x.py"},
+                             environ={"HTTP_PROXY": "http://proxy.invalid:3128", "NO_PROXY": "corp.example"})["seen"]
         self.assertTrue(seen["relay_bypasses_proxy"])
         self.assertEqual((seen["NO_PROXY"], seen["no_proxy"]), ("corp.example,127.0.0.1", "corp.example,127.0.0.1"))
 
     def test_a_proxy_wildcard_exclusion_stays_a_wildcard(self):
-        import os
-        saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy")}
-        os.environ.update({"HTTP_PROXY": "http://proxy.invalid:3128", "HTTPS_PROXY": "http://proxy.invalid:3128",
-                           "no_proxy": "*"})
-        try:
-            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
-        finally:
-            for k, v in saved.items():
-                os.environ.pop(k, None)
-                if v is not None:
-                    os.environ[k] = v
+        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                             {"mode": "full", "files": ["x.py"]}, {"x.py"},
+                             environ={"HTTP_PROXY": "http://proxy.invalid:3128",
+                                      "HTTPS_PROXY": "http://proxy.invalid:3128", "no_proxy": "*"})["seen"]
         self.assertEqual((seen["NO_PROXY"], seen["no_proxy"]), ("*", "*"))
         self.assertTrue(seen["relay_bypasses_proxy"])
         self.assertTrue(seen["github_bypasses_proxy"])
 
     def test_the_lowercase_exclusion_keeps_its_precedence(self):
         # Python and httpx use no_proxy over NO_PROXY, so GitHub stays on the proxy here; only the relay leaves it.
-        import os
-        saved = {k: os.environ.pop(k, None) for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "no_proxy")}
-        os.environ.update({"HTTP_PROXY": "http://proxy.invalid:3128", "HTTPS_PROXY": "http://proxy.invalid:3128",
-                           "NO_PROXY": "*", "no_proxy": "corp.example"})
-        try:
-            seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
-        finally:
-            for k, v in saved.items():
-                os.environ.pop(k, None)
-                if v is not None:
-                    os.environ[k] = v
+        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                             {"mode": "full", "files": ["x.py"]}, {"x.py"},
+                             environ={"HTTP_PROXY": "http://proxy.invalid:3128",
+                                      "HTTPS_PROXY": "http://proxy.invalid:3128", "NO_PROXY": "*",
+                                      "no_proxy": "corp.example"})["seen"]
         self.assertTrue(seen["relay_bypasses_proxy"])
         self.assertFalse(seen["github_bypasses_proxy"])
         self.assertEqual(seen["no_proxy"], "corp.example,127.0.0.1")
@@ -2091,7 +2120,8 @@ class PrAgentProcessTests(unittest.TestCase):
             os.environ["HTTPS_PROXY"] = "https://user:pass@proxy.invalid:443"
             self.assertTrue(cp.relay_cannot_reach(cp.OPENAI_API))
             seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
-                                 {"mode": "full", "files": ["x.py"]}, {"x.py"})["seen"]
+                                 {"mode": "full", "files": ["x.py"]}, {"x.py"},
+                                 environ={"HTTPS_PROXY": "https://user:pass@proxy.invalid:443"})["seen"]
             self.assertIsNone(seen["OPENAI.API_BASE"])
             os.environ["NO_PROXY"] = "api.openai.com"
             self.assertFalse(cp.relay_cannot_reach(cp.OPENAI_API))
@@ -2168,6 +2198,45 @@ class PrAgentProcessTests(unittest.TestCase):
         self.assertEqual(seen["answer_status"], 422)  # The standard call reached OpenAI and was not finished.
         self.assertLess(seen["elapsed"], 2)  # Before PR-Agent's own timeout, so it never retries a running call.
 
+    def test_a_model_pr_agent_knows_gets_no_extra_settings(self):
+        # The workflow sets CONFIG.MODEL to the model input; PR-Agent gets it exactly as given.
+        seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                             {"mode": "full", "files": ["x.py"]}, {"x.py"},
+                             environ={"CONFIG.MODEL": "gpt-6.1-sol", "CONFIG.CUSTOM_MODEL_MAX_TOKENS": None,
+                                      "CONFIG.TEMPERATURE": None})["seen"]  # Whatever the runner sets.
+        self.assertEqual((seen["CONFIG.MODEL"], seen["CONFIG.CUSTOM_MODEL_MAX_TOKENS"], seen["CONFIG.TEMPERATURE"]),
+                         ("gpt-6.1-sol", None, None))
+
+    def test_a_newer_reasoning_model_gets_the_settings_pr_agent_needs_and_its_effort(self):
+        for tier in ("flex", ""):  # The relay adds the effort on the standard tier too.
+            with FakeOpenAI([(200, {"choices": []})]) as openai:
+                saved, cp.OPENAI_API = cp.OPENAI_API, openai.url
+                try:
+                    seen = self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"},
+                                         {"mode": "full", "files": ["x.py"]}, {"x.py"}, call_api=True,
+                                         tier=tier)["seen"]
+                finally:
+                    cp.OPENAI_API = saved
+            self.assertEqual((seen["CONFIG.MODEL"], seen["CONFIG.CUSTOM_MODEL_MAX_TOKENS"], seen["CONFIG.TEMPERATURE"]),
+                             ("openai/gpt-6.2-sol", "200000", "1"), tier)
+            body = openai.calls[0][2]
+            self.assertEqual((body["reasoning_effort"], body.get("service_tier")), ("high", tier or None), tier)
+
+    def test_a_newer_model_behind_a_proxy_the_relay_cannot_use_fails_rather_than_lose_its_effort(self):
+        for tier in ("flex", ""):  # The standard tier has no fallback either: the effort needs the relay.
+            with self.assertRaises(cp.RunFailed) as failure:
+                self.run_with("gpt-6.2-sol", {"anthropic": "", "openai": "o-key"},
+                              {"mode": "full", "files": ["x.py"]}, {"x.py"}, tier=tier,
+                              environ={"HTTPS_PROXY": "https://proxy.invalid:443"})
+            self.assertIn("reasoning effort", str(failure.exception), tier)
+
+    def test_which_models_pr_agent_does_not_know(self):
+        for model in ("gpt-6.2-sol", "gpt-6.2-astra", "openai/gpt-6.2-sol", "gpt-7"):
+            self.assertTrue(cp.unknown_to_pr_agent(model), model)
+        for model in ("gpt-6.1-sol", "gpt-6-luna", "gpt-5.5", "o3", "gpt-4o", "gpt-6.2-chat-latest",
+                      "anthropic/claude-opus-5-5"):
+            self.assertFalse(cp.unknown_to_pr_agent(model), model)
+
     def test_failure_or_missing_output_is_a_failed_run(self):
         with self.assertRaises(cp.RunFailed):
             self.run_with("gpt-6.1-sol", {"openai": "k"}, {"mode": "full", "files": []}, set(), exit_code=1)
@@ -2216,6 +2285,16 @@ class FakeOpenAI:
 
 
 class FlexRelayTests(unittest.TestCase):
+    def setUp(self):
+        # No proxy unless the test sets one, whatever the runner sets; restored after each test.
+        import os
+        from unittest import mock
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in PROXY_VARIABLES:
+            os.environ.pop(name, None)
+
     def call(self, relay, body):
         import urllib.error
         import urllib.request
@@ -2590,6 +2669,21 @@ class FlexRelayTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_a_configured_effort_is_added_unless_the_call_has_one(self):
+        with FakeOpenAI([(200, {"ok": 1}), (200, {"ok": 1})]) as openai, \
+                cp.FlexRelay("", 1140, upstream=openai.url, out=lambda m: None, effort="high") as relay:
+            self.call(relay, {"model": "m", "messages": []})
+            self.call(relay, {"model": "m", "messages": [], "reasoning_effort": "low"})
+        self.assertEqual([(b.get("reasoning_effort"), b.get("service_tier")) for _, _, b in openai.calls],
+                         [("high", None), ("low", None)])
+
+    def test_a_rejected_effort_fails_visibly(self):
+        rejected = (400, {"error": {"message": "Unsupported value: 'reasoning_effort' does not support 'high'."}})
+        with FakeOpenAI([rejected]) as openai, \
+                cp.FlexRelay("flex", 1140, upstream=openai.url, out=lambda m: None, effort="high") as relay:
+            self.assertEqual(self.call(relay, {"model": "m", "messages": []}), rejected)
+        self.assertEqual(len(openai.calls), 1)
 
     def test_an_unreachable_openai_is_a_gateway_error(self):
         with FakeOpenAI([]) as openai:

@@ -28,7 +28,7 @@ jobs:
     secrets:
       OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
     with:
-      model: gpt-6.1-sol
+      model: gpt-6.2-sol
       # Trial: Terra decides verifications, and Luna answers the same requests in the job summary
       # for comparison only.
       verifier-model: gpt-6.1-terra
