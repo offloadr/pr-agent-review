@@ -2135,6 +2135,39 @@ class PrAgentProcessTests(unittest.TestCase):
         self.assertLess(seen["elapsed"], 2)
         self.assertEqual(len(openai.calls), 1)
 
+    def test_slow_refusals_then_a_slow_standard_call_still_answer_before_pr_agents_timeout(self):
+        # The sequence from the review, scaled to seconds: Flex takes 0.3 s to refuse each time, the relay waits
+        # between refusals, and the standard-tier call is slower than all that is left. PR-Agent gives the call
+        # 2 s; the relay's deadline is a minute less than CONFIG.AI_TIMEOUT, here 61 s, so 1 s.
+        import os
+        import time
+
+        def answer(body):
+            if "service_tier" in body:
+                time.sleep(0.3)
+                return BUSY
+            time.sleep(3)
+            return 200, {"ok": 1}
+
+        saved = (cp.OPENAI_API, cp.FLEX_BACKOFF, cp.FlexRelay.STANDARD_CALL_SECONDS, os.environ.get("CONFIG.AI_TIMEOUT"))
+        with FakeOpenAI(answer) as openai:
+            cp.OPENAI_API, cp.FLEX_BACKOFF, cp.FlexRelay.STANDARD_CALL_SECONDS = openai.url, (0.1, 0.1, 0.1), 0.3
+            os.environ["CONFIG.AI_TIMEOUT"] = "61"
+            try:
+                seen = self.run_with("gpt-6.1-sol", {"anthropic": "", "openai": "o-key"},
+                                     {"mode": "full", "files": ["x.py"]}, {"x.py"}, call_api=True,
+                                     call_timeout=2)["seen"]
+            finally:
+                cp.OPENAI_API, cp.FLEX_BACKOFF, cp.FlexRelay.STANDARD_CALL_SECONDS = saved[:3]
+                if saved[3] is None:
+                    os.environ.pop("CONFIG.AI_TIMEOUT")
+                else:
+                    os.environ["CONFIG.AI_TIMEOUT"] = saved[3]
+        tiers = [body.get("service_tier") for _, _, body in openai.calls]
+        self.assertEqual(tiers, ["flex", "flex", None])  # Two refusals; the third wait would leave too little.
+        self.assertEqual(seen["answer_status"], 422)  # The standard call reached OpenAI and was not finished.
+        self.assertLess(seen["elapsed"], 2)  # Before PR-Agent's own timeout, so it never retries a running call.
+
     def test_failure_or_missing_output_is_a_failed_run(self):
         with self.assertRaises(cp.RunFailed):
             self.run_with("gpt-6.1-sol", {"openai": "k"}, {"mode": "full", "files": []}, set(), exit_code=1)
