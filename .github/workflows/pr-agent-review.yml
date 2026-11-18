@@ -2299,9 +2299,11 @@ jobs:
                       dismissed_ids.discard(dismissed_key(f))
                       dismissed_ids.discard(current_key(f))
               runs = list((checkpoint or {}).get("runs") or [])
-              out("verifier-usage: " + json.dumps(usage, sort_keys=True))
+              if usage:
+                  out("verifier-usage: " + json.dumps(usage, sort_keys=True))
+              # A run without verifier calls stores [] rather than a summary of zeros, so it costs no more room.
               runs.append({"head_sha": head_sha, "mode": plan_result["mode"], "files": len(plan_result["files"]),
-                           "verified": len(to_verify), "verifier_usage": usage_summary(usage), "at": int(time.time())})
+                           "verified": len(to_verify), "verifier_usage": usage_summary(usage) if usage else [], "at": int(time.time())})
               state = {"version": 1, "revision": (checkpoint or {}).get("revision", 0) + 1,
                        "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref, "merge_base": merge_base,
                        "fixed_ids": sorted(fixed_ids), "dismissed_ids": sorted(dismissed_ids), "fixed_deps": fixed_deps,

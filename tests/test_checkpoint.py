@@ -925,6 +925,12 @@ class ReviewTests(unittest.TestCase):
                          {"calls": 1, "input_tokens": 10, "output_tokens": 2, "reasoning_tokens": 0, "service_tiers": []})
         self.assertIn('verifier-usage: [{"completion_tokens": 2', output)
 
+    def test_a_run_without_verifier_calls_stores_no_usage_summary(self):
+        github = FakeGitHub(A, ["x.py"])
+        code, _, output = run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        self.assertEqual((code, github.state()["runs"][-1]["verifier_usage"]), (0, []))
+        self.assertNotIn("verifier-usage:", output)
+
     def test_checkpoint_stays_under_the_comment_limit_by_dropping_old_fixed_findings(self):
         # Twelve fix-and-review rounds of ten 1.5 KB findings each: far more history than fits.
         paths = [f"f{i}.py" for i in range(10)]
