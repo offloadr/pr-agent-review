@@ -122,7 +122,7 @@ class FakeGitHub:
         return cp.find_checkpoint(self.issue_comments)[1]
 
 
-def run_review(github, head, result, verdicts=None, prompts=None, globs=(), relies=None):
+def run_review(github, head, result, verdicts=None, prompts=None, globs=(), relies=None, usage=None):
     calls = []
 
     def fake_review(plan_result, pr_paths, user_globs, model, keys):
@@ -140,7 +140,7 @@ def run_review(github, head, result, verdicts=None, prompts=None, globs=(), reli
             prompts.append(prompt)
         answer = {"verdicts": [{"id": i, "verdict": v, "reason": f"{v} because", "relies_on": (relies or {}).get(i, [])}
                                for i, v in (verdicts or {}).items()]}
-        return answer, {"total_tokens": 100}
+        return answer, usage if usage is not None else {"total_tokens": 100}
 
     output = []
     code = cp.review_main(github, "o/r", "1", head, "gpt-6.1-sol", "gpt-6.1-sol", "medium", {"openai": "k"},
@@ -291,6 +291,19 @@ class StorageTests(unittest.TestCase):
                 cp.fit_comment(state)
         finally:
             cp.COMMENT_LIMIT = saved
+
+    def test_anthropic_cache_tokens_count_as_input(self):
+        used = {"input_tokens": 100, "cache_read_input_tokens": 900, "cache_creation_input_tokens": 50,
+                "output_tokens": 7}
+        self.assertEqual(cp.usage_summary([used]), {"calls": 1, "input_tokens": 1050, "output_tokens": 7,
+                                                     "reasoning_tokens": 0, "service_tiers": []})
+
+    def test_counters_that_are_not_numbers_count_as_nothing(self):
+        used = {"prompt_tokens": "unknown", "completion_tokens": 5, "completion_tokens_details": {"reasoning_tokens": "unknown"},
+                "service_tier": "flex"}
+        self.assertEqual(cp.usage_summary([used, "junk", {"output_tokens_details": "x"}]),
+                         {"calls": 3, "input_tokens": 0, "output_tokens": 5, "reasoning_tokens": 0,
+                          "service_tiers": ["flex"]})
 
     def test_a_run_stores_a_usage_summary_rather_than_each_call(self):
         chat = {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
@@ -897,6 +910,20 @@ class ReviewTests(unittest.TestCase):
         code, calls, _ = run_review(github, A, review())
         self.assertEqual((code, calls[0]["mode"]), (0, "full"))
         self.assertEqual(github.state()["base_ref"], "release")
+
+    def test_a_verifier_usage_counter_that_is_not_a_number_still_saves_the_checkpoint(self):
+        github = FakeGitHub(A, ["x.py"])
+        run_review(github, A, review(issue("x.py", "Race", "Two saves interleave.")))
+        race = github.state()["findings"][0]["id"]
+        github.heads = [B]
+        github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "x.py", "patch": "+lock"}]}
+        odd = {"prompt_tokens": 10, "completion_tokens": 2, "completion_tokens_details": {"reasoning_tokens": "unknown"}}
+        code, _, output = run_review(github, B, review(), verdicts={race: "fixed"}, usage=odd)
+        state = github.state()
+        self.assertEqual((code, state["head_sha"], state["findings"][0]["state"]), (0, B, "FIXED"))
+        self.assertEqual(state["runs"][-1]["verifier_usage"],
+                         {"calls": 1, "input_tokens": 10, "output_tokens": 2, "reasoning_tokens": 0, "service_tiers": []})
+        self.assertIn('verifier-usage: [{"completion_tokens": 2', output)
 
     def test_checkpoint_stays_under_the_comment_limit_by_dropping_old_fixed_findings(self):
         # Twelve fix-and-review rounds of ten 1.5 KB findings each: far more history than fits.

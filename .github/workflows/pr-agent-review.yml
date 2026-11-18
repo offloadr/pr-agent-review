@@ -529,15 +529,22 @@ jobs:
 
           def usage_summary(usage):
               """A run's verifier token use in a few numbers; the per-call records go to the job log only."""
+              def count(value):
+                  # Usage is reported by the provider; a counter that is not a number counts as nothing rather
+                  # than failing a run whose verdicts are fine.
+                  return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
               summary = {"calls": len(usage), "input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
               tiers = set()
               for used in usage:
-                  used = used or {}
+                  used = used if isinstance(used, dict) else {}
                   # Chat completions name them prompt/completion, the Responses and Anthropic APIs input/output.
-                  summary["input_tokens"] += int(used.get("input_tokens") or used.get("prompt_tokens") or 0)
-                  summary["output_tokens"] += int(used.get("output_tokens") or used.get("completion_tokens") or 0)
-                  details = used.get("output_tokens_details") or used.get("completion_tokens_details") or {}
-                  summary["reasoning_tokens"] += int(details.get("reasoning_tokens") or 0)
+                  # OpenAI's input counts include cached tokens; Anthropic reports cache reads and writes apart.
+                  summary["input_tokens"] += (count(used.get("input_tokens")) or count(used.get("prompt_tokens"))) + \
+                      count(used.get("cache_read_input_tokens")) + count(used.get("cache_creation_input_tokens"))
+                  summary["output_tokens"] += count(used.get("output_tokens")) or count(used.get("completion_tokens"))
+                  details = used.get("output_tokens_details") or used.get("completion_tokens_details")
+                  summary["reasoning_tokens"] += count(details.get("reasoning_tokens")) if isinstance(details, dict) else 0
                   if used.get("service_tier"):
                       tiers.add(str(used["service_tier"]))
               summary["service_tiers"] = sorted(tiers)
