@@ -556,8 +556,8 @@ jobs:
 
 
           def fit_comment(state):
-              """Render the checkpoint within GitHub's comment limit: older run records go first, then the oldest
-              fixed findings, dismissed findings, long finding text, open findings' verifier reasons, and last
+              """Render the checkpoint within GitHub's comment limit: older run records and open findings' verifier
+              reasons go first, then the oldest fixed findings, dismissed findings, long finding text, and last
               the pruned history. Only the open findings themselves are never dropped."""
               bound_history(state)
               body = render_comment(state)
@@ -568,6 +568,11 @@ jobs:
                   if len(state.get("runs") or []) > 1:
                       # Run records are informational; the comment's summary line reads only the latest.
                       state["runs"] = state["runs"][1:]
+                  elif long_reasons:
+                      # Before any pruning: these reasons are never read back, while pruning a finding adds history
+                      # whose budget can evict a record of a reverted fix or a withdrawn dismissal.
+                      for f in long_reasons:
+                          f["check"]["reason"] = f["check"]["reason"][:OPEN_REASON_CHARS]
                   elif fixed:
                       pruned = state["findings"].pop(fixed[0])
                       state["pruned_fixed"] = state.get("pruned_fixed", 0) + 1
@@ -604,11 +609,6 @@ jobs:
                   elif any(len(f["content"]) > 300 for f in state["findings"]):
                       for f in state["findings"]:
                           f["content"] = f["content"][:300]
-                  elif long_reasons:
-                      # Before any history: these reasons are never read back, while a trimmed history entry can
-                      # miss a reverted fix or a withdrawn dismissal.
-                      for f in long_reasons:
-                          f["check"]["reason"] = f["check"]["reason"][:OPEN_REASON_CHARS]
                   elif any(state.get(name) for name in ("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned", "fixed_own")):
                       longest = max(("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned", "fixed_own"),
                                     key=lambda name: len(json.dumps(state.get(name) or [])))

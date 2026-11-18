@@ -283,6 +283,27 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(state.get("history_trimmed"))
         self.assertTrue(all(len(f["check"]["reason"]) == cp.OPEN_REASON_CHARS for f in state["findings"]))
 
+    def test_open_reasons_are_shortened_before_a_fixed_finding_is_pruned_into_full_history(self):
+        def own(i):
+            return {"id": f"o{i}", "path": f"p{i}.py", "header": "H", "content_id": "c", "threads": [],
+                    "content": "x" * 100}
+        fixed_own = []
+        while len(json.dumps(fixed_own)) < cp.HISTORY_CHARS - 300:
+            fixed_own.append(own(len(fixed_own)))
+        fixed = {"id": "fx", "path": "fixed.py", "header": "Fixed", "content": "c" * 300, "line": 1, "state": "FIXED",
+                 "checked_sha": A, "content_id": "cf", "check": {"verdict": "fixed", "reason": "r", "sha": A}}
+        state = {"head_sha": A, "findings": [self.open_finding(i, 600) for i in range(10)] + [fixed], "security": {},
+                 "runs": [{"head_sha": A, "mode": "full", "files": 1, "verified": 10, "at": 1}],
+                 "fixed_own": list(fixed_own)}
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 3_000
+        try:
+            cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertEqual(state["fixed_own"], fixed_own)
+        self.assertFalse(state.get("history_trimmed"))
+        self.assertIn(fixed, state["findings"])
+
     def test_open_findings_that_cannot_fit_still_fail_the_save(self):
         state = {"head_sha": A, "findings": [self.open_finding(i, 10) for i in range(20)], "security": {}, "runs": []}
         saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, 2_000
