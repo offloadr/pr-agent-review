@@ -191,6 +191,7 @@ jobs:
           import urllib.error
           import urllib.parse
           import urllib.request
+          import zlib
 
           # One script, two modes: MODE=review plans, runs PR-Agent, verifies earlier findings and saves the
           # checkpoint; MODE=gate checks the checkpoint for the current head. See docs/checkpoint-gate.md.
@@ -411,9 +412,10 @@ jobs:
           # ---- Checkpoint storage ------------------------------------------------------------------------
 
           def encode_state(state):
-              # Escaping < and > keeps finding text from closing the HTML comment that holds the state.
-              text = json.dumps(state, sort_keys=True, ensure_ascii=False)
-              return text.replace("<", "\\u003c").replace(">", "\\u003e")
+              # Compressed, so a pull request with many open findings still fits one comment. Base64 has none of
+              # the characters that could close the HTML comment that holds the state.
+              text = json.dumps(state, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+              return base64.b64encode(zlib.compress(text.encode("utf-8"), 9)).decode("ascii")
 
 
           def parse_checkpoint(body):
@@ -424,7 +426,14 @@ jobs:
                   return None
               start = starts[-1]
               end = lines.index(STATE_END, start + 1)
-              return json.loads("\n".join(lines[start + 1:end]))
+              text = "\n".join(lines[start + 1:end]).strip()
+              # A checkpoint saved before the state was compressed holds the JSON itself.
+              if text.startswith("{"):
+                  return json.loads(text)
+              try:
+                  return json.loads(zlib.decompress(base64.b64decode(text, validate=True)).decode("utf-8"))
+              except zlib.error as error:
+                  raise ValueError("The checkpoint state is not readable.") from error
 
 
           def find_checkpoint(comments):
@@ -443,7 +452,9 @@ jobs:
               return " ".join((text or "").split()).replace("|", "\\|")[:200]
 
 
-          def render_comment(state):
+          def render_comment(state, rows=None):
+              """The checkpoint comment: a summary, a table of findings (at most `rows` of them, open ones first)
+              and the full state in a hidden block."""
               findings = state["findings"]
               active = [f for f in findings if f["state"] == "ACTIVE"]
               fixed = [f for f in findings if f["state"] == "FIXED"]
@@ -459,7 +470,8 @@ jobs:
                   lines += ["", f"🔒 **Security concern:** {cell(concern)}"]
               if findings:
                   lines += ["", "| State | Finding | Location |", "| --- | --- | --- |"]
-                  for f in active + fixed + dismissed:
+                  listed = active + fixed + dismissed
+                  for f in listed if rows is None else listed[:rows]:
                       where = f"`{cell(f['path'])}`" + (f":{f['line']}" if f.get("line") else "")
                       if f["state"] == "ACTIVE":
                           status = "open"
@@ -471,6 +483,8 @@ jobs:
                       if f["state"] == "FIXED" and (f.get("check") or {}).get("reason"):
                           text += f" — _{cell(f['check']['reason'])}_"
                       lines.append(f"| {status} | {text} | {where} |")
+                  if rows is not None and len(listed) > rows:
+                      lines += ["", f"{len(listed) - rows} more finding(s) are tracked but not listed here."]
               lines += ["", STATE_START, encode_state(state), STATE_END]
               return "\n".join(lines)
 
@@ -553,19 +567,27 @@ jobs:
 
           # An open finding's verifier reason is not shown or read back; under size pressure it keeps this much.
           OPEN_REASON_CHARS = 120
+          # Under size pressure the comment's table lists at least this many findings.
+          TABLE_ROWS_MIN = 10
 
 
           def fit_comment(state):
-              """Render the checkpoint within GitHub's comment limit: older run records and open findings' verifier
-              reasons go first, then the oldest fixed findings, dismissed findings, long finding text, and last
-              the pruned history. Only the open findings themselves are never dropped."""
+              """Render the checkpoint within GitHub's comment limit. The table lists fewer findings first, which
+              loses nothing. Then older run records and open findings' verifier reasons go, then the oldest fixed
+              findings, dismissed findings, long finding text, and last the pruned history. Only the open
+              findings themselves are never dropped."""
               bound_history(state)
-              body = render_comment(state)
+              rows = None
+              body = render_comment(state, rows)
               while len(body) > COMMENT_LIMIT:
                   fixed = [i for i, f in enumerate(state["findings"]) if f["state"] == "FIXED"]
                   long_reasons = [f for f in state["findings"] if f["state"] == "ACTIVE"
                                   and len((f.get("check") or {}).get("reason") or "") > OPEN_REASON_CHARS]
-                  if len(state.get("runs") or []) > 1:
+                  listed = len(state["findings"]) if rows is None else rows
+                  if listed > TABLE_ROWS_MIN:
+                      # Every finding stays in the state below; only the visible list gets shorter.
+                      rows = max(TABLE_ROWS_MIN, listed // 2)
+                  elif len(state.get("runs") or []) > 1:
                       # Run records are informational; the comment's summary line reads only the latest.
                       state["runs"] = state["runs"][1:]
                   elif long_reasons:
@@ -617,7 +639,7 @@ jobs:
                   else:
                       raise RunFailed("Too many open findings to store in one checkpoint comment.")
                   bound_history(state)
-                  body = render_comment(state)
+                  body = render_comment(state, rows)
               return body
 
 

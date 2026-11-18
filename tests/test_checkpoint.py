@@ -1,4 +1,6 @@
 """Tests for the checkpoint script, loaded from the workflow so the tested code is the shipped code."""
+import base64
+import hashlib
 import json
 import pathlib
 import textwrap
@@ -27,6 +29,17 @@ def load_script():
 
 
 cp = load_script()
+
+
+def noise(length, seed=0):
+    """Text that does not compress, so a size limit bites as it does on real finding text."""
+    text, block = "", 0
+    while len(text) < length:
+        text += base64.b64encode(hashlib.sha256(f"{seed}:{block}".encode()).digest()).decode().rstrip("=")
+        block += 1
+    return text[:length]
+
+
 cp.FLEX_BACKOFF = (0, 0, 0)  # No real waiting in tests.
 
 
@@ -219,6 +232,31 @@ class StorageTests(unittest.TestCase):
         self.assertNotIn("-->\n<b>", body)
         self.assertEqual(cp.parse_checkpoint(body), state)
 
+    def test_a_checkpoint_saved_before_compression_is_still_read(self):
+        state = {"head_sha": A, "findings": [{"content": "plain <b> text"}], "runs": [], "security": {}, "revision": 3}
+        plain = json.dumps(state, sort_keys=True).replace("<", "\\u003c").replace(">", "\\u003e")
+        body = "\n".join([cp.CHECKPOINT_MARKER, "### PR-Agent findings at aaaaaaa", "", cp.STATE_START, plain, cp.STATE_END])
+        self.assertEqual(cp.parse_checkpoint(body), state)
+
+    def test_a_damaged_state_block_is_an_error_not_an_empty_checkpoint(self):
+        body = "\n".join([cp.CHECKPOINT_MARKER, "", cp.STATE_START, "bm90IGEgY2hlY2twb2ludA==", cp.STATE_END])
+        with self.assertRaises(ValueError):
+            cp.parse_checkpoint(body)
+
+    def test_many_open_findings_fit_by_listing_fewer_and_every_one_stays_stored(self):
+        # More open findings than the comment can list in full: none is dropped or shortened.
+        findings = [self.open_finding(i, 400) for i in range(70)]
+        state = {"head_sha": A, "findings": [dict(f) for f in findings], "security": {},
+                 "runs": [{"head_sha": A, "mode": "full", "files": 1, "verified": 70, "at": 1}]}
+        self.assertGreater(len(cp.render_comment(state)), cp.COMMENT_LIMIT)
+        body = cp.fit_comment(state)
+        self.assertLessEqual(len(body), cp.COMMENT_LIMIT)
+        stored = cp.parse_checkpoint(body)["findings"]
+        self.assertEqual([(f["id"], f["content"], f["check"]["reason"]) for f in stored],
+                         [(f["id"], f["content"], f["check"]["reason"]) for f in findings])
+        self.assertIn("more finding(s) are tracked but not listed here", body)
+        self.assertGreaterEqual(body.count("| open |"), cp.TABLE_ROWS_MIN)
+
     def test_a_comment_quoting_the_marker_is_not_the_checkpoint(self):
         real = {"id": 1, "user": {"login": "github-actions[bot]"},
                 "body": cp.render_comment({"head_sha": A, "findings": [], "security": {}, "runs": []})}
@@ -236,12 +274,12 @@ class StorageTests(unittest.TestCase):
 
     @staticmethod
     def open_finding(i, reason_chars):
-        return {"id": f"{i:012x}", "path": f"f{i}.py", "header": "Bug", "content": "c" * 300, "line": 1,
-                "state": "ACTIVE", "checked_sha": A, "check": {"verdict": "still_present", "reason": "r" * reason_chars,
+        return {"id": f"{i:012x}", "path": f"f{i}.py", "header": "Bug", "content": noise(300, i), "line": 1,
+                "state": "ACTIVE", "checked_sha": A, "check": {"verdict": "still_present", "reason": noise(reason_chars, 1000 + i),
                                                                 "sha": A}}
 
     def test_old_run_records_go_before_any_finding(self):
-        runs = [{"head_sha": A, "mode": "full", "files": 3, "verified": 1, "at": n, "verifier_usage": {"pad": "u" * 900}}
+        runs = [{"head_sha": A, "mode": "full", "files": 3, "verified": 1, "at": n, "verifier_usage": {"pad": noise(900, n)}}
                 for n in range(20)]
         state = {"head_sha": A, "findings": [self.open_finding(i, 50) for i in range(10)], "security": {},
                  "runs": runs}
@@ -286,11 +324,11 @@ class StorageTests(unittest.TestCase):
     def test_open_reasons_are_shortened_before_a_fixed_finding_is_pruned_into_full_history(self):
         def own(i):
             return {"id": f"o{i}", "path": f"p{i}.py", "header": "H", "content_id": "c", "threads": [],
-                    "content": "x" * 100}
+                    "content": noise(100, i)}
         fixed_own = []
         while len(json.dumps(fixed_own)) < cp.HISTORY_CHARS - 300:
             fixed_own.append(own(len(fixed_own)))
-        fixed = {"id": "fx", "path": "fixed.py", "header": "Fixed", "content": "c" * 300, "line": 1, "state": "FIXED",
+        fixed = {"id": "fx", "path": "fixed.py", "header": "Fixed", "content": noise(300, 77), "line": 1, "state": "FIXED",
                  "checked_sha": A, "content_id": "cf", "check": {"verdict": "fixed", "reason": "r", "sha": A}}
         state = {"head_sha": A, "findings": [self.open_finding(i, 600) for i in range(10)] + [fixed], "security": {},
                  "runs": [{"head_sha": A, "mode": "full", "files": 1, "verified": 10, "at": 1}],
@@ -963,7 +1001,7 @@ class ReviewTests(unittest.TestCase):
             if previous:
                 github.compares[(previous, head)] = {"status": "ahead", "files": [{"filename": p} for p in paths]}
             fixed = {f["id"]: "fixed" for f in (github.state() or {}).get("findings", []) if f["state"] == "ACTIVE"}
-            issues = [issue(p, "Bug", f"round {round_number} " + "x" * 1500) for p in paths]
+            issues = [issue(p, "Bug", f"round {round_number} " + noise(1500, f"{round_number}{p}")) for p in paths]
             code, _, _ = run_review(github, head, review(*issues), verdicts=fixed)
             self.assertEqual(code, 0)
             previous = head
@@ -2888,7 +2926,7 @@ class GateTests(unittest.TestCase):
             if previous:
                 github.compares[(previous, head)] = {"status": "ahead", "files": [{"filename": p} for p in paths]}
             fixed = {f["id"]: "fixed" for f in (github.state() or {}).get("findings", []) if f["state"] == "ACTIVE"}
-            contents = [(p, f"round {round_number} " + "x" * 1500) for p in paths]
+            contents = [(p, f"round {round_number} " + noise(1500, f"{round_number}{p}")) for p in paths]
             run_review(github, head, review(*[issue(p, "Bug", c) for p, c in contents]), verdicts=fixed)
             posted_threads += [posted(f"T{round_number}-{p}", p, "Bug", c) for p, c in contents]
             github.threads = posted_threads
@@ -3051,8 +3089,8 @@ class GateTests(unittest.TestCase):
         self.assertIn("No PR-Agent checkpoint", output)
 
     def test_pruned_renamed_finding_still_resolves_its_original_thread(self):
-        finding = {"id": "1", "path": "moved.py", "thread_path": "x.py", "header": "Race", "content": "c" * 500,
-                   "line": 1, "state": "FIXED", "fingerprint": cp.inline_fingerprint("x.py", "Race", "c" * 500),
+        finding = {"id": "1", "path": "moved.py", "thread_path": "x.py", "header": "Race", "content": noise(500),
+                   "line": 1, "state": "FIXED", "fingerprint": cp.inline_fingerprint("x.py", "Race", noise(500)),
                    "checked_sha": B, "check": {"verdict": "fixed", "reason": "r", "sha": B}}
         state = {"head_sha": B, "findings": [finding], "security": {}, "runs": []}
         saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, 800
@@ -3063,7 +3101,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(state["findings"], [])
         self.assertEqual((state["pruned"][0]["id"], state["pruned"][0]["threads"]),
                          ("1", [{"path": "x.py", "fingerprint": finding["fingerprint"]}]))
-        thread_on_old_path = posted("T1", "x.py", "Race", "c" * 500)
+        thread_on_old_path = posted("T1", "x.py", "Race", noise(500))
         self.assertEqual(cp.fixed_thread_ids(state, [thread_on_old_path]), ["T1"])
 
     def test_gate_does_not_resolve_threads_when_a_newer_checkpoint_appears(self):
@@ -3127,7 +3165,7 @@ class GateTests(unittest.TestCase):
             github.heads = [head]
             if previous:
                 github.compares[(previous, head)] = {"status": "ahead", "files": [{"filename": p} for p in paths]}
-            contents = [(p, f"round {round_number} " + "x" * 1500) for p in paths]
+            contents = [(p, f"round {round_number} " + noise(1500, f"{round_number}{p}")) for p in paths]
             # Every earlier finding was dismissed by resolving its thread; the verifier keeps saying still_present.
             still = {f["id"]: "still_present" for f in (github.state() or {}).get("findings", [])}
             code, _, _ = run_review(github, head, review(*[issue(p, "Bug", c) for p, c in contents]), verdicts=still)
@@ -3500,8 +3538,8 @@ class GateTests(unittest.TestCase):
         self.assertEqual([f["header"] for f in github.state()["findings"]], ["Race"])
 
     def test_unresolving_a_pruned_dismissed_findings_thread_fails_the_gate(self):
-        finding = {"id": "1", "path": "x.py", "header": "Race", "content": "c" * 500, "line": 1, "state": "DISMISSED",
-                   "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", "c" * 500)}],
+        finding = {"id": "1", "path": "x.py", "header": "Race", "content": noise(500), "line": 1, "state": "DISMISSED",
+                   "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", noise(500))}],
                    "checked_sha": A, "check": None, "content_id": "x"}
         state = {"head_sha": A, "base_ref": "main", "findings": [finding], "security": {}, "runs": []}
         saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, 800
@@ -3513,7 +3551,7 @@ class GateTests(unittest.TestCase):
         github = FakeGitHub(A, ["x.py"])
         github.issue_comments = [{"id": 1, "user": {"login": "github-actions[bot]"}, "body": body,
                                   "html_url": "https://example/checkpoint"}]
-        github.threads = [posted("T1", "x.py", "Race", "c" * 500, resolved=True)]
+        github.threads = [posted("T1", "x.py", "Race", noise(500), resolved=True)]
         self.assertEqual(self.gate(github)[0], 0)
         github.threads[0]["resolved"] = False
         code, output = self.gate(github)

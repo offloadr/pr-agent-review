@@ -17,9 +17,18 @@ token writes, in a hidden block:
 
 ```
 <!-- pr-agent-checkpoint:v1
-{"head_sha": ..., "base_sha": ..., "findings": [...], "security": {...}, "runs": [...]}
+<base64 text>
 -->
 ```
+
+The block is the state as JSON, zlib-compressed and base64-encoded:
+
+```
+{"head_sha": ..., "base_sha": ..., "findings": [...], "security": {...}, "runs": [...]}
+```
+
+To read one by hand: `base64 -d | python3 -c 'import sys, zlib; print(zlib.decompress(sys.stdin.buffer.read()).decode())'`.
+A checkpoint saved before the state was compressed holds the JSON itself and is still read.
 
 PR-Agent's own persistent finding state is turned off, so there is one source of truth.
 
@@ -31,7 +40,9 @@ goes to the job log as a `verifier-usage:` line.
 
 GitHub caps a comment at 65,536 characters, and the checkpoint stays under 60,000. The pruned
 history first keeps to its own budget (see Known limits), whatever the comment's size. If the
-comment is still too long, the save then drops, in order: run records other than the latest, open findings' verifier reasons
+comment is still too long, the table first lists fewer findings (down to 10; every finding
+stays in the state, and the comment says how many are not listed). After that the save drops, in
+order: run records other than the latest, open findings' verifier reasons
 past 120 characters (never shown or read back), the oldest fixed findings (kept as compact records),
 dismissed findings, finding text past 300 characters, and last the oldest pruned history. Open
 findings themselves are never dropped; if they alone cannot fit, the run fails.
