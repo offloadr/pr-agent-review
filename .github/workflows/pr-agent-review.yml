@@ -527,13 +527,53 @@ jobs:
                   state["history_trimmed"] = True
 
 
+          def usage_summary(usage):
+              """A run's verifier token use in a few numbers; the per-call records go to the job log only."""
+              def count(value):
+                  # Usage is reported by the provider; a counter that is not a number counts as nothing rather
+                  # than failing a run whose verdicts are fine.
+                  return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+              summary = {"calls": len(usage), "input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
+              tiers = set()
+              for used in usage:
+                  used = used if isinstance(used, dict) else {}
+                  # Chat completions name them prompt/completion, the Responses and Anthropic APIs input/output.
+                  # OpenAI's input counts include cached tokens; Anthropic reports cache reads and writes apart.
+                  summary["input_tokens"] += (count(used.get("input_tokens")) or count(used.get("prompt_tokens"))) + \
+                      count(used.get("cache_read_input_tokens")) + count(used.get("cache_creation_input_tokens"))
+                  summary["output_tokens"] += count(used.get("output_tokens")) or count(used.get("completion_tokens"))
+                  details = used.get("output_tokens_details") or used.get("completion_tokens_details")
+                  summary["reasoning_tokens"] += count(details.get("reasoning_tokens")) if isinstance(details, dict) else 0
+                  if used.get("service_tier"):
+                      tiers.add(str(used["service_tier"]))
+              summary["service_tiers"] = sorted(tiers)
+              return summary
+
+
+          # An open finding's verifier reason is not shown or read back; under size pressure it keeps this much.
+          OPEN_REASON_CHARS = 120
+
+
           def fit_comment(state):
-              """Render the checkpoint within GitHub's comment limit, dropping the oldest fixed findings first."""
+              """Render the checkpoint within GitHub's comment limit: older run records and open findings' verifier
+              reasons go first, then the oldest fixed findings, dismissed findings, long finding text, and last
+              the pruned history. Only the open findings themselves are never dropped."""
               bound_history(state)
               body = render_comment(state)
               while len(body) > COMMENT_LIMIT:
                   fixed = [i for i, f in enumerate(state["findings"]) if f["state"] == "FIXED"]
-                  if fixed:
+                  long_reasons = [f for f in state["findings"] if f["state"] == "ACTIVE"
+                                  and len((f.get("check") or {}).get("reason") or "") > OPEN_REASON_CHARS]
+                  if len(state.get("runs") or []) > 1:
+                      # Run records are informational; the comment's summary line reads only the latest.
+                      state["runs"] = state["runs"][1:]
+                  elif long_reasons:
+                      # Before any pruning: these reasons are never read back, while pruning a finding adds history
+                      # whose budget can evict a record of a reverted fix or a withdrawn dismissal.
+                      for f in long_reasons:
+                          f["check"]["reason"] = f["check"]["reason"][:OPEN_REASON_CHARS]
+                  elif fixed:
                       pruned = state["findings"].pop(fixed[0])
                       state["pruned_fixed"] = state.get("pruned_fixed", 0) + 1
                       # About 15 characters per id, so the history stays small for any realistic pull request.
@@ -2259,8 +2299,11 @@ jobs:
                       dismissed_ids.discard(dismissed_key(f))
                       dismissed_ids.discard(current_key(f))
               runs = list((checkpoint or {}).get("runs") or [])
+              if usage:
+                  out("verifier-usage: " + json.dumps(usage, sort_keys=True))
+              # A run without verifier calls stores [] rather than a summary of zeros, so it costs no more room.
               runs.append({"head_sha": head_sha, "mode": plan_result["mode"], "files": len(plan_result["files"]),
-                           "verified": len(to_verify), "verifier_usage": usage, "at": int(time.time())})
+                           "verified": len(to_verify), "verifier_usage": usage_summary(usage) if usage else [], "at": int(time.time())})
               state = {"version": 1, "revision": (checkpoint or {}).get("revision", 0) + 1,
                        "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref, "merge_base": merge_base,
                        "fixed_ids": sorted(fixed_ids), "dismissed_ids": sorted(dismissed_ids), "fixed_deps": fixed_deps,
