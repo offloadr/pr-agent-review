@@ -267,6 +267,22 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(all(len(f["check"]["reason"]) == cp.OPEN_REASON_CHARS for f in state["findings"]))
         self.assertEqual(state["findings"][0]["check"]["verdict"], "still_present")
 
+    def test_open_reasons_are_shortened_before_any_pruned_history_is_lost(self):
+        record = {"id": "f1", "path": "caller.py", "header": "Null", "content_id": "c1", "threads": [],
+                  "content": "helper() can return None."}
+        state = {"head_sha": A, "findings": [self.open_finding(i, 600) for i in range(10)], "security": {},
+                 "runs": [{"head_sha": A, "mode": "full", "files": 1, "verified": 10, "at": 1}],
+                 "fixed_own": [record], "fixed_ids": ["f1", "k1"]}
+        # Shortening the reasons alone fits; trimming the history alone would not.
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 3_000
+        try:
+            cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertEqual((state["fixed_own"], state["fixed_ids"]), ([record], ["f1", "k1"]))
+        self.assertFalse(state.get("history_trimmed"))
+        self.assertTrue(all(len(f["check"]["reason"]) == cp.OPEN_REASON_CHARS for f in state["findings"]))
+
     def test_open_findings_that_cannot_fit_still_fail_the_save(self):
         state = {"head_sha": A, "findings": [self.open_finding(i, 10) for i in range(20)], "security": {}, "runs": []}
         saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, 2_000

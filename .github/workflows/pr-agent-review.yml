@@ -550,8 +550,8 @@ jobs:
 
           def fit_comment(state):
               """Render the checkpoint within GitHub's comment limit: older run records go first, then the oldest
-              fixed findings, dismissed findings, long finding text and pruned history, then open findings'
-              verifier reasons. Only the open findings themselves are never dropped."""
+              fixed findings, dismissed findings, long finding text, open findings' verifier reasons, and last
+              the pruned history. Only the open findings themselves are never dropped."""
               bound_history(state)
               body = render_comment(state)
               while len(body) > COMMENT_LIMIT:
@@ -597,14 +597,16 @@ jobs:
                   elif any(len(f["content"]) > 300 for f in state["findings"]):
                       for f in state["findings"]:
                           f["content"] = f["content"][:300]
+                  elif long_reasons:
+                      # Before any history: these reasons are never read back, while a trimmed history entry can
+                      # miss a reverted fix or a withdrawn dismissal.
+                      for f in long_reasons:
+                          f["check"]["reason"] = f["check"]["reason"][:OPEN_REASON_CHARS]
                   elif any(state.get(name) for name in ("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned", "fixed_own")):
                       longest = max(("fixed_ids", "dismissed_ids", "dismissed_threads", "pruned", "fixed_own"),
                                     key=lambda name: len(json.dumps(state.get(name) or [])))
                       state[longest] = state[longest][1:]
                       state["history_trimmed"] = True
-                  elif long_reasons:
-                      for f in long_reasons:
-                          f["check"]["reason"] = f["check"]["reason"][:OPEN_REASON_CHARS]
                   else:
                       raise RunFailed("Too many open findings to store in one checkpoint comment.")
                   bound_history(state)

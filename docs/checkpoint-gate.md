@@ -31,8 +31,8 @@ goes to the job log as a `verifier-usage:` line.
 
 GitHub caps a comment at 65,536 characters, and the checkpoint stays under 60,000. When it would
 not, the save drops, in order: run records other than the latest, the oldest fixed findings (kept as
-compact records), dismissed findings, finding text past 300 characters, the oldest pruned history,
-and then open findings' verifier reasons past 120 characters (never shown or read back). Open
+compact records), dismissed findings, finding text past 300 characters, open findings' verifier
+reasons past 120 characters (never shown or read back), and last the oldest pruned history. Open
 findings themselves are never dropped; if they alone cannot fit, the run fails.
 
 ## Each run of the review job
