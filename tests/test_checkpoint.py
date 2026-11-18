@@ -234,6 +234,58 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(fnmatch.fnmatch("src/i/pageX.tsx", glob))
 
 
+    @staticmethod
+    def open_finding(i, reason_chars):
+        return {"id": f"{i:012x}", "path": f"f{i}.py", "header": "Bug", "content": "c" * 300, "line": 1,
+                "state": "ACTIVE", "checked_sha": A, "check": {"verdict": "still_present", "reason": "r" * reason_chars,
+                                                                "sha": A}}
+
+    def test_old_run_records_go_before_any_finding(self):
+        runs = [{"head_sha": A, "mode": "full", "files": 3, "verified": 1, "at": n, "verifier_usage": {"pad": "u" * 900}}
+                for n in range(20)]
+        state = {"head_sha": A, "findings": [self.open_finding(i, 50) for i in range(10)], "security": {},
+                 "runs": runs}
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 5_000
+        try:
+            body = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertLessEqual(len(body), len(cp.render_comment({**state, "runs": runs})) - 5_000)
+        self.assertEqual(len(state["findings"]), 10)
+        self.assertLess(len(state["runs"]), 20)
+        self.assertEqual(state["runs"][-1]["at"], 19)
+
+    def test_open_findings_keep_their_place_by_shortening_reasons_nobody_reads(self):
+        state = {"head_sha": A, "findings": [self.open_finding(i, 600) for i in range(20)], "security": {},
+                 "runs": [{"head_sha": A, "mode": "full", "files": 1, "verified": 20, "at": 1}]}
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 5_000
+        try:
+            cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertEqual(len(state["findings"]), 20)
+        self.assertTrue(all(len(f["check"]["reason"]) == cp.OPEN_REASON_CHARS for f in state["findings"]))
+        self.assertEqual(state["findings"][0]["check"]["verdict"], "still_present")
+
+    def test_open_findings_that_cannot_fit_still_fail_the_save(self):
+        state = {"head_sha": A, "findings": [self.open_finding(i, 10) for i in range(20)], "security": {}, "runs": []}
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, 2_000
+        try:
+            with self.assertRaises(cp.RunFailed):
+                cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+
+    def test_a_run_stores_a_usage_summary_rather_than_each_call(self):
+        chat = {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+                "completion_tokens_details": {"reasoning_tokens": 5}, "service_tier": "flex", "reasoning_effort": "high"}
+        responses = {"input_tokens": 50, "output_tokens": 10, "output_tokens_details": {"reasoning_tokens": 4},
+                     "service_tier": "default"}
+        self.assertEqual(cp.usage_summary([chat, responses, {}]),
+                         {"calls": 3, "input_tokens": 150, "output_tokens": 30, "reasoning_tokens": 9,
+                          "service_tiers": ["default", "flex"]})
+
+
 class PlanTests(unittest.TestCase):
     def compare(self, status, files):
         return lambda base, head: {"status": status, "files": [{"filename": f} for f in files]}
@@ -1516,6 +1568,7 @@ class ReviewTests(unittest.TestCase):
         github.compares[(A, B)] = {"status": "ahead", "files": [{"filename": "caller.py", "patch": "+if x:"}]}
         run_review(github, B, review(), verdicts={null: "fixed"})
         state = github.state()
+        state["runs"] = state["runs"][-1:]  # Older run records would go first.
         # Just under the current size, so the fixed record has to be pruned.
         saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 50
         try:
@@ -1744,6 +1797,7 @@ class ReviewTests(unittest.TestCase):
     def test_pruned_own_file_fix_skipped_for_the_token_budget_is_rechecked(self):
         github, race = self.own_file_fixed()
         state = github.state()
+        state["runs"] = state["runs"][-1:]  # Older run records would go first.
         saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 50
         try:
             checkpoint_comment(github)["body"] = cp.fit_comment(state)

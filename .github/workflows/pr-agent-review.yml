@@ -527,13 +527,41 @@ jobs:
                   state["history_trimmed"] = True
 
 
+          def usage_summary(usage):
+              """A run's verifier token use in a few numbers; the per-call records go to the job log only."""
+              summary = {"calls": len(usage), "input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
+              tiers = set()
+              for used in usage:
+                  used = used or {}
+                  # Chat completions name them prompt/completion, the Responses and Anthropic APIs input/output.
+                  summary["input_tokens"] += int(used.get("input_tokens") or used.get("prompt_tokens") or 0)
+                  summary["output_tokens"] += int(used.get("output_tokens") or used.get("completion_tokens") or 0)
+                  details = used.get("output_tokens_details") or used.get("completion_tokens_details") or {}
+                  summary["reasoning_tokens"] += int(details.get("reasoning_tokens") or 0)
+                  if used.get("service_tier"):
+                      tiers.add(str(used["service_tier"]))
+              summary["service_tiers"] = sorted(tiers)
+              return summary
+
+
+          # An open finding's verifier reason is not shown or read back; under size pressure it keeps this much.
+          OPEN_REASON_CHARS = 120
+
+
           def fit_comment(state):
-              """Render the checkpoint within GitHub's comment limit, dropping the oldest fixed findings first."""
+              """Render the checkpoint within GitHub's comment limit: older run records go first, then the oldest
+              fixed findings, dismissed findings, long finding text and pruned history, then open findings'
+              verifier reasons. Only the open findings themselves are never dropped."""
               bound_history(state)
               body = render_comment(state)
               while len(body) > COMMENT_LIMIT:
                   fixed = [i for i, f in enumerate(state["findings"]) if f["state"] == "FIXED"]
-                  if fixed:
+                  long_reasons = [f for f in state["findings"] if f["state"] == "ACTIVE"
+                                  and len((f.get("check") or {}).get("reason") or "") > OPEN_REASON_CHARS]
+                  if len(state.get("runs") or []) > 1:
+                      # Run records are informational; the comment's summary line reads only the latest.
+                      state["runs"] = state["runs"][1:]
+                  elif fixed:
                       pruned = state["findings"].pop(fixed[0])
                       state["pruned_fixed"] = state.get("pruned_fixed", 0) + 1
                       # About 15 characters per id, so the history stays small for any realistic pull request.
@@ -574,6 +602,9 @@ jobs:
                                     key=lambda name: len(json.dumps(state.get(name) or [])))
                       state[longest] = state[longest][1:]
                       state["history_trimmed"] = True
+                  elif long_reasons:
+                      for f in long_reasons:
+                          f["check"]["reason"] = f["check"]["reason"][:OPEN_REASON_CHARS]
                   else:
                       raise RunFailed("Too many open findings to store in one checkpoint comment.")
                   bound_history(state)
@@ -2259,8 +2290,9 @@ jobs:
                       dismissed_ids.discard(dismissed_key(f))
                       dismissed_ids.discard(current_key(f))
               runs = list((checkpoint or {}).get("runs") or [])
+              out("verifier-usage: " + json.dumps(usage, sort_keys=True))
               runs.append({"head_sha": head_sha, "mode": plan_result["mode"], "files": len(plan_result["files"]),
-                           "verified": len(to_verify), "verifier_usage": usage, "at": int(time.time())})
+                           "verified": len(to_verify), "verifier_usage": usage_summary(usage), "at": int(time.time())})
               state = {"version": 1, "revision": (checkpoint or {}).get("revision", 0) + 1,
                        "head_sha": head_sha, "base_sha": base_sha, "base_ref": base_ref, "merge_base": merge_base,
                        "fixed_ids": sorted(fixed_ids), "dismissed_ids": sorted(dismissed_ids), "fixed_deps": fixed_deps,
