@@ -29,8 +29,9 @@ findings are kept with their evidence rather than deleted. Each run adds a recor
 mode, files, findings re-checked and a summary of the verifier's token use); the per-call usage
 goes to the job log as a `verifier-usage:` line.
 
-GitHub caps a comment at 65,536 characters, and the checkpoint stays under 60,000. When it would
-not, the save drops, in order: run records other than the latest, open findings' verifier reasons
+GitHub caps a comment at 65,536 characters, and the checkpoint stays under 60,000. The pruned
+history first keeps to its own budget (see Known limits), whatever the comment's size. If the
+comment is still too long, the save then drops, in order: run records other than the latest, open findings' verifier reasons
 past 120 characters (never shown or read back), the oldest fixed findings (kept as compact records),
 dismissed findings, finding text past 300 characters, and last the oldest pruned history. Open
 findings themselves are never dropped; if they alone cannot fit, the run fails.
