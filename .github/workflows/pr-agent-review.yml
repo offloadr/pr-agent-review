@@ -460,12 +460,14 @@ jobs:
 
 
           def cell(text):
-              return " ".join((text or "").split()).replace("|", "\\|")[:200]
+              # Shown text only: a lone surrogate (kept escaped in the state) would make the comment invalid UTF-8.
+              text = LONE_SURROGATE_RE.sub("\ufffd", text or "")
+              return " ".join(text.split()).replace("|", "\\|")[:200]
 
 
-          def render_comment(state, rows=None, compressed=False):
+          def render_comment(state, rows=None, compressed=False, encoded=None):
               """The checkpoint comment: a summary, a table of findings (at most `rows` of them, open ones first)
-              and the full state in a hidden block, as JSON or compressed."""
+              and the full state in a hidden block, as JSON or compressed (`encoded`, if the caller has it)."""
               findings = state["findings"]
               active = [f for f in findings if f["state"] == "ACTIVE"]
               fixed = [f for f in findings if f["state"] == "FIXED"]
@@ -496,7 +498,7 @@ jobs:
                       lines.append(f"| {status} | {text} | {where} |")
               if rows is not None and len(listed) > rows:
                   lines += ["", f"{len(listed) - rows} more finding(s) are tracked but not listed here."]
-              lines += ["", STATE_START, encode_state(state, compressed), STATE_END]
+              lines += ["", STATE_START, encode_state(state, compressed) if encoded is None else encoded, STATE_END]
               return "\n".join(lines)
 
 
@@ -507,14 +509,18 @@ jobs:
               Compression is not always shorter either: text such as CJK takes more characters compressed and
               base64-encoded than as JSON."""
               for compressed in (False, True):
-                  body = render_comment(state, None, compressed)
+                  # Encoded once: each row count below only changes the table.
+                  encoded = encode_state(state, compressed)
+                  body = render_comment(state, None, compressed, encoded)
                   if len(body) <= COMMENT_LIMIT:
                       return body
+                  if len(render_comment(state, 0, compressed, encoded)) > COMMENT_LIMIT:
+                      continue
                   # The comment grows with every row listed, so the most rows that fit are found by bisection.
                   low, high, best = 0, len(state["findings"]) - 1, None
                   while low <= high:
                       rows = (low + high) // 2
-                      candidate = render_comment(state, rows, compressed)
+                      candidate = render_comment(state, rows, compressed, encoded)
                       if len(candidate) <= COMMENT_LIMIT:
                           best, low = candidate, rows + 1
                       else:

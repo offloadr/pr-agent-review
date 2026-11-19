@@ -338,6 +338,52 @@ class StorageTests(unittest.TestCase):
         self.assertIn(cp.STATE_START + "\n{", body, "Stored as JSON.")
         self.assertEqual(cp.parse_checkpoint(body)["findings"], stored)
 
+    def test_a_finding_with_a_lone_surrogate_is_listed_as_valid_utf8_later(self):
+        findings = [self.open_finding(i, 0) for i in range(12)]
+        findings[11]["header"] = "Bad \ud800 header"
+        state = {"head_sha": A, "findings": findings, "security": {"concern": "odd \udfff"}, "runs": []}
+        stored = json.loads(json.dumps(state))
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state, 3))
+        try:
+            omitted = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        omitted.encode("utf-8")
+        later = cp.parse_checkpoint(omitted)
+        self.assertEqual(later, stored)
+        listed = cp.fit_comment(later)
+        listed.encode("utf-8")
+        self.assertIn("Bad \ufffd header", listed)
+        self.assertEqual(cp.parse_checkpoint(listed)["findings"][11]["header"], "Bad \ud800 header")
+
+    def test_each_format_is_encoded_once_per_attempt_to_fit(self):
+        findings = [self.open_finding(i, 400) for i in range(200)]
+        state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
+        calls = []
+        original = cp.encode_state
+
+        def counted(state, compressed=False):
+            calls.append(compressed)
+            return original(state, compressed)
+        cp.encode_state = counted
+        try:
+            # Neither format fits with no table: one encoding each, and no search.
+            saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, 1_000
+            try:
+                self.assertIsNone(cp.render_within_limit(state))
+            finally:
+                cp.COMMENT_LIMIT = saved
+            self.assertEqual(calls, [False, True])
+            calls.clear()
+            saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(original(state)) + 5_000
+            try:
+                self.assertIsNotNone(cp.render_within_limit(state))
+            finally:
+                cp.COMMENT_LIMIT = saved
+            self.assertEqual(calls, [False])
+        finally:
+            cp.encode_state = original
+
     def test_the_documented_command_reads_a_compressed_state(self):
         import re
         import subprocess
