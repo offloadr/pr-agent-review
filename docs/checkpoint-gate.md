@@ -49,7 +49,8 @@ compressed; neither loses anything. After that the save drops, in
 order: run records other than the latest, open findings' verifier reasons
 past 120 characters (never shown or read back), the oldest fixed findings (kept as compact records),
 dismissed findings, finding text past 300 characters, and last the oldest pruned history. Open
-findings themselves are never dropped; if they alone cannot fit, the run fails.
+findings themselves are never dropped: with nothing else left to drop, the table lists fewer
+than 10 findings, down to none, and only if the state still cannot fit does the run fail.
 
 ## Each run of the review job
 

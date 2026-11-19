@@ -419,7 +419,8 @@ jobs:
               if compressed:
                   # So a pull request with many open findings still fits one comment. Base64 has none of the
                   # characters that could close the HTML comment that holds the state.
-                  return base64.b64encode(zlib.compress(text.encode("utf-8"), 9)).decode("ascii")
+                  # surrogatepass: model text can hold a lone surrogate, which JSON allows and UTF-8 does not.
+                  return base64.b64encode(zlib.compress(text.encode("utf-8", "surrogatepass"), 9)).decode("ascii")
               # Escaping < and > keeps finding text from closing the HTML comment that holds the state.
               return text.replace("<", "\\u003c").replace(">", "\\u003e")
 
@@ -436,7 +437,7 @@ jobs:
               if text.startswith("{"):
                   return json.loads(text)
               try:
-                  return json.loads(zlib.decompress(base64.b64decode(text, validate=True)).decode("utf-8"))
+                  return json.loads(zlib.decompress(base64.b64decode(text, validate=True)).decode("utf-8", "surrogatepass"))
               except zlib.error as error:
                   raise ValueError("The checkpoint state is not readable.") from error
 
@@ -494,11 +495,12 @@ jobs:
               return "\n".join(lines)
 
 
-          def render_within_limit(state):
+          def render_within_limit(state, floor=None):
               """The checkpoint comment within GitHub's comment limit without changing the state, or None. The table
               lists fewer findings first, which loses nothing; the state is compressed only when its JSON cannot fit
               with the shortest table. Compression is not always shorter: text such as CJK takes more characters
-              compressed and base64-encoded than as JSON."""
+              compressed and base64-encoded than as JSON. The table keeps `floor` rows (TABLE_ROWS_MIN by default)."""
+              floor = TABLE_ROWS_MIN if floor is None else floor
               for compressed in (False, True):
                   rows = None
                   while True:
@@ -506,9 +508,9 @@ jobs:
                       if len(body) <= COMMENT_LIMIT:
                           return body
                       listed = len(state["findings"]) if rows is None else rows
-                      if listed <= TABLE_ROWS_MIN:
+                      if listed <= floor:
                           break
-                      rows = max(TABLE_ROWS_MIN, listed // 2)
+                      rows = max(floor, listed // 2)
               return None
 
 
@@ -655,7 +657,12 @@ jobs:
                       state[longest] = state[longest][1:]
                       state["history_trimmed"] = True
                   else:
-                      raise RunFailed("Too many open findings to store in one checkpoint comment.")
+                      # Nothing else can go: the table lists fewer than its usual minimum, down to none, before
+                      # the save fails. Every open finding stays in the state.
+                      body = render_within_limit(state, floor=0)
+                      if body is None:
+                          raise RunFailed("Too many open findings to store in one checkpoint comment.")
+                      break
                   bound_history(state)
                   body = render_within_limit(state)
               return body

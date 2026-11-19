@@ -305,6 +305,35 @@ class StorageTests(unittest.TestCase):
         self.assertIn("more finding(s) are tracked but not listed here", body)
         self.assertGreaterEqual(body.count("| open |"), cp.TABLE_ROWS_MIN)
 
+    def test_a_lone_surrogate_in_an_open_reason_does_not_stop_the_save(self):
+        # JSON allows it and model text can hold it; UTF-8 does not, and the compressed form is tried first
+        # when the JSON is too long.
+        findings = [self.open_finding(i, 600) for i in range(20)]
+        findings[0]["check"]["reason"] = findings[0]["check"]["reason"][:300] + "\ud800" + "tail"
+        state = {"head_sha": A, "findings": findings, "security": {},
+                 "runs": [{"head_sha": A, "mode": "full", "files": 1, "verified": 20, "at": 1}]}
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, smallest_lossless(state) - 3_000
+        try:
+            body = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertEqual(len(cp.parse_checkpoint(body)["findings"]), 20)
+        compressed = cp.render_comment(state, compressed=True)
+        self.assertEqual(cp.parse_checkpoint(compressed), state, "A surrogate kept in a compressed state round-trips.")
+
+    def test_the_table_lists_fewer_than_its_minimum_before_a_save_fails(self):
+        findings = [self.open_finding(i, 0) for i in range(cp.TABLE_ROWS_MIN + 5)]
+        state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
+        stored = json.loads(json.dumps(findings))
+        # Nothing can be shortened, and the state does not fit with the usual shortest table.
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, smallest_lossless(state) - 1
+        try:
+            body = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertEqual(cp.parse_checkpoint(body)["findings"], stored)
+        self.assertLess(body.count("| open |"), cp.TABLE_ROWS_MIN)
+
     def test_a_comment_quoting_the_marker_is_not_the_checkpoint(self):
         real = {"id": 1, "user": {"login": "github-actions[bot]"},
                 "body": cp.render_comment({"head_sha": A, "findings": [], "security": {}, "runs": []})}
