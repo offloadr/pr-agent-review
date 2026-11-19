@@ -197,7 +197,11 @@ jobs:
           # checkpoint; MODE=gate checks the checkpoint for the current head. See docs/checkpoint-gate.md.
 
           CHECKPOINT_MARKER = "<!-- pr-agent:checkpoint -->"
+          # The state as JSON. Readers of every version find this block.
           STATE_START = "<!-- pr-agent-checkpoint:v1"
+          # The state compressed, only when the JSON cannot fit: a reader from before compression does not see
+          # this block (it would otherwise fail on it), and finds no checkpoint, as when it could not save one.
+          COMPRESSED_STATE_START = "<!-- pr-agent-checkpoint:v2"
           STATE_END = "-->"
           COMMENT_AUTHOR = "github-actions[bot]"
           # GraphQL reports the workflow token's author without the [bot] suffix.
@@ -411,24 +415,26 @@ jobs:
 
           # ---- Checkpoint storage ------------------------------------------------------------------------
 
-          def encode_state(state):
-              # Compressed, so a pull request with many open findings still fits one comment. Base64 has none of
-              # the characters that could close the HTML comment that holds the state.
+          def encode_state(state, compressed=False):
               text = json.dumps(state, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-              return base64.b64encode(zlib.compress(text.encode("utf-8"), 9)).decode("ascii")
+              if compressed:
+                  # So a pull request with many open findings still fits one comment. Base64 has none of the
+                  # characters that could close the HTML comment that holds the state.
+                  return base64.b64encode(zlib.compress(text.encode("utf-8"), 9)).decode("ascii")
+              # Escaping < and > keeps finding text from closing the HTML comment that holds the state.
+              return text.replace("<", "\\u003c").replace(">", "\\u003e")
 
 
           def parse_checkpoint(body):
               lines = (body or "").replace("\r\n", "\n").split("\n")
               # The state block is always the comment's last lines, so text above it cannot impersonate it.
-              starts = [i for i, line in enumerate(lines) if line == STATE_START]
+              starts = [i for i, line in enumerate(lines) if line in (STATE_START, COMPRESSED_STATE_START)]
               if not starts or STATE_END not in lines[starts[-1] + 1:]:
                   return None
               start = starts[-1]
               end = lines.index(STATE_END, start + 1)
-              text = "\n".join(lines[start + 1:end]).strip()
-              # A checkpoint saved before the state was compressed holds the JSON itself.
-              if text.startswith("{"):
+              text = "\n".join(lines[start + 1:end])
+              if lines[start] == STATE_START:
                   return json.loads(text)
               try:
                   return json.loads(zlib.decompress(base64.b64decode(text, validate=True)).decode("utf-8"))
@@ -452,9 +458,9 @@ jobs:
               return " ".join((text or "").split()).replace("|", "\\|")[:200]
 
 
-          def render_comment(state, rows=None):
+          def render_comment(state, rows=None, compressed=False):
               """The checkpoint comment: a summary, a table of findings (at most `rows` of them, open ones first)
-              and the full state in a hidden block."""
+              and the full state in a hidden block, as JSON or compressed."""
               findings = state["findings"]
               active = [f for f in findings if f["state"] == "ACTIVE"]
               fixed = [f for f in findings if f["state"] == "FIXED"]
@@ -485,8 +491,26 @@ jobs:
                       lines.append(f"| {status} | {text} | {where} |")
                   if rows is not None and len(listed) > rows:
                       lines += ["", f"{len(listed) - rows} more finding(s) are tracked but not listed here."]
-              lines += ["", STATE_START, encode_state(state), STATE_END]
+              lines += ["", COMPRESSED_STATE_START if compressed else STATE_START, encode_state(state, compressed), STATE_END]
               return "\n".join(lines)
+
+
+          def render_within_limit(state):
+              """The checkpoint comment within GitHub's comment limit without changing the state, or None. The table
+              lists fewer findings first, which loses nothing; the state is compressed only when its JSON cannot fit
+              with the shortest table. Compression is not always shorter: text such as CJK takes more characters
+              compressed and base64-encoded than as JSON."""
+              for compressed in (False, True):
+                  rows = None
+                  while True:
+                      body = render_comment(state, rows, compressed)
+                      if len(body) <= COMMENT_LIMIT:
+                          return body
+                      listed = len(state["findings"]) if rows is None else rows
+                      if listed <= TABLE_ROWS_MIN:
+                          break
+                      rows = max(TABLE_ROWS_MIN, listed // 2)
+              return None
 
 
           # Pruned findings' ids and dismissed threads are kept within this budget, oldest dropped first.
@@ -572,22 +596,17 @@ jobs:
 
 
           def fit_comment(state):
-              """Render the checkpoint within GitHub's comment limit. The table lists fewer findings first, which
-              loses nothing. Then older run records and open findings' verifier reasons go, then the oldest fixed
-              findings, dismissed findings, long finding text, and last the pruned history. Only the open
-              findings themselves are never dropped."""
+              """Render the checkpoint within GitHub's comment limit. A shorter table and a compressed state lose
+              nothing (render_within_limit). Then older run records and open findings' verifier reasons go, then the
+              oldest fixed findings, dismissed findings, long finding text, and last the pruned history. Only the
+              open findings themselves are never dropped."""
               bound_history(state)
-              rows = None
-              body = render_comment(state, rows)
-              while len(body) > COMMENT_LIMIT:
+              body = render_within_limit(state)
+              while body is None:
                   fixed = [i for i, f in enumerate(state["findings"]) if f["state"] == "FIXED"]
                   long_reasons = [f for f in state["findings"] if f["state"] == "ACTIVE"
                                   and len((f.get("check") or {}).get("reason") or "") > OPEN_REASON_CHARS]
-                  listed = len(state["findings"]) if rows is None else rows
-                  if listed > TABLE_ROWS_MIN:
-                      # Every finding stays in the state below; only the visible list gets shorter.
-                      rows = max(TABLE_ROWS_MIN, listed // 2)
-                  elif len(state.get("runs") or []) > 1:
+                  if len(state.get("runs") or []) > 1:
                       # Run records are informational; the comment's summary line reads only the latest.
                       state["runs"] = state["runs"][1:]
                   elif long_reasons:
@@ -639,7 +658,7 @@ jobs:
                   else:
                       raise RunFailed("Too many open findings to store in one checkpoint comment.")
                   bound_history(state)
-                  body = render_comment(state, rows)
+                  body = render_within_limit(state)
               return body
 
 

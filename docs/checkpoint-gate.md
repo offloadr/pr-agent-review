@@ -17,18 +17,19 @@ token writes, in a hidden block:
 
 ```
 <!-- pr-agent-checkpoint:v1
-<base64 text>
+{"head_sha": ..., "base_sha": ..., "findings": [...], "security": {...}, "runs": [...]}
 -->
 ```
 
-The block is the state as JSON, zlib-compressed and base64-encoded:
+The block is the state as JSON, with `<` and `>` escaped so finding text cannot close the HTML
+comment. When the JSON cannot fit in the comment even with the shortest table, the state is
+zlib-compressed and base64-encoded instead, in a `<!-- pr-agent-checkpoint:v2` block. JSON is
+kept whenever it fits: compression is not always shorter (varied CJK text takes more characters
+compressed), and a workflow from before compression reads only `v1` blocks. If such a workflow
+is run again (a rollback), it sees no checkpoint in a `v2` comment, as when it could not save
+one, rather than failing on it.
 
-```
-{"head_sha": ..., "base_sha": ..., "findings": [...], "security": {...}, "runs": [...]}
-```
-
-To read one by hand: `base64 -d | python3 -c 'import sys, zlib; print(zlib.decompress(sys.stdin.buffer.read()).decode())'`.
-A checkpoint saved before the state was compressed holds the JSON itself and is still read.
+To read a `v2` block by hand: `base64 -d | python3 -c 'import sys, zlib; print(zlib.decompress(sys.stdin.buffer.read()).decode())'`.
 
 PR-Agent's own persistent finding state is turned off, so there is one source of truth.
 
@@ -41,7 +42,8 @@ goes to the job log as a `verifier-usage:` line.
 GitHub caps a comment at 65,536 characters, and the checkpoint stays under 60,000. The pruned
 history first keeps to its own budget (see Known limits), whatever the comment's size. If the
 comment is still too long, the table first lists fewer findings (down to 10; every finding
-stays in the state, and the comment says how many are not listed). After that the save drops, in
+stays in the state, and the comment says how many are not listed), and then the state is
+compressed; neither loses anything. After that the save drops, in
 order: run records other than the latest, open findings' verifier reasons
 past 120 characters (never shown or read back), the oldest fixed findings (kept as compact records),
 dismissed findings, finding text past 300 characters, and last the oldest pruned history. Open
