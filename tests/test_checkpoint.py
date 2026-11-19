@@ -244,14 +244,9 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(cp.parse_checkpoint(body), state)
 
     def test_a_damaged_compressed_state_block_is_an_error_not_an_empty_checkpoint(self):
-        body = "\n".join([cp.CHECKPOINT_MARKER, "", cp.COMPRESSED_STATE_START, "bm90IGEgY2hlY2twb2ludA==", cp.STATE_END])
+        body = "\n".join([cp.CHECKPOINT_MARKER, "", cp.STATE_START, "bm90IGEgY2hlY2twb2ludA==", cp.STATE_END])
         with self.assertRaises(ValueError):
             cp.parse_checkpoint(body)
-
-    def test_a_compressed_state_under_the_v1_marker_is_still_read(self):
-        state = {"head_sha": A, "findings": [{"content": "saved compressed"}], "runs": [], "security": {}}
-        body = "\n".join([cp.CHECKPOINT_MARKER, "", cp.STATE_START, cp.encode_state(state, compressed=True), cp.STATE_END])
-        self.assertEqual(cp.parse_checkpoint(body), state)
 
     @staticmethod
     def reader_before_compression(body):
@@ -267,7 +262,7 @@ class StorageTests(unittest.TestCase):
         findings = [self.open_finding(i, 100) for i in range(5)]
         state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
         body = cp.fit_comment(json.loads(json.dumps(state)))
-        self.assertIn(cp.STATE_START + "\n", body)
+        self.assertIn(cp.STATE_START + "\n{", body, "Stored as JSON.")
         self.assertEqual(self.reader_before_compression(body), state)
 
     def test_cjk_text_that_fits_as_json_is_stored_as_json_and_round_trips(self):
@@ -281,19 +276,20 @@ class StorageTests(unittest.TestCase):
         self.assertGreater(len(cp.encode_state(state, compressed=True)), len(cp.encode_state(state)))
         body = cp.fit_comment(json.loads(json.dumps(state)))
         self.assertLessEqual(len(body), cp.COMMENT_LIMIT)
-        self.assertIn(cp.STATE_START + "\n", body)
+        self.assertIn(cp.STATE_START + "\n{", body, "Stored as JSON.")
         self.assertEqual(cp.parse_checkpoint(body)["findings"], findings)
 
-    def test_a_state_too_large_as_json_is_compressed_and_an_earlier_reader_finds_no_checkpoint(self):
-        # Repetitive text compresses well; as JSON it cannot fit. A rolled-back workflow must not fail on the
-        # compressed block: it sees no checkpoint, as when it could not have saved one.
+    def test_a_state_too_large_as_json_is_compressed_and_an_earlier_reader_fails_on_it(self):
+        # Repetitive text compresses well; as JSON it cannot fit. A rolled-back workflow must not take the
+        # compressed state for no checkpoint: starting over, its gate could pass with an open finding.
         findings = [dict(self.open_finding(i, 0), content=("the same words " * 40)[:500]) for i in range(150)]
         state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
         self.assertGreater(len(cp.render_comment(state, cp.TABLE_ROWS_MIN)), cp.COMMENT_LIMIT)
         body = cp.fit_comment(json.loads(json.dumps(state)))
-        self.assertIn(cp.COMPRESSED_STATE_START + "\n", body)
+        self.assertNotIn(cp.STATE_START + "\n{", body, "Stored compressed.")
         self.assertEqual(cp.parse_checkpoint(body)["findings"], findings)
-        self.assertIsNone(self.reader_before_compression(body))
+        with self.assertRaises(ValueError):
+            self.reader_before_compression(body)
 
     def test_many_open_findings_fit_by_listing_fewer_and_every_one_stays_stored(self):
         # More open findings than the comment can list in full: none is dropped or shortened.

@@ -22,14 +22,16 @@ token writes, in a hidden block:
 ```
 
 The block is the state as JSON, with `<` and `>` escaped so finding text cannot close the HTML
-comment. When the JSON cannot fit in the comment even with the shortest table, the state is
-zlib-compressed and base64-encoded instead, in a `<!-- pr-agent-checkpoint:v2` block. JSON is
-kept whenever it fits: compression is not always shorter (varied CJK text takes more characters
-compressed), and a workflow from before compression reads only `v1` blocks. If such a workflow
-is run again (a rollback), it sees no checkpoint in a `v2` comment, as when it could not save
-one, rather than failing on it. The current reader decodes either block by its content.
+comment. When the JSON cannot fit in the comment even with the shortest table, the block holds
+the state zlib-compressed and base64-encoded instead; the reader tells them apart by content.
+JSON is kept whenever it fits: compression is not always shorter (varied CJK text takes more
+characters compressed), and a workflow from before compression reads only JSON. Such a
+workflow, if run again after a rollback, fails on a compressed state instead of starting over:
+a gate that started over without the stored open findings could pass. A compressed state is
+written only when the JSON cannot fit, so that workflow could not have kept the whole state
+either.
 
-To read a `v2` block by hand: `base64 -d | python3 -c 'import sys, zlib; print(zlib.decompress(sys.stdin.buffer.read()).decode())'`.
+To read a compressed block by hand: `base64 -d | python3 -c 'import sys, zlib; print(zlib.decompress(sys.stdin.buffer.read()).decode())'`.
 
 PR-Agent's own persistent finding state is turned off, so there is one source of truth.
 
