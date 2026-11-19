@@ -21,6 +21,18 @@ token writes, in a hidden block:
 -->
 ```
 
+The block is the state as JSON, with `<` and `>` escaped so finding text cannot close the HTML
+comment, and any lone surrogate escaped so the comment is valid UTF-8. When the JSON cannot fit in the comment even with no table, the block holds
+the state zlib-compressed and base64-encoded instead; the reader tells them apart by content.
+JSON is kept whenever it fits: compression is not always shorter (varied CJK text takes more
+characters compressed), and a workflow from before compression reads only JSON. Such a
+workflow, if run again after a rollback, fails on a compressed state instead of starting over:
+a gate that started over without the stored open findings could pass. A compressed state is
+written only when the JSON cannot fit, so that workflow could not have kept the whole state
+either.
+
+To read a compressed block by hand: `base64 -d | python3 -c 'import sys, zlib; print(zlib.decompress(sys.stdin.buffer.read()).decode())'`.
+
 PR-Agent's own persistent finding state is turned off, so there is one source of truth.
 
 Each finding has an id, path, line, header, content, `state` (`ACTIVE` or `FIXED`), the commit
@@ -31,7 +43,11 @@ goes to the job log as a `verifier-usage:` line.
 
 GitHub caps a comment at 65,536 characters, and the checkpoint stays under 60,000. The pruned
 history first keeps to its own budget (see Known limits), whatever the comment's size. If the
-comment is still too long, the save then drops, in order: run records other than the latest, open findings' verifier reasons
+comment is still too long, the table first lists fewer findings (down to none; every finding
+stays in the state, and the comment says how many are not listed). Only if the JSON does not fit
+even with no table is the state compressed, again listing as many findings as fit. Neither loses
+anything. After that the save drops, in
+order: run records other than the latest, open findings' verifier reasons
 past 120 characters (never shown or read back), the oldest fixed findings (kept as compact records),
 dismissed findings, finding text past 300 characters, and last the oldest pruned history. Open
 findings themselves are never dropped; if they alone cannot fit, the run fails.

@@ -1,4 +1,6 @@
 """Tests for the checkpoint script, loaded from the workflow so the tested code is the shipped code."""
+import base64
+import hashlib
 import json
 import pathlib
 import textwrap
@@ -27,7 +29,23 @@ def load_script():
 
 
 cp = load_script()
+
+
+def noise(length, seed=0):
+    """Text that does not compress, so a size limit bites as it does on real finding text."""
+    text, block = "", 0
+    while len(text) < length:
+        text += base64.b64encode(hashlib.sha256(f"{seed}:{block}".encode()).digest()).decode().rstrip("=")
+        block += 1
+    return text[:length]
+
+
 cp.FLEX_BACKOFF = (0, 0, 0)  # No real waiting in tests.
+
+
+def smallest_lossless(state):
+    """The shortest the checkpoint comment gets without changing its state: no table, JSON or compressed."""
+    return min(len(cp.render_comment(state, 0, compressed)) for compressed in (False, True))
 
 
 def issue(path, header, content, line=10):
@@ -219,6 +237,198 @@ class StorageTests(unittest.TestCase):
         self.assertNotIn("-->\n<b>", body)
         self.assertEqual(cp.parse_checkpoint(body), state)
 
+    def test_a_checkpoint_saved_before_compression_is_still_read(self):
+        state = {"head_sha": A, "findings": [{"content": "plain <b> text"}], "runs": [], "security": {}, "revision": 3}
+        plain = json.dumps(state, sort_keys=True).replace("<", "\\u003c").replace(">", "\\u003e")
+        body = "\n".join([cp.CHECKPOINT_MARKER, "### PR-Agent findings at aaaaaaa", "", cp.STATE_START, plain, cp.STATE_END])
+        self.assertEqual(cp.parse_checkpoint(body), state)
+
+    def test_a_damaged_compressed_state_block_is_an_error_not_an_empty_checkpoint(self):
+        body = "\n".join([cp.CHECKPOINT_MARKER, "", cp.STATE_START, "bm90IGEgY2hlY2twb2ludA==", cp.STATE_END])
+        with self.assertRaises(ValueError):
+            cp.parse_checkpoint(body)
+
+    @staticmethod
+    def reader_before_compression(body):
+        """parse_checkpoint as released before compression (15ba456), for a rolled-back workflow."""
+        lines = body.replace("\r\n", "\n").split("\n")
+        starts = [i for i, line in enumerate(lines) if line == "<!-- pr-agent-checkpoint:v1"]
+        if not starts or "-->" not in lines[starts[-1] + 1:]:
+            return None
+        end = lines.index("-->", starts[-1] + 1)
+        return json.loads("\n".join(lines[starts[-1] + 1:end]))
+
+    def test_the_state_is_json_whenever_it_fits_so_an_earlier_reader_still_reads_it(self):
+        findings = [self.open_finding(i, 100) for i in range(5)]
+        state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
+        body = cp.fit_comment(json.loads(json.dumps(state)))
+        self.assertIn(cp.STATE_START + "\n{", body, "Stored as JSON.")
+        self.assertEqual(self.reader_before_compression(body), state)
+
+    def test_cjk_text_that_fits_as_json_is_stored_as_json_and_round_trips(self):
+        # Compressed and base64-encoded, varied CJK text takes more characters than its JSON.
+        def cjk(length, seed):
+            data = b"".join(hashlib.sha256(f"{seed}:{n}".encode()).digest() for n in range(length // 16 + 1))
+            return "".join(chr(0x4E00 + int.from_bytes(data[2 * i:2 * i + 2], "big") % 20_000) for i in range(length))
+        findings = [dict(self.open_finding(i, 0), content=cjk(300, i), check={"verdict": "still_present", "reason": ""})
+                    for i in range(85)]
+        state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
+        self.assertGreater(len(cp.encode_state(state, compressed=True)), len(cp.encode_state(state)))
+        body = cp.fit_comment(json.loads(json.dumps(state)))
+        self.assertLessEqual(len(body), cp.COMMENT_LIMIT)
+        self.assertIn(cp.STATE_START + "\n{", body, "Stored as JSON.")
+        self.assertEqual(cp.parse_checkpoint(body)["findings"], findings)
+
+    def test_a_state_too_large_as_json_is_compressed_and_an_earlier_reader_fails_on_it(self):
+        # Repetitive text compresses well; as JSON it cannot fit. A rolled-back workflow must not take the
+        # compressed state for no checkpoint: starting over, its gate could pass with an open finding.
+        findings = [dict(self.open_finding(i, 0), content=("the same words " * 40)[:500]) for i in range(150)]
+        state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
+        self.assertGreater(len(cp.render_comment(state, 0)), cp.COMMENT_LIMIT)
+        body = cp.fit_comment(json.loads(json.dumps(state)))
+        self.assertNotIn(cp.STATE_START + "\n{", body, "Stored compressed.")
+        self.assertEqual(cp.parse_checkpoint(body)["findings"], findings)
+        with self.assertRaises(ValueError):
+            self.reader_before_compression(body)
+
+    def test_many_open_findings_fit_by_listing_fewer_and_every_one_stays_stored(self):
+        # More open findings than the comment can list in full: none is dropped or shortened.
+        findings = [self.open_finding(i, 400) for i in range(70)]
+        state = {"head_sha": A, "findings": [dict(f) for f in findings], "security": {},
+                 "runs": [{"head_sha": A, "mode": "full", "files": 1, "verified": 70, "at": 1}]}
+        self.assertGreater(len(cp.render_comment(state)), cp.COMMENT_LIMIT)
+        body = cp.fit_comment(state)
+        self.assertLessEqual(len(body), cp.COMMENT_LIMIT)
+        stored = cp.parse_checkpoint(body)["findings"]
+        self.assertEqual([(f["id"], f["content"], f["check"]["reason"]) for f in stored],
+                         [(f["id"], f["content"], f["check"]["reason"]) for f in findings])
+        self.assertIn("more finding(s) are tracked but not listed here", body)
+        self.assertGreater(body.count("| open |"), 0)
+
+    def test_a_lone_surrogate_in_an_open_reason_does_not_stop_the_save(self):
+        # JSON allows it and model text can hold it; UTF-8 does not, and the compressed form is tried first
+        # when the JSON is too long.
+        findings = [self.open_finding(i, 600) for i in range(20)]
+        findings[0]["check"]["reason"] = findings[0]["check"]["reason"][:300] + "\ud800" + "tail"
+        state = {"head_sha": A, "findings": findings, "security": {},
+                 "runs": [{"head_sha": A, "mode": "full", "files": 1, "verified": 20, "at": 1}]}
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, smallest_lossless(state) - 3_000
+        try:
+            body = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertEqual(len(cp.parse_checkpoint(body)["findings"]), 20)
+        for compressed in (False, True):
+            kept = cp.render_comment(state, compressed=compressed)
+            kept.encode("utf-8")
+            self.assertEqual(cp.parse_checkpoint(kept), state, "A surrogate kept in the state round-trips.")
+
+    def test_a_lone_surrogate_saved_as_json_after_a_shorter_table_is_valid_utf8(self):
+        findings = [self.open_finding(i, 200) for i in range(20)]
+        findings[3]["check"]["reason"] = findings[3]["check"]["reason"][:150] + "\udc00"
+        state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
+        stored = json.loads(json.dumps(findings))
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state, 10)) + 10
+        try:
+            self.assertGreater(len(cp.render_comment(state)), cp.COMMENT_LIMIT)
+            body = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        body.encode("utf-8")
+        self.assertIn(cp.STATE_START + "\n{", body, "Stored as JSON.")
+        self.assertEqual(cp.parse_checkpoint(body)["findings"], stored)
+
+    def test_a_finding_with_a_lone_surrogate_is_listed_as_valid_utf8_later(self):
+        findings = [self.open_finding(i, 0) for i in range(12)]
+        findings[11]["header"] = "Bad \ud800 header"
+        state = {"head_sha": A, "findings": findings, "security": {"concern": "odd \udfff"}, "runs": []}
+        stored = json.loads(json.dumps(state))
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state, 3))
+        try:
+            omitted = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        omitted.encode("utf-8")
+        later = cp.parse_checkpoint(omitted)
+        self.assertEqual(later, stored)
+        listed = cp.fit_comment(later)
+        listed.encode("utf-8")
+        self.assertIn("Bad \ufffd header", listed)
+        self.assertEqual(cp.parse_checkpoint(listed)["findings"][11]["header"], "Bad \ud800 header")
+
+    def test_each_format_is_encoded_once_per_attempt_to_fit(self):
+        findings = [self.open_finding(i, 400) for i in range(200)]
+        state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
+        calls = []
+        original = cp.encode_state
+
+        def counted(state, compressed=False):
+            calls.append(compressed)
+            return original(state, compressed)
+        cp.encode_state = counted
+        try:
+            # Neither format fits with no table: one encoding each, and no search.
+            saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, 1_000
+            try:
+                self.assertIsNone(cp.render_within_limit(state))
+            finally:
+                cp.COMMENT_LIMIT = saved
+            self.assertEqual(calls, [False, True])
+            calls.clear()
+            saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(original(state)) + 5_000
+            try:
+                self.assertIsNotNone(cp.render_within_limit(state))
+            finally:
+                cp.COMMENT_LIMIT = saved
+            self.assertEqual(calls, [False])
+        finally:
+            cp.encode_state = original
+
+    # The decoder docs/checkpoint-gate.md shows. The test runs this copy, never text read from the docs.
+    DOCUMENTED_DECODER = "base64 -d | python3 -c 'import sys, zlib; print(zlib.decompress(sys.stdin.buffer.read()).decode())'"
+
+    def test_the_documented_command_reads_a_compressed_state(self):
+        import os
+        import subprocess
+        doc = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "checkpoint-gate.md").read_text()
+        self.assertIn(f"To read a compressed block by hand: `{self.DOCUMENTED_DECODER}`.", doc)
+        state = {"head_sha": A, "findings": [{"content": "odd \ud800 text", "header": "表"}], "runs": [], "security": {}}
+        block = cp.encode_state(state, compressed=True)
+        result = subprocess.run(["sh", "-c", self.DOCUMENTED_DECODER], input=block, capture_output=True, text=True,
+                                check=True, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C.UTF-8"})
+        self.assertEqual(json.loads(result.stdout), state)
+
+    def test_a_shorter_table_keeps_the_state_as_json_and_its_history_whole(self):
+        # Repetitive text: compressed it would fit with the whole table, as JSON only with nine rows. The JSON
+        # is kept, so a workflow from before compression still reads it, and no pruned history is trimmed.
+        findings = [dict(self.open_finding(i, 0), content=("the same words " * 40)[:300]) for i in range(30)]
+        pruned = [{"id": "gone", "key": "gone-key", "threads": [{"path": "x.py", "fingerprint": "f00d"}]}]
+        state = {"head_sha": A, "findings": findings, "security": {}, "runs": [], "pruned": pruned}
+        stored = json.loads(json.dumps(state))
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state, 9)) + 1
+        try:
+            self.assertGreater(len(cp.render_comment(state, 10)), cp.COMMENT_LIMIT)
+            self.assertLess(len(cp.render_comment(state, compressed=True)), cp.COMMENT_LIMIT)
+            body = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertEqual(self.reader_before_compression(body), stored)
+        self.assertEqual(body.count("| open |"), 9, "As many findings as fit are listed.")
+
+    def test_a_comment_listing_no_findings_has_no_table_and_keeps_the_state_as_json(self):
+        findings = [self.open_finding(i, 0) for i in range(12)]
+        state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
+        stored = json.loads(json.dumps(state))
+        # Room for the summary, the omission notice and the JSON, not for any table markup.
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state, 0))
+        try:
+            body = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertNotIn("| State |", body)
+        self.assertIn("12 more finding(s) are tracked but not listed here.", body)
+        self.assertEqual(self.reader_before_compression(body), stored)
+
     def test_a_comment_quoting_the_marker_is_not_the_checkpoint(self):
         real = {"id": 1, "user": {"login": "github-actions[bot]"},
                 "body": cp.render_comment({"head_sha": A, "findings": [], "security": {}, "runs": []})}
@@ -236,16 +446,16 @@ class StorageTests(unittest.TestCase):
 
     @staticmethod
     def open_finding(i, reason_chars):
-        return {"id": f"{i:012x}", "path": f"f{i}.py", "header": "Bug", "content": "c" * 300, "line": 1,
-                "state": "ACTIVE", "checked_sha": A, "check": {"verdict": "still_present", "reason": "r" * reason_chars,
+        return {"id": f"{i:012x}", "path": f"f{i}.py", "header": "Bug", "content": noise(300, i), "line": 1,
+                "state": "ACTIVE", "checked_sha": A, "check": {"verdict": "still_present", "reason": noise(reason_chars, 1000 + i),
                                                                 "sha": A}}
 
     def test_old_run_records_go_before_any_finding(self):
-        runs = [{"head_sha": A, "mode": "full", "files": 3, "verified": 1, "at": n, "verifier_usage": {"pad": "u" * 900}}
+        runs = [{"head_sha": A, "mode": "full", "files": 3, "verified": 1, "at": n, "verifier_usage": {"pad": noise(900, n)}}
                 for n in range(20)]
         state = {"head_sha": A, "findings": [self.open_finding(i, 50) for i in range(10)], "security": {},
                  "runs": runs}
-        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 5_000
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, smallest_lossless(state) - 5_000
         try:
             body = cp.fit_comment(state)
         finally:
@@ -258,7 +468,7 @@ class StorageTests(unittest.TestCase):
     def test_open_findings_keep_their_place_by_shortening_reasons_nobody_reads(self):
         state = {"head_sha": A, "findings": [self.open_finding(i, 600) for i in range(20)], "security": {},
                  "runs": [{"head_sha": A, "mode": "full", "files": 1, "verified": 20, "at": 1}]}
-        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 5_000
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, smallest_lossless(state) - 5_000
         try:
             cp.fit_comment(state)
         finally:
@@ -274,7 +484,7 @@ class StorageTests(unittest.TestCase):
                  "runs": [{"head_sha": A, "mode": "full", "files": 1, "verified": 10, "at": 1}],
                  "fixed_own": [record], "fixed_ids": ["f1", "k1"]}
         # Shortening the reasons alone fits; trimming the history alone would not.
-        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 3_000
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, smallest_lossless(state) - 3_000
         try:
             cp.fit_comment(state)
         finally:
@@ -286,16 +496,16 @@ class StorageTests(unittest.TestCase):
     def test_open_reasons_are_shortened_before_a_fixed_finding_is_pruned_into_full_history(self):
         def own(i):
             return {"id": f"o{i}", "path": f"p{i}.py", "header": "H", "content_id": "c", "threads": [],
-                    "content": "x" * 100}
+                    "content": noise(100, i)}
         fixed_own = []
         while len(json.dumps(fixed_own)) < cp.HISTORY_CHARS - 300:
             fixed_own.append(own(len(fixed_own)))
-        fixed = {"id": "fx", "path": "fixed.py", "header": "Fixed", "content": "c" * 300, "line": 1, "state": "FIXED",
+        fixed = {"id": "fx", "path": "fixed.py", "header": "Fixed", "content": noise(300, 77), "line": 1, "state": "FIXED",
                  "checked_sha": A, "content_id": "cf", "check": {"verdict": "fixed", "reason": "r", "sha": A}}
         state = {"head_sha": A, "findings": [self.open_finding(i, 600) for i in range(10)] + [fixed], "security": {},
                  "runs": [{"head_sha": A, "mode": "full", "files": 1, "verified": 10, "at": 1}],
                  "fixed_own": list(fixed_own)}
-        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 3_000
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, smallest_lossless(state) - 3_000
         try:
             cp.fit_comment(state)
         finally:
@@ -963,7 +1173,7 @@ class ReviewTests(unittest.TestCase):
             if previous:
                 github.compares[(previous, head)] = {"status": "ahead", "files": [{"filename": p} for p in paths]}
             fixed = {f["id"]: "fixed" for f in (github.state() or {}).get("findings", []) if f["state"] == "ACTIVE"}
-            issues = [issue(p, "Bug", f"round {round_number} " + "x" * 1500) for p in paths]
+            issues = [issue(p, "Bug", f"round {round_number} " + noise(1500, f"{round_number}{p}")) for p in paths]
             code, _, _ = run_review(github, head, review(*issues), verdicts=fixed)
             self.assertEqual(code, 0)
             previous = head
@@ -1640,7 +1850,7 @@ class ReviewTests(unittest.TestCase):
         state = github.state()
         state["runs"] = state["runs"][-1:]  # Older run records would go first.
         # Just under the current size, so the fixed record has to be pruned.
-        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 50
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, smallest_lossless(state) - 50
         try:
             checkpoint_comment(github)["body"] = cp.fit_comment(state)
         finally:
@@ -1868,7 +2078,7 @@ class ReviewTests(unittest.TestCase):
         github, race = self.own_file_fixed()
         state = github.state()
         state["runs"] = state["runs"][-1:]  # Older run records would go first.
-        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state)) - 50
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, smallest_lossless(state) - 50
         try:
             checkpoint_comment(github)["body"] = cp.fit_comment(state)
         finally:
@@ -2888,7 +3098,7 @@ class GateTests(unittest.TestCase):
             if previous:
                 github.compares[(previous, head)] = {"status": "ahead", "files": [{"filename": p} for p in paths]}
             fixed = {f["id"]: "fixed" for f in (github.state() or {}).get("findings", []) if f["state"] == "ACTIVE"}
-            contents = [(p, f"round {round_number} " + "x" * 1500) for p in paths]
+            contents = [(p, f"round {round_number} " + noise(1500, f"{round_number}{p}")) for p in paths]
             run_review(github, head, review(*[issue(p, "Bug", c) for p, c in contents]), verdicts=fixed)
             posted_threads += [posted(f"T{round_number}-{p}", p, "Bug", c) for p, c in contents]
             github.threads = posted_threads
@@ -3051,8 +3261,8 @@ class GateTests(unittest.TestCase):
         self.assertIn("No PR-Agent checkpoint", output)
 
     def test_pruned_renamed_finding_still_resolves_its_original_thread(self):
-        finding = {"id": "1", "path": "moved.py", "thread_path": "x.py", "header": "Race", "content": "c" * 500,
-                   "line": 1, "state": "FIXED", "fingerprint": cp.inline_fingerprint("x.py", "Race", "c" * 500),
+        finding = {"id": "1", "path": "moved.py", "thread_path": "x.py", "header": "Race", "content": noise(500),
+                   "line": 1, "state": "FIXED", "fingerprint": cp.inline_fingerprint("x.py", "Race", noise(500)),
                    "checked_sha": B, "check": {"verdict": "fixed", "reason": "r", "sha": B}}
         state = {"head_sha": B, "findings": [finding], "security": {}, "runs": []}
         saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, 800
@@ -3063,7 +3273,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(state["findings"], [])
         self.assertEqual((state["pruned"][0]["id"], state["pruned"][0]["threads"]),
                          ("1", [{"path": "x.py", "fingerprint": finding["fingerprint"]}]))
-        thread_on_old_path = posted("T1", "x.py", "Race", "c" * 500)
+        thread_on_old_path = posted("T1", "x.py", "Race", noise(500))
         self.assertEqual(cp.fixed_thread_ids(state, [thread_on_old_path]), ["T1"])
 
     def test_gate_does_not_resolve_threads_when_a_newer_checkpoint_appears(self):
@@ -3127,7 +3337,7 @@ class GateTests(unittest.TestCase):
             github.heads = [head]
             if previous:
                 github.compares[(previous, head)] = {"status": "ahead", "files": [{"filename": p} for p in paths]}
-            contents = [(p, f"round {round_number} " + "x" * 1500) for p in paths]
+            contents = [(p, f"round {round_number} " + noise(1500, f"{round_number}{p}")) for p in paths]
             # Every earlier finding was dismissed by resolving its thread; the verifier keeps saying still_present.
             still = {f["id"]: "still_present" for f in (github.state() or {}).get("findings", [])}
             code, _, _ = run_review(github, head, review(*[issue(p, "Bug", c) for p, c in contents]), verdicts=still)
@@ -3500,8 +3710,8 @@ class GateTests(unittest.TestCase):
         self.assertEqual([f["header"] for f in github.state()["findings"]], ["Race"])
 
     def test_unresolving_a_pruned_dismissed_findings_thread_fails_the_gate(self):
-        finding = {"id": "1", "path": "x.py", "header": "Race", "content": "c" * 500, "line": 1, "state": "DISMISSED",
-                   "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", "c" * 500)}],
+        finding = {"id": "1", "path": "x.py", "header": "Race", "content": noise(500), "line": 1, "state": "DISMISSED",
+                   "threads": [{"path": "x.py", "fingerprint": cp.inline_fingerprint("x.py", "Race", noise(500))}],
                    "checked_sha": A, "check": None, "content_id": "x"}
         state = {"head_sha": A, "base_ref": "main", "findings": [finding], "security": {}, "runs": []}
         saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, 800
@@ -3513,7 +3723,7 @@ class GateTests(unittest.TestCase):
         github = FakeGitHub(A, ["x.py"])
         github.issue_comments = [{"id": 1, "user": {"login": "github-actions[bot]"}, "body": body,
                                   "html_url": "https://example/checkpoint"}]
-        github.threads = [posted("T1", "x.py", "Race", "c" * 500, resolved=True)]
+        github.threads = [posted("T1", "x.py", "Race", noise(500), resolved=True)]
         self.assertEqual(self.gate(github)[0], 0)
         github.threads[0]["resolved"] = False
         code, output = self.gate(github)
