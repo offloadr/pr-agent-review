@@ -384,14 +384,18 @@ class StorageTests(unittest.TestCase):
         finally:
             cp.encode_state = original
 
+    # The decoder docs/checkpoint-gate.md shows. The test runs this copy, never text read from the docs.
+    DOCUMENTED_DECODER = "base64 -d | python3 -c 'import sys, zlib; print(zlib.decompress(sys.stdin.buffer.read()).decode())'"
+
     def test_the_documented_command_reads_a_compressed_state(self):
-        import re
+        import os
         import subprocess
         doc = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "checkpoint-gate.md").read_text()
-        command = re.search(r"To read a compressed block by hand: `([^`]+)`", doc).group(1)
+        self.assertIn(f"To read a compressed block by hand: `{self.DOCUMENTED_DECODER}`.", doc)
         state = {"head_sha": A, "findings": [{"content": "odd \ud800 text", "header": "表"}], "runs": [], "security": {}}
         block = cp.encode_state(state, compressed=True)
-        result = subprocess.run(["bash", "-c", command], input=block, capture_output=True, text=True, check=True)
+        result = subprocess.run(["sh", "-c", self.DOCUMENTED_DECODER], input=block, capture_output=True, text=True,
+                                check=True, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C.UTF-8"})
         self.assertEqual(json.loads(result.stdout), state)
 
     def test_a_shorter_table_keeps_the_state_as_json_and_its_history_whole(self):
