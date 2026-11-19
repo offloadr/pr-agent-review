@@ -44,8 +44,8 @@ cp.FLEX_BACKOFF = (0, 0, 0)  # No real waiting in tests.
 
 
 def smallest_lossless(state):
-    """The shortest the checkpoint comment gets without changing its state: the shortest table, JSON or compressed."""
-    return min(len(cp.render_comment(state, cp.TABLE_ROWS_MIN, compressed)) for compressed in (False, True))
+    """The shortest the checkpoint comment gets without changing its state: no table, JSON or compressed."""
+    return min(len(cp.render_comment(state, 0, compressed)) for compressed in (False, True))
 
 
 def issue(path, header, content, line=10):
@@ -284,7 +284,7 @@ class StorageTests(unittest.TestCase):
         # compressed state for no checkpoint: starting over, its gate could pass with an open finding.
         findings = [dict(self.open_finding(i, 0), content=("the same words " * 40)[:500]) for i in range(150)]
         state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
-        self.assertGreater(len(cp.render_comment(state, cp.TABLE_ROWS_MIN)), cp.COMMENT_LIMIT)
+        self.assertGreater(len(cp.render_comment(state, 0)), cp.COMMENT_LIMIT)
         body = cp.fit_comment(json.loads(json.dumps(state)))
         self.assertNotIn(cp.STATE_START + "\n{", body, "Stored compressed.")
         self.assertEqual(cp.parse_checkpoint(body)["findings"], findings)
@@ -303,7 +303,7 @@ class StorageTests(unittest.TestCase):
         self.assertEqual([(f["id"], f["content"], f["check"]["reason"]) for f in stored],
                          [(f["id"], f["content"], f["check"]["reason"]) for f in findings])
         self.assertIn("more finding(s) are tracked but not listed here", body)
-        self.assertGreaterEqual(body.count("| open |"), cp.TABLE_ROWS_MIN)
+        self.assertGreater(body.count("| open |"), 0)
 
     def test_a_lone_surrogate_in_an_open_reason_does_not_stop_the_save(self):
         # JSON allows it and model text can hold it; UTF-8 does not, and the compressed form is tried first
@@ -328,7 +328,7 @@ class StorageTests(unittest.TestCase):
         findings[3]["check"]["reason"] = findings[3]["check"]["reason"][:150] + "\udc00"
         state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
         stored = json.loads(json.dumps(findings))
-        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state, cp.TABLE_ROWS_MIN)) + 10
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state, 10)) + 10
         try:
             self.assertGreater(len(cp.render_comment(state)), cp.COMMENT_LIMIT)
             body = cp.fit_comment(state)
@@ -348,18 +348,21 @@ class StorageTests(unittest.TestCase):
         result = subprocess.run(["bash", "-c", command], input=block, capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(result.stdout), state)
 
-    def test_the_table_lists_fewer_than_its_minimum_before_a_save_fails(self):
-        findings = [self.open_finding(i, 0) for i in range(cp.TABLE_ROWS_MIN + 5)]
-        state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
-        stored = json.loads(json.dumps(findings))
-        # Nothing can be shortened, and the state does not fit with the usual shortest table.
-        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, smallest_lossless(state) - 1
+    def test_a_shorter_table_keeps_the_state_as_json_and_its_history_whole(self):
+        # Repetitive text: compressed it would fit with the whole table, as JSON only with nine rows. The JSON
+        # is kept, so a workflow from before compression still reads it, and no pruned history is trimmed.
+        findings = [dict(self.open_finding(i, 0), content=("the same words " * 40)[:300]) for i in range(30)]
+        pruned = [{"id": "gone", "key": "gone-key", "threads": [{"path": "x.py", "fingerprint": "f00d"}]}]
+        state = {"head_sha": A, "findings": findings, "security": {}, "runs": [], "pruned": pruned}
+        stored = json.loads(json.dumps(state))
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state, 9)) + 1
         try:
+            self.assertGreater(len(cp.render_comment(state, 10)), cp.COMMENT_LIMIT)
+            self.assertLess(len(cp.render_comment(state, compressed=True)), cp.COMMENT_LIMIT)
             body = cp.fit_comment(state)
         finally:
             cp.COMMENT_LIMIT = saved
-        self.assertEqual(cp.parse_checkpoint(body)["findings"], stored)
-        self.assertLess(body.count("| open |"), cp.TABLE_ROWS_MIN)
+        self.assertEqual(self.reader_before_compression(body), stored)
 
     def test_a_comment_quoting_the_marker_is_not_the_checkpoint(self):
         real = {"id": 1, "user": {"login": "github-actions[bot]"},
