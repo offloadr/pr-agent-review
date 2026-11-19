@@ -479,9 +479,9 @@ jobs:
               concern = (state.get("security") or {}).get("concern")
               if concern:
                   lines += ["", f"🔒 **Security concern:** {cell(concern)}"]
-              if findings:
+              listed = active + fixed + dismissed
+              if findings and rows != 0:
                   lines += ["", "| State | Finding | Location |", "| --- | --- | --- |"]
-                  listed = active + fixed + dismissed
                   for f in listed if rows is None else listed[:rows]:
                       where = f"`{cell(f['path'])}`" + (f":{f['line']}" if f.get("line") else "")
                       if f["state"] == "ACTIVE":
@@ -494,8 +494,8 @@ jobs:
                       if f["state"] == "FIXED" and (f.get("check") or {}).get("reason"):
                           text += f" — _{cell(f['check']['reason'])}_"
                       lines.append(f"| {status} | {text} | {where} |")
-                  if rows is not None and len(listed) > rows:
-                      lines += ["", f"{len(listed) - rows} more finding(s) are tracked but not listed here."]
+              if rows is not None and len(listed) > rows:
+                  lines += ["", f"{len(listed) - rows} more finding(s) are tracked but not listed here."]
               lines += ["", STATE_START, encode_state(state, compressed), STATE_END]
               return "\n".join(lines)
 
@@ -507,15 +507,20 @@ jobs:
               Compression is not always shorter either: text such as CJK takes more characters compressed and
               base64-encoded than as JSON."""
               for compressed in (False, True):
-                  rows = None
-                  while True:
-                      body = render_comment(state, rows, compressed)
-                      if len(body) <= COMMENT_LIMIT:
-                          return body
-                      listed = len(state["findings"]) if rows is None else rows
-                      if listed == 0:
-                          break
-                      rows = listed // 2
+                  body = render_comment(state, None, compressed)
+                  if len(body) <= COMMENT_LIMIT:
+                      return body
+                  # The comment grows with every row listed, so the most rows that fit are found by bisection.
+                  low, high, best = 0, len(state["findings"]) - 1, None
+                  while low <= high:
+                      rows = (low + high) // 2
+                      candidate = render_comment(state, rows, compressed)
+                      if len(candidate) <= COMMENT_LIMIT:
+                          best, low = candidate, rows + 1
+                      else:
+                          high = rows - 1
+                  if best is not None:
+                      return best
               return None
 
 

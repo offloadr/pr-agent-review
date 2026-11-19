@@ -363,6 +363,21 @@ class StorageTests(unittest.TestCase):
         finally:
             cp.COMMENT_LIMIT = saved
         self.assertEqual(self.reader_before_compression(body), stored)
+        self.assertEqual(body.count("| open |"), 9, "As many findings as fit are listed.")
+
+    def test_a_comment_listing_no_findings_has_no_table_and_keeps_the_state_as_json(self):
+        findings = [self.open_finding(i, 0) for i in range(12)]
+        state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
+        stored = json.loads(json.dumps(state))
+        # Room for the summary, the omission notice and the JSON, not for any table markup.
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state, 0))
+        try:
+            body = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        self.assertNotIn("| State |", body)
+        self.assertIn("12 more finding(s) are tracked but not listed here.", body)
+        self.assertEqual(self.reader_before_compression(body), stored)
 
     def test_a_comment_quoting_the_marker_is_not_the_checkpoint(self):
         real = {"id": 1, "user": {"login": "github-actions[bot]"},
