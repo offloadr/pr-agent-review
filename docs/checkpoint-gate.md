@@ -27,7 +27,7 @@ zlib-compressed and base64-encoded instead, in a `<!-- pr-agent-checkpoint:v2` b
 kept whenever it fits: compression is not always shorter (varied CJK text takes more characters
 compressed), and a workflow from before compression reads only `v1` blocks. If such a workflow
 is run again (a rollback), it sees no checkpoint in a `v2` comment, as when it could not save
-one, rather than failing on it.
+one, rather than failing on it. The current reader decodes either block by its content.
 
 To read a `v2` block by hand: `base64 -d | python3 -c 'import sys, zlib; print(zlib.decompress(sys.stdin.buffer.read()).decode())'`.
 

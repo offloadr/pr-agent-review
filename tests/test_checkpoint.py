@@ -248,6 +248,11 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cp.parse_checkpoint(body)
 
+    def test_a_compressed_state_under_the_v1_marker_is_still_read(self):
+        state = {"head_sha": A, "findings": [{"content": "saved compressed"}], "runs": [], "security": {}}
+        body = "\n".join([cp.CHECKPOINT_MARKER, "", cp.STATE_START, cp.encode_state(state, compressed=True), cp.STATE_END])
+        self.assertEqual(cp.parse_checkpoint(body), state)
+
     @staticmethod
     def reader_before_compression(body):
         """parse_checkpoint as released before compression (15ba456), for a rolled-back workflow."""

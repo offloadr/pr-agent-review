@@ -433,8 +433,10 @@ jobs:
                   return None
               start = starts[-1]
               end = lines.index(STATE_END, start + 1)
-              text = "\n".join(lines[start + 1:end])
-              if lines[start] == STATE_START:
+              text = "\n".join(lines[start + 1:end]).strip()
+              # Read by content, not by marker: the marker only keeps older readers away from compressed state,
+              # and a compressed state was briefly saved under the v1 marker.
+              if text.startswith("{"):
                   return json.loads(text)
               try:
                   return json.loads(zlib.decompress(base64.b64decode(text, validate=True)).decode("utf-8"))
