@@ -414,13 +414,18 @@ jobs:
 
           # ---- Checkpoint storage ------------------------------------------------------------------------
 
+          # A lone surrogate: JSON allows one (model text can hold it), UTF-8 does not.
+          LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
           def encode_state(state, compressed=False):
               text = json.dumps(state, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+              # Escaped as JSON does, so the comment and the compressed bytes are valid UTF-8; it reads back the same.
+              text = LONE_SURROGATE_RE.sub(lambda match: "\\u%04x" % ord(match.group()), text)
               if compressed:
                   # So a pull request with many open findings still fits one comment. Base64 has none of the
                   # characters that could close the HTML comment that holds the state.
-                  # surrogatepass: model text can hold a lone surrogate, which JSON allows and UTF-8 does not.
-                  return base64.b64encode(zlib.compress(text.encode("utf-8", "surrogatepass"), 9)).decode("ascii")
+                  return base64.b64encode(zlib.compress(text.encode("utf-8"), 9)).decode("ascii")
               # Escaping < and > keeps finding text from closing the HTML comment that holds the state.
               return text.replace("<", "\\u003c").replace(">", "\\u003e")
 
@@ -437,7 +442,7 @@ jobs:
               if text.startswith("{"):
                   return json.loads(text)
               try:
-                  return json.loads(zlib.decompress(base64.b64decode(text, validate=True)).decode("utf-8", "surrogatepass"))
+                  return json.loads(zlib.decompress(base64.b64decode(text, validate=True)).decode("utf-8"))
               except zlib.error as error:
                   raise ValueError("The checkpoint state is not readable.") from error
 

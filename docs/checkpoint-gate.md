@@ -22,7 +22,7 @@ token writes, in a hidden block:
 ```
 
 The block is the state as JSON, with `<` and `>` escaped so finding text cannot close the HTML
-comment. When the JSON cannot fit in the comment even with the shortest table, the block holds
+comment, and any lone surrogate escaped so the comment is valid UTF-8. When the JSON cannot fit in the comment even with the shortest table, the block holds
 the state zlib-compressed and base64-encoded instead; the reader tells them apart by content.
 JSON is kept whenever it fits: compression is not always shorter (varied CJK text takes more
 characters compressed), and a workflow from before compression reads only JSON. Such a

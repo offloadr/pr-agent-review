@@ -318,8 +318,35 @@ class StorageTests(unittest.TestCase):
         finally:
             cp.COMMENT_LIMIT = saved
         self.assertEqual(len(cp.parse_checkpoint(body)["findings"]), 20)
-        compressed = cp.render_comment(state, compressed=True)
-        self.assertEqual(cp.parse_checkpoint(compressed), state, "A surrogate kept in a compressed state round-trips.")
+        for compressed in (False, True):
+            kept = cp.render_comment(state, compressed=compressed)
+            kept.encode("utf-8")
+            self.assertEqual(cp.parse_checkpoint(kept), state, "A surrogate kept in the state round-trips.")
+
+    def test_a_lone_surrogate_saved_as_json_after_a_shorter_table_is_valid_utf8(self):
+        findings = [self.open_finding(i, 200) for i in range(20)]
+        findings[3]["check"]["reason"] = findings[3]["check"]["reason"][:150] + "\udc00"
+        state = {"head_sha": A, "findings": findings, "security": {}, "runs": []}
+        stored = json.loads(json.dumps(findings))
+        saved, cp.COMMENT_LIMIT = cp.COMMENT_LIMIT, len(cp.render_comment(state, cp.TABLE_ROWS_MIN)) + 10
+        try:
+            self.assertGreater(len(cp.render_comment(state)), cp.COMMENT_LIMIT)
+            body = cp.fit_comment(state)
+        finally:
+            cp.COMMENT_LIMIT = saved
+        body.encode("utf-8")
+        self.assertIn(cp.STATE_START + "\n{", body, "Stored as JSON.")
+        self.assertEqual(cp.parse_checkpoint(body)["findings"], stored)
+
+    def test_the_documented_command_reads_a_compressed_state(self):
+        import re
+        import subprocess
+        doc = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "checkpoint-gate.md").read_text()
+        command = re.search(r"To read a compressed block by hand: `([^`]+)`", doc).group(1)
+        state = {"head_sha": A, "findings": [{"content": "odd \ud800 text", "header": "表"}], "runs": [], "security": {}}
+        block = cp.encode_state(state, compressed=True)
+        result = subprocess.run(["bash", "-c", command], input=block, capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout), state)
 
     def test_the_table_lists_fewer_than_its_minimum_before_a_save_fails(self):
         findings = [self.open_finding(i, 0) for i in range(cp.TABLE_ROWS_MIN + 5)]
